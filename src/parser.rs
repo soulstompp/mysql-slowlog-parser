@@ -1,4 +1,4 @@
-use nom::bytes::complete::tag;
+use nom::bytes::complete::{tag, take_until};
 use nom::character::complete::{alphanumeric1, anychar, digit1, multispace1};
 use nom::character::is_space;
 use nom::combinator::rest;
@@ -10,8 +10,14 @@ use nom::IResult;
 
 use iso8601::parsers::parse_datetime;
 use iso8601::DateTime;
+use sqlparser::ast::Statement;
+use sqlparser::dialect::MySqlDialect;
+use sqlparser::parser::{Parser, ParserError};
+use sqlparser::tokenizer::{Token, Tokenizer};
 
+use crate::EntryMasking;
 use thiserror::Error;
+
 #[derive(Error, Debug)]
 pub enum ParseEntryError {}
 
@@ -26,7 +32,7 @@ impl EntryTime {
     }
 }
 
-pub fn parse_entry_time<'a>(i: &'a str) -> IResult<&'a str, EntryTime> {
+pub fn parse_entry_time(i: &str) -> IResult<&str, EntryTime> {
     let (i, _) = tag("# Time:")(i)?;
     let (i, _) = multispace1(i)?;
 
@@ -126,7 +132,7 @@ impl EntryStats {
     }
 }
 
-pub fn parse_entry_stats<'a>(i: &'a str) -> IResult<&'a str, EntryStats> {
+pub fn parse_entry_stats(i: &str) -> IResult<&str, EntryStats> {
     let (
         i,
         (_, _, _, _, query_time, _, _, _, lock_time, _, _, _, rows_sent, _, _, _, rows_examined),
@@ -161,11 +167,79 @@ pub fn parse_entry_stats<'a>(i: &'a str) -> IResult<&'a str, EntryStats> {
     ))
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct EntryAdminCommand {
+    command: String,
+}
+
+pub fn parse_admin_command(i: &str) -> IResult<&str, EntryAdminCommand> {
+    let (i, (_, _, command, _)) = tuple((
+        tag("# administrator command:"),
+        multispace1,
+        take_until(";"),
+        rest,
+    ))(i)?;
+
+    Ok((
+        i,
+        EntryAdminCommand {
+            command: command.into(),
+        },
+    ))
+}
+
+pub fn parse_sql(sql: &str, mask: &EntryMasking) -> Result<Vec<Statement>, ParserError> {
+    let mut tokenizer = Tokenizer::new(&MySqlDialect {}, sql);
+    let mut tokens = tokenizer.tokenize()?;
+
+    if mask == &EntryMasking::PlaceHolder {
+        tokens = mask_tokens(tokens, mask);
+    }
+
+    let mut parser = Parser::new(&MySqlDialect {}).with_tokens(tokens);
+
+    parser.parse_statements()
+}
+
+pub fn mask_tokens(tokens: Vec<Token>, mask: &EntryMasking) -> Vec<Token> {
+    let mut acc = vec![];
+
+    if mask == &EntryMasking::None {
+        return tokens;
+    }
+
+    for t in tokens {
+        let mt = if let Token::Number(_, _) = t {
+            Token::Placeholder("?".into())
+        } else if let Token::Number(_, _) = t {
+            Token::Placeholder("?".into())
+        } else if let Token::SingleQuotedString(_) = t {
+            Token::Placeholder("?".into())
+        } else if let Token::DoubleQuotedString(_) = t {
+            Token::Placeholder("?".into())
+        } else if let Token::NationalStringLiteral(_) = t {
+            Token::Placeholder("?".into())
+        } else if let Token::EscapedStringLiteral(_) = t {
+            Token::Placeholder("?".into())
+        } else if let Token::HexStringLiteral(_) = t {
+            Token::Placeholder("?".into())
+        } else {
+            t
+        };
+
+        acc.push(mt);
+    }
+
+    acc
+}
+
 #[cfg(test)]
 mod tests {
     use crate::parser::{
-        parse_entry_stats, parse_entry_time, parse_entry_user, EntryStats, EntryTime, EntryUser,
+        parse_admin_command, parse_entry_stats, parse_entry_time, parse_entry_user, parse_sql,
+        EntryAdminCommand, EntryStats, EntryTime, EntryUser,
     };
+    use crate::EntryMasking;
     use iso8601::{Date, DateTime, Time};
 
     #[test]
@@ -221,5 +295,35 @@ mod tests {
 
         let res = parse_entry_stats(i).unwrap();
         assert_eq!(expected, res.1);
+    }
+
+    #[test]
+    fn parse_admin_command_line() {
+        let i = "# administrator command: Quit;\n";
+
+        let expected = EntryAdminCommand {
+            command: "Quit".into(),
+        };
+
+        let res = parse_admin_command(i).unwrap();
+        assert_eq!(expected, res.1);
+    }
+
+    #[test]
+    fn parse_masked_selects() {
+        let sql0 = "SELECT a, b, 123, 'abcd', myfunc(b) \
+           FROM table_1 \
+           WHERE a > b AND b < 100 \
+           ORDER BY a DESC, b";
+
+        let sql1 = "SELECT a, b, 456, 'efg', myfunc(b) \
+           FROM table_1 \
+           WHERE a > b AND b < 1000 \
+           ORDER BY a DESC, b";
+
+        let ast0 = parse_sql(sql0, &EntryMasking::PlaceHolder).unwrap();
+        let ast1 = parse_sql(sql1, &EntryMasking::PlaceHolder).unwrap();
+
+        assert_eq!(ast0, ast1);
     }
 }
