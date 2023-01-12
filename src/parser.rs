@@ -1,5 +1,5 @@
 use nom::bytes::complete::{tag, take_until};
-use nom::character::complete::{alphanumeric1, anychar, digit1, multispace1};
+use nom::character::complete::{alphanumeric1, anychar, digit1, multispace0, multispace1};
 use nom::character::is_space;
 use nom::combinator::rest;
 use nom::error::{Error, ErrorKind};
@@ -7,6 +7,7 @@ use nom::number::complete::double;
 use nom::sequence::tuple;
 use nom::Err as nomErr;
 use nom::IResult;
+use std::collections::HashMap;
 
 use iso8601::parsers::parse_datetime;
 use iso8601::DateTime;
@@ -16,11 +17,8 @@ use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::{Token, Tokenizer};
 
 use crate::EntryMasking;
-use thiserror::Error;
 
-#[derive(Error, Debug)]
-pub enum ParseEntryError {}
-
+/// values from the time entry line
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EntryTime {
     time: DateTime,
@@ -32,6 +30,7 @@ impl EntryTime {
     }
 }
 
+/// parses "# Time: ...." entry line
 pub fn parse_entry_time(i: &str) -> IResult<&str, EntryTime> {
     let (i, _) = tag("# Time:")(i)?;
     let (i, _) = multispace1(i)?;
@@ -44,6 +43,7 @@ pub fn parse_entry_time(i: &str) -> IResult<&str, EntryTime> {
         })))
 }
 
+/// values from the user entry line
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EntryUser {
     user: String,
@@ -65,6 +65,7 @@ impl EntryUser {
     }
 }
 
+/// an overly simplistic hostname parser
 pub fn parse_host<'a>(i: &'_ str) -> IResult<&'_ str, String> {
     let mut acc = String::new();
 
@@ -83,6 +84,7 @@ pub fn parse_host<'a>(i: &'_ str) -> IResult<&'_ str, String> {
     }
 }
 
+/// an overly simplistic user parser
 pub fn parse_entry_user<'a>(i: &'_ str) -> IResult<&'_ str, EntryUser> {
     let (i, (_, _, user, _, sys_user, _, _, _, _, host, _)) = tuple((
         tag("# User@Host:"),
@@ -108,6 +110,63 @@ pub fn parse_entry_user<'a>(i: &'_ str) -> IResult<&'_ str, EntryUser> {
     ))
 }
 
+pub fn parse_details_comment<'a>(i: &'_ str) -> IResult<&'_ str, HashMap<String, String>> {
+    let mut name = None;
+
+    let mut res: HashMap<String, String> = HashMap::new();
+
+    let (mut i, _) = tag("--")(i)?;
+
+    loop {
+        if let Ok((ii, (_, n, _))) = tuple((multispace0, parse_details_tag, multispace1))(i) {
+            i = ii;
+            name.replace(n.to_string());
+
+            if let Some(_) = res.insert(n, String::new()) {
+                return Err(nomErr::Error(Error {
+                    input: i,
+                    code: ErrorKind::Fail,
+                }));
+            }
+        }
+
+        if let Ok((ii, c)) = anychar::<&str, (&str, nom::error::ErrorKind)>(i) {
+            i = ii;
+
+            if c == '\n' || c == '\r' {
+                break;
+            }
+
+            if let Some(k) = &name {
+                let v = &mut res.get_mut(k).ok_or(nomErr::Error(Error {
+                    input: i,
+                    code: ErrorKind::Fail,
+                }))?;
+
+                v.push(c);
+            } else {
+                return Err(nomErr::Error(Error {
+                    input: i,
+                    code: ErrorKind::Fail,
+                }));
+            }
+
+            continue;
+        } else {
+            break;
+        }
+    }
+
+    Ok((i, res))
+}
+
+pub fn parse_details_tag<'a>(i: &'_ str) -> IResult<&'_ str, String> {
+    let (i, (name, _)) = tuple((alphanumeric1, tag(":")))(i)?;
+
+    Ok((i, name.into()))
+}
+
+/// values parsed from stats entry line
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntryStats {
     query_time: f64,
@@ -132,6 +191,7 @@ impl EntryStats {
     }
 }
 
+/// parse '# Query_time:...' entry line
 pub fn parse_entry_stats(i: &str) -> IResult<&str, EntryStats> {
     let (
         i,
@@ -167,11 +227,13 @@ pub fn parse_entry_stats(i: &str) -> IResult<&str, EntryStats> {
     ))
 }
 
+/// admin command values parsed from sql lines of an entry
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntryAdminCommand {
     command: String,
 }
 
+/// parse "# administrator command: " entry line
 pub fn parse_admin_command(i: &str) -> IResult<&str, EntryAdminCommand> {
     let (i, (_, _, command, _)) = tuple((
         tag("# administrator command:"),
@@ -188,19 +250,25 @@ pub fn parse_admin_command(i: &str) -> IResult<&str, EntryAdminCommand> {
     ))
 }
 
+/// Parses one or more sql statements using `sqlparser::parse_statements`. This uses the
+/// `sqlparser::Tokenizer` to first tokenize the SQL and replace tokenized values with an
+/// masked value determined by the `&EntryMasking` value passed as an argument. In the case of
+/// `EntryMasking::None` this call is identical to calling `sqlparse::parse_statements`.
+/// command: " entry line
 pub fn parse_sql(sql: &str, mask: &EntryMasking) -> Result<Vec<Statement>, ParserError> {
     let mut tokenizer = Tokenizer::new(&MySqlDialect {}, sql);
     let mut tokens = tokenizer.tokenize()?;
 
-    if mask == &EntryMasking::PlaceHolder {
-        tokens = mask_tokens(tokens, mask);
-    }
+    tokens = mask_tokens(tokens, mask);
 
     let mut parser = Parser::new(&MySqlDialect {}).with_tokens(tokens);
 
     parser.parse_statements()
 }
 
+/// Replaces numbers, strings and literal tokenized by `sql_parser::Tokenizer` and replaces them
+/// with a masking values. Passing a value of `EntryMasking::None` will simply return the
+/// `Vec<Token>` passed in.
 pub fn mask_tokens(tokens: Vec<Token>, mask: &EntryMasking) -> Vec<Token> {
     let mut acc = vec![];
 
@@ -236,11 +304,12 @@ pub fn mask_tokens(tokens: Vec<Token>, mask: &EntryMasking) -> Vec<Token> {
 #[cfg(test)]
 mod tests {
     use crate::parser::{
-        parse_admin_command, parse_entry_stats, parse_entry_time, parse_entry_user, parse_sql,
-        EntryAdminCommand, EntryStats, EntryTime, EntryUser,
+        parse_admin_command, parse_details_comment, parse_entry_stats, parse_entry_time,
+        parse_entry_user, parse_sql, EntryAdminCommand, EntryStats, EntryTime, EntryUser,
     };
     use crate::EntryMasking;
     use iso8601::{Date, DateTime, Time};
+    use std::collections::HashMap;
 
     #[test]
     fn parse_time_line() {
@@ -284,7 +353,7 @@ mod tests {
 
     #[test]
     fn parse_stats_line() {
-        let i = "# Query_time: 1.000016  Lock_time: 2.000000 Rows_sent: 3  Rows_examined: 4";
+        let i = "# Query_time: 1.000016  Lock_time: 2.000000 Rows_sent: 3  Rows_examined: 4\n";
 
         let expected = EntryStats {
             query_time: 1.000016,
@@ -307,6 +376,24 @@ mod tests {
 
         let res = parse_admin_command(i).unwrap();
         assert_eq!(expected, res.1);
+    }
+
+    #[test]
+    fn parses_details_comment() {
+        let c = "-- Id: 123 long: some kind of details here caller: hello_world()\n";
+
+        let res = parse_details_comment(c).unwrap();
+
+        let expected = (
+            "",
+            HashMap::from([
+                ("Id".into(), "123".into()),
+                ("long".into(), "some kind of details here".into()),
+                ("caller".into(), "hello_world()".into()),
+            ]),
+        );
+
+        assert_eq!(res, expected)
     }
 
     #[test]

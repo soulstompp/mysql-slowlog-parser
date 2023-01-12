@@ -1,8 +1,12 @@
+//! # Parse MySQL SlowLog
+//!
+//! A pull parser library for reading MySQL's slow query logs.
+use std::collections::HashMap;
 use thiserror::Error;
 
 use crate::parser::{
-    parse_admin_command, parse_entry_stats, parse_entry_time, parse_entry_user, parse_sql,
-    EntryAdminCommand, EntryStats, EntryTime, EntryUser,
+    parse_admin_command, parse_details_comment, parse_entry_stats, parse_entry_time,
+    parse_entry_user, parse_sql, EntryAdminCommand, EntryStats, EntryTime, EntryUser,
 };
 use crate::ReadError::{
     IncompleteEntry, IncompleteLog, IncompleteSql, InvalidStatsLine, InvalidTimeLine,
@@ -15,6 +19,7 @@ use std::io::{BufRead, BufReader, Read};
 
 mod parser;
 
+/// Error returned to cover all cases when reading/parsing a log
 #[derive(Error, Debug)]
 pub enum ReadError {
     #[error("file read error: {0}")]
@@ -34,14 +39,33 @@ pub enum ReadError {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct EntrySqlStatement {
+    statement: Statement,
+    details: HashMap<String, String>,
+}
+
+impl From<Statement> for EntrySqlStatement {
+    fn from(statement: Statement) -> Self {
+        let details = HashMap::new();
+
+        EntrySqlStatement { statement, details }
+    }
+}
+
+/// Types of possible statements parsed from the log:
+/// * SqlStatement: parseable statement with a proper SQL AST
+/// * AdminCommand: commands passed from the mysql cli/admin tools
+/// * InvalidStatement: statement which isn't currently parseable as plain-text
+#[derive(Clone, Debug, PartialEq)]
 pub enum EntryStatement {
-    SqlStatement(Statement),
+    SqlStatement(EntrySqlStatement),
     AdminCommand(EntryAdminCommand),
     InvalidStatement(String),
 }
 
+/// context used internally for a Reader while parsing lines
 #[derive(Default, Debug)]
-pub struct EntryContext {
+struct EntryContext {
     time: Option<EntryTime>,
     user: Option<EntryUser>,
     stats: Option<EntryStats>,
@@ -72,6 +96,9 @@ impl EntryContext {
     }
 }
 
+/// types of masking to apply when parsing SQL statements
+/// * PlaceHolder - mask all sql values with a '?' placeholder
+/// * None - leave all values in place
 #[derive(PartialEq)]
 pub enum EntryMasking {
     PlaceHolder,
@@ -103,6 +130,7 @@ impl<'a> Reader<'a> {
         })
     }
 
+    /// reads next line in BufReader returning None when there is nothing left to read
     fn read_line(&mut self) -> Result<Option<String>, ReadError> {
         let mut l = String::new();
 
@@ -115,6 +143,7 @@ impl<'a> Reader<'a> {
         Ok(Some(l))
     }
 
+    /// reads header section of an entry, currently parses the whole header as a String
     fn read_header(&mut self) -> Result<(), ReadError> {
         let mut h = String::new();
 
@@ -138,6 +167,11 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
+    /// reads the "# Time..." entry line which is the start of an entry, returns the entire header
+    /// as a
+    /// String
+    ///
+    /// *Note: this line sometimes contains an Id: [] portion which is discarded.*
     fn read_time(&mut self) -> Result<Option<()>, ReadError> {
         let line = self.read_line()?;
 
@@ -154,6 +188,7 @@ impl<'a> Reader<'a> {
         Ok(Some(()))
     }
 
+    /// reads the entry line containing statistics on the query
     fn read_stats(&mut self) -> Result<(), ReadError> {
         let line = self.read_line()?;
 
@@ -170,13 +205,21 @@ impl<'a> Reader<'a> {
         return Ok(());
     }
 
+    /// reads the entry lines containing SQL and admistrator command statements
     fn read_sql(&mut self) -> Result<Option<Entry>, ReadError> {
         let mut sql = String::new();
+        let mut details = None;
 
         'sql: loop {
             let line = self.read_line()?;
 
             if let Some(l) = line {
+                if sql.len() == 0 {
+                    if let Ok((_, d)) = parse_details_comment(&l) {
+                        details = Some(d);
+                    }
+                }
+
                 if l.trim().ends_with(";") {
                     sql.push_str(&l);
 
@@ -189,7 +232,12 @@ impl<'a> Reader<'a> {
                             self.context.statements.append(
                                 &mut s
                                     .into_iter()
-                                    .map(|s| EntryStatement::SqlStatement(s))
+                                    .map(|s| {
+                                        EntryStatement::SqlStatement(EntrySqlStatement {
+                                            statement: s,
+                                            details: details.take().unwrap_or(HashMap::new()),
+                                        })
+                                    })
                                     .collect(),
                             )
                         } else {
@@ -200,6 +248,8 @@ impl<'a> Reader<'a> {
                     }
 
                     sql = String::new();
+                    details = None;
+
                     continue 'sql;
                 }
 
@@ -229,6 +279,10 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// reads lines from BufReader and build
+    ///
+    /// *Note: the buffer is left at the start of the next entry, with a partially created entry
+    /// stored in EntryContext. This partial which will be completed on the next call.*
     pub fn read_entry(&mut self) -> Result<Option<Entry>, ReadError> {
         if self.header.is_none() {
             self.read_header()?;
@@ -263,6 +317,7 @@ impl<'a> Reader<'a> {
         self.read_sql()
     }
 
+    /// Parses the first line of an entry and resets `self.context` with only this initial value.
     fn start_entry(&mut self, l: &str) -> Result<(), ReadError> {
         if let Ok((_, t)) = parse_entry_time(&l) {
             self.context = EntryContext {
@@ -277,6 +332,7 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// a struct representing the values parsed from the log entry
 #[derive(Debug, PartialEq)]
 pub struct Entry {
     time: DateTime,
@@ -294,6 +350,7 @@ pub struct Entry {
 mod tests {
     use crate::EntryStatement::SqlStatement;
     use crate::{Entry, EntryMasking, Reader};
+    use std::collections::HashMap;
     use std::fs::File;
     use std::ops::AddAssign;
 
@@ -314,6 +371,7 @@ mod tests {
 # User@Host: msandbox[msandbox] @ localhost []  Id:    10
 # Query_time: 0.000352  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
 SET timestamp=1517798807;
+-- ID: 123 caller: hello_world()
 SELECT film.film_id AS FID, film.title AS title, film.description AS description, category.name AS category, film.rental_rate AS price
 FROM category LEFT JOIN film_category ON category.category_id = film_category.category_id LEFT JOIN film ON film_category.film_id = film.film_id
 GROUP BY film.film_id, category.name;
@@ -322,7 +380,18 @@ GROUP BY film.film_id, category.name;
         let mut b = sql.as_bytes();
         let mut r = Reader::new(&mut b, EntryMasking::None).unwrap();
 
+        let ed = HashMap::from([
+            ("ID".into(), "123".into()),
+            ("caller".into(), "hello_world()".into()),
+        ]);
+
         while let Some(e) = r.read_entry().unwrap() {
+            if let SqlStatement(s) = &e.statements[1] {
+                assert_eq!(s.details, ed);
+            } else {
+                panic!("expected a second statement")
+            }
+
             test_entry(&e, 2);
         }
     }
