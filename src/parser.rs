@@ -8,6 +8,7 @@ use nom::sequence::tuple;
 use nom::Err as nomErr;
 use nom::IResult;
 use std::collections::HashMap;
+use std::str::FromStr;
 
 use iso8601::parsers::parse_datetime;
 use iso8601::DateTime;
@@ -230,7 +231,7 @@ pub fn parse_entry_stats(i: &str) -> IResult<&str, EntryStats> {
 /// admin command values parsed from sql lines of an entry
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntryAdminCommand {
-    command: String,
+    pub command: String,
 }
 
 /// parse "# administrator command: " entry line
@@ -248,6 +249,22 @@ pub fn parse_admin_command(i: &str) -> IResult<&str, EntryAdminCommand> {
             command: command.into(),
         },
     ))
+}
+
+/// parses 'SET timestamp=\d{10};' command which starts
+pub fn parse_start_timestamp_command(i: &str) -> IResult<&str, u32> {
+    let (i, (_, _, _, _, time, _, _, _)) = tuple((
+        tag("SET timestamp"),
+        multispace0,
+        tag("="),
+        multispace0,
+        digit1,
+        multispace0,
+        tag(";"),
+        multispace0,
+    ))(i)?;
+
+    Ok((i, u32::from_str(time).unwrap()))
 }
 
 /// Parses one or more sql statements using `sqlparser::parse_statements`. This uses the
@@ -305,7 +322,8 @@ pub fn mask_tokens(tokens: Vec<Token>, mask: &EntryMasking) -> Vec<Token> {
 mod tests {
     use crate::parser::{
         parse_admin_command, parse_details_comment, parse_entry_stats, parse_entry_time,
-        parse_entry_user, parse_sql, EntryAdminCommand, EntryStats, EntryTime, EntryUser,
+        parse_entry_user, parse_sql, parse_start_timestamp_command, EntryAdminCommand, EntryStats,
+        EntryTime, EntryUser,
     };
     use crate::EntryMasking;
     use iso8601::{Date, DateTime, Time};
@@ -394,6 +412,17 @@ mod tests {
         );
 
         assert_eq!(res, expected)
+    }
+
+    #[test]
+    fn parses_start_timestamp() {
+        let l = "SET timestamp=1517798807;\n";
+
+        let res = parse_start_timestamp_command(l).unwrap();
+
+        let expected = ("", 1517798807);
+
+        assert_eq!(res, expected);
     }
 
     #[test]

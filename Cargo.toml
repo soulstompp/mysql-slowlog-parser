@@ -1,5 +1,5 @@
 [package]
-name = "parse-mysql-slowlog"
+name = "mysql-slowlog-parser"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"

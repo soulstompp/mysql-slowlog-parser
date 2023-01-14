@@ -1,13 +1,18 @@
 //! # Parse MySQL SlowLog
 //!
 //! A pull parser library for reading MySQL's slow query logs.
+extern crate core;
+
 use std::collections::HashMap;
 use thiserror::Error;
 
 use crate::parser::{
     parse_admin_command, parse_details_comment, parse_entry_stats, parse_entry_time,
-    parse_entry_user, parse_sql, EntryAdminCommand, EntryStats, EntryTime, EntryUser,
+    parse_entry_user, parse_sql, parse_start_timestamp_command, EntryAdminCommand, EntryStats,
+    EntryTime, EntryUser,
 };
+use crate::EntryError::MissingField;
+use crate::EntryStatement::{AdminCommand, SqlStatement};
 use crate::ReadError::{
     IncompleteEntry, IncompleteLog, IncompleteSql, InvalidStatsLine, InvalidTimeLine,
     InvalidUserLine,
@@ -15,7 +20,7 @@ use crate::ReadError::{
 use iso8601::DateTime;
 use sqlparser::ast::Statement;
 use std::io;
-use std::io::{BufRead, BufReader, Read};
+use std::io::BufRead;
 
 mod parser;
 
@@ -32,16 +37,22 @@ pub enum ReadError {
     InvalidStatsLine(String),
     #[error("invalid entry with invalid sql starting at end of file")]
     IncompleteSql,
-    #[error("{0} entry started but not completed at line: {1}")]
-    IncompleteEntry(String, String),
+    #[error("found start of new entry before entry completed at line: {0}")]
+    IncompleteEntry(EntryError),
     #[error("Invalid log format or format contains no entries")]
     IncompleteLog,
 }
 
+#[derive(Error, Debug)]
+pub enum EntryError {
+    #[error("entry is missing: {0}")]
+    MissingField(String),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntrySqlStatement {
-    statement: Statement,
-    details: HashMap<String, String>,
+    pub statement: Statement,
+    pub details: HashMap<String, String>,
 }
 
 impl From<Statement> for EntrySqlStatement {
@@ -58,8 +69,8 @@ impl From<Statement> for EntrySqlStatement {
 /// * InvalidStatement: statement which isn't currently parseable as plain-text
 #[derive(Clone, Debug, PartialEq)]
 pub enum EntryStatement {
-    SqlStatement(EntrySqlStatement),
     AdminCommand(EntryAdminCommand),
+    SqlStatement(EntrySqlStatement),
     InvalidStatement(String),
 }
 
@@ -69,17 +80,24 @@ struct EntryContext {
     time: Option<EntryTime>,
     user: Option<EntryUser>,
     stats: Option<EntryStats>,
-    statements: Vec<EntryStatement>,
+    statement: Option<EntryStatement>,
+    set_timestamp: Option<u32>,
 }
 
 impl EntryContext {
-    fn entry(&self) -> Result<Entry, ()> {
-        let time = self.time.clone().ok_or(())?;
-        let user = self.user.clone().ok_or(())?;
-        let stats = self.stats.clone().ok_or(())?;
+    fn entry(&self) -> Result<Entry, EntryError> {
+        let time = self.time.clone().ok_or(MissingField("time".into()))?;
+        let user = self.user.clone().ok_or(MissingField("user".into()))?;
+        let stats = self.stats.clone().ok_or(MissingField("stats".into()))?;
+        let set_timestamp = self
+            .set_timestamp
+            .clone()
+            .ok_or(MissingField("set timestamp".into()))?;
+        let statement = self.statement.clone().ok_or(MissingField("sql".into()))?;
 
         Ok(Entry {
             time: time.time(),
+            start_timestamp: set_timestamp,
             user: user.user(),
             sys_user: user.sys_user(),
             host: user.host(),
@@ -87,7 +105,7 @@ impl EntryContext {
             lock_time: stats.lock_time(),
             rows_sent: stats.rows_sent(),
             rows_examined: stats.rows_examined(),
-            statements: self.statements.clone(),
+            statement,
         })
     }
 
@@ -112,16 +130,14 @@ impl Default for EntryMasking {
 }
 
 pub struct Reader<'a> {
-    reader: BufReader<&'a mut dyn Read>,
+    reader: &'a mut dyn BufRead,
     context: EntryContext,
     masking: EntryMasking,
     header: Option<String>,
 }
 
 impl<'a> Reader<'a> {
-    pub fn new(r: &'a mut dyn Read, m: EntryMasking) -> Result<Self, ReadError> {
-        let reader = BufReader::new(r);
-
+    pub fn new(reader: &'a mut dyn BufRead, m: EntryMasking) -> Result<Self, ReadError> {
         Ok(Self {
             reader,
             context: Default::default(),
@@ -221,29 +237,30 @@ impl<'a> Reader<'a> {
                 }
 
                 if l.trim().ends_with(";") {
+                    if let Ok((_, timestamp)) = parse_start_timestamp_command(&l) {
+                        if sql.len() == 0 {
+                            self.context.set_timestamp = Some(timestamp);
+                            continue;
+                        }
+                    }
+
                     sql.push_str(&l);
 
                     if let Ok((_, command)) = parse_admin_command(&l) {
-                        self.context
-                            .statements
-                            .push(EntryStatement::AdminCommand(command))
+                        self.context.statement = Some(EntryStatement::AdminCommand(command))
                     } else {
                         if let Ok(s) = parse_sql(&sql, &self.masking) {
-                            self.context.statements.append(
-                                &mut s
-                                    .into_iter()
-                                    .map(|s| {
-                                        EntryStatement::SqlStatement(EntrySqlStatement {
-                                            statement: s,
-                                            details: details.take().unwrap_or(HashMap::new()),
-                                        })
-                                    })
-                                    .collect(),
-                            )
+                            if s.len() == 1 {
+                                self.context.statement =
+                                    Some(EntryStatement::SqlStatement(EntrySqlStatement {
+                                        statement: s[0].clone(),
+                                        details: details.take().unwrap_or(HashMap::new()),
+                                    }))
+                            } else {
+                                self.context.statement = Some(EntryStatement::InvalidStatement(sql))
+                            }
                         } else {
-                            self.context
-                                .statements
-                                .push(EntryStatement::InvalidStatement(sql))
+                            self.context.statement = Some(EntryStatement::InvalidStatement(sql))
                         }
                     }
 
@@ -254,10 +271,7 @@ impl<'a> Reader<'a> {
                 }
 
                 if l.starts_with("#") {
-                    let e = self
-                        .context
-                        .entry()
-                        .or(Err(IncompleteEntry("Sql".into(), l.clone())))?;
+                    let e = self.context.entry().or_else(|e| Err(IncompleteEntry(e)))?;
 
                     self.start_entry(&l)?;
 
@@ -269,7 +283,7 @@ impl<'a> Reader<'a> {
                 return if let Ok(e) = self.context.entry() {
                     Ok(Some(e))
                 } else {
-                    if self.context.statements.is_empty() {
+                    if self.context.statement.is_none() {
                         Err(IncompleteSql)
                     } else {
                         Ok(None)
@@ -336,6 +350,7 @@ impl<'a> Reader<'a> {
 #[derive(Debug, PartialEq)]
 pub struct Entry {
     time: DateTime,
+    start_timestamp: u32,
     user: String,
     sys_user: String,
     host: String,
@@ -343,27 +358,117 @@ pub struct Entry {
     lock_time: f64,
     rows_sent: u32,
     rows_examined: u32,
-    statements: Vec<EntryStatement>,
+    statement: EntryStatement,
+}
+
+impl Entry {
+    /// return entry time as an `iso8601::DateTime`
+    pub fn time(&self) -> DateTime {
+        self.time
+    }
+
+    /// returns the time stamp set at the beginning of each entry
+    pub fn start_timestamp(&self) -> u32 {
+        self.start_timestamp
+    }
+
+    /// returns the mysql user name that requested the command
+    pub fn user(&self) -> &str {
+        &self.user
+    }
+
+    /// returns the system user name that requested the command
+    pub fn sys_user(&self) -> &str {
+        &self.sys_user
+    }
+
+    /// returns the host name which requested the command
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// returns how long the query took to run
+    pub fn query_time(&self) -> f64 {
+        self.query_time
+    }
+
+    /// returns how long it took to lock
+    pub fn lock_time(&self) -> f64 {
+        self.lock_time
+    }
+
+    /// returns number of rows returned when query was executed
+    pub fn rows_sent(&self) -> u32 {
+        self.rows_sent
+    }
+
+    /// returns how many rows where examined to execute the query
+    pub fn rows_examined(&self) -> u32 {
+        self.rows_examined
+    }
+
+    /// returns `true` if entry contains valid SQL, otherwise `false`
+    pub fn has_sql_statement(&self) -> bool {
+        match &self.statement {
+            SqlStatement(_) => true,
+            _ => false,
+        }
+    }
+
+    /// returns associated `&EntryStatement`
+    pub fn statement(&self) -> &EntryStatement {
+        &self.statement
+    }
+
+    /// returns `Some(&EntrySqlStatement)` if entry contains valid SQ, otherwise `None`
+    pub fn sql_statement(&self) -> Option<&EntrySqlStatement> {
+        match &self.statement {
+            SqlStatement(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// returns `true` if entry is an admin command, otherwise `false`
+    pub fn has_admin_command(&self) -> bool {
+        match &self.statement {
+            AdminCommand(_) => true,
+            _ => false,
+        }
+    }
+
+    /// returns `Some(&EntryAdminCommand)` if entry is an admin command, otherwise `None`
+    pub fn admin_command(&self) -> Option<&EntryAdminCommand> {
+        match &self.statement {
+            AdminCommand(ac) => Some(ac),
+            _ => None,
+        }
+    }
+
+    /// returns `true` if entry sql was unparseable, otherwise `false`
+    pub fn has_invalid_statement(&self) -> bool {
+        match &self.statement {
+            EntryStatement::InvalidStatement(_) => true,
+            _ => false,
+        }
+    }
+
+    /// returns `Some(&str)` if entry sql was unparseable, otherwise `None`
+    pub fn invalid_statement(&self) -> Option<&str> {
+        match &self.statement {
+            EntryStatement::InvalidStatement(is) => Some(is),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::EntryStatement::SqlStatement;
-    use crate::{Entry, EntryMasking, Reader};
+    use crate::{EntryMasking, Reader};
     use std::collections::HashMap;
     use std::fs::File;
+    use std::io::BufReader;
     use std::ops::AddAssign;
-
-    fn test_entry(e: &Entry, c: usize) {
-        assert_eq!(e.statements.len(), c, "statement count");
-        assert!(
-            e.statements.iter().all(|s| match s {
-                SqlStatement(_) => true,
-                _ => false,
-            }),
-            "all valid statements"
-        );
-    }
 
     #[test]
     fn parse_select_entry() {
@@ -386,13 +491,11 @@ GROUP BY film.film_id, category.name;
         ]);
 
         while let Some(e) = r.read_entry().unwrap() {
-            if let SqlStatement(s) = &e.statements[1] {
+            if let SqlStatement(s) = e.statement {
                 assert_eq!(s.details, ed);
             } else {
-                panic!("expected a second statement")
+                panic!("no statement")
             }
-
-            test_entry(&e, 2);
         }
     }
 
@@ -422,8 +525,11 @@ GROUP BY film.film_id, category.name;
         let mut res = vec![];
 
         while let Some(e) = r.read_entry().unwrap() {
+            if !e.has_sql_statement() {
+                continue;
+            }
+
             i.add_assign(1);
-            test_entry(&e, 2);
 
             res.push(e);
         }
@@ -434,12 +540,12 @@ GROUP BY film.film_id, category.name;
 
     #[test]
     fn parse_slow_log() {
-        let mut f = File::open("data/slow-test-queries.log").unwrap();
-        let mut p = Reader::new(&mut f, EntryMasking::PlaceHolder).unwrap();
+        let mut fr = BufReader::new(File::open("data/slow-test-queries.log").unwrap());
+        let mut r = Reader::new(&mut fr, EntryMasking::PlaceHolder).unwrap();
 
         let mut i = 0usize;
 
-        while let Some(_) = p.read_entry().unwrap() {
+        while let Some(_) = r.read_entry().unwrap() {
             i += 1;
         }
 
