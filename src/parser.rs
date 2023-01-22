@@ -1,7 +1,7 @@
 use nom::bytes::complete::{tag, take_until};
 use nom::character::complete::{alphanumeric1, anychar, digit1, multispace0, multispace1};
 use nom::character::is_space;
-use nom::combinator::rest;
+use nom::combinator::{opt, rest};
 use nom::error::{Error, ErrorKind};
 use nom::number::complete::double;
 use nom::sequence::tuple;
@@ -12,6 +12,7 @@ use std::str::FromStr;
 
 use iso8601::parsers::parse_datetime;
 use iso8601::DateTime;
+use nom::branch::alt;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::{Parser, ParserError};
@@ -119,7 +120,7 @@ pub fn parse_details_comment<'a>(i: &'_ str) -> IResult<&'_ str, HashMap<String,
     let (mut i, _) = tag("--")(i)?;
 
     loop {
-        if let Ok((ii, (_, n, _))) = tuple((multispace0, parse_details_tag, multispace1))(i) {
+        if let Ok((ii, (_, n, _))) = tuple((multispace0, parse_details_tag, multispace0))(i) {
             i = ii;
             name.replace(n.to_string());
 
@@ -162,7 +163,13 @@ pub fn parse_details_comment<'a>(i: &'_ str) -> IResult<&'_ str, HashMap<String,
 }
 
 pub fn parse_details_tag<'a>(i: &'_ str) -> IResult<&'_ str, String> {
-    let (i, (name, _)) = tuple((alphanumeric1, tag(":")))(i)?;
+    let (i, (_, _, name, _, _)) = tuple((
+        opt(tag(",")),
+        multispace0,
+        alphanumeric1,
+        multispace0,
+        alt((tag(":"), tag("="))),
+    ))(i)?;
 
     Ok((i, name.into()))
 }
@@ -398,9 +405,13 @@ mod tests {
 
     #[test]
     fn parses_details_comment() {
-        let c = "-- Id: 123 long: some kind of details here caller: hello_world()\n";
+        let s0 = "-- Id: 123 long: some kind of details here caller: hello_world()\n";
+        let s1 = "-- Id: 123, long: some kind of details here, caller: hello_world()\n";
+        let s2 = "-- Id= 123, long = some kind of details here, caller =hello_world()\n";
 
-        let res = parse_details_comment(c).unwrap();
+        let res0 = parse_details_comment(s0).unwrap();
+        let res1 = parse_details_comment(s1).unwrap();
+        let res2 = parse_details_comment(s2).unwrap();
 
         let expected = (
             "",
@@ -411,7 +422,9 @@ mod tests {
             ]),
         );
 
-        assert_eq!(res, expected)
+        assert_eq!(res0, expected);
+        assert_eq!(res1, expected);
+        assert_eq!(res2, expected);
     }
 
     #[test]
