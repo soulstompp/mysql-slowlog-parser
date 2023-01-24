@@ -51,6 +51,8 @@ pub struct EntryUser {
     user: String,
     sys_user: String,
     host: String,
+    ip_address: Option<String>,
+    thread_id: u32,
 }
 
 impl EntryUser {
@@ -64,6 +66,14 @@ impl EntryUser {
 
     pub fn host(&self) -> String {
         self.host.clone()
+    }
+
+    pub fn ip_address(&self) -> Option<String> {
+        self.ip_address.clone()
+    }
+
+    pub fn thread_id(&self) -> u32 {
+        self.thread_id
     }
 }
 
@@ -86,9 +96,27 @@ pub fn parse_host<'a>(i: &'_ str) -> IResult<&'_ str, String> {
     }
 }
 
+/// ip address handler that only handles IP4
+pub fn parse_ip_address<'a>(i: &'_ str) -> IResult<&'_ str, String> {
+    let (i, (o1, _, o2, _, o3, _, o4)) =
+        tuple((digit1, tag("."), digit1, tag("."), digit1, tag("."), digit1))(i)?;
+
+    Ok((i, format!("{}.{}.{}.{}", o1, o2, o3, o4)))
+}
+
+/// an overly simplistic user parser
+pub fn parse_entry_user_thread_id<'a>(i: &'_ str) -> IResult<&'_ str, u32> {
+    let (i, (_, _, id)) = tuple((tag("Id:"), multispace1, digit1))(i)?;
+
+    Ok((i, u32::from_str(id).unwrap()))
+}
+
 /// an overly simplistic user parser
 pub fn parse_entry_user<'a>(i: &'_ str) -> IResult<&'_ str, EntryUser> {
-    let (i, (_, _, user, _, sys_user, _, _, _, _, host, _)) = tuple((
+    let (
+        i,
+        (_, _, user, _, sys_user, _, _, _, _, host, _, _, _, ip_address, _, _, _, thread_id, _),
+    ) = tuple((
         tag("# User@Host:"),
         multispace1,
         alphanumeric1,
@@ -99,6 +127,14 @@ pub fn parse_entry_user<'a>(i: &'_ str) -> IResult<&'_ str, EntryUser> {
         tag("@"),
         multispace1,
         parse_host,
+        multispace0,
+        tag("["),
+        multispace0,
+        opt(parse_ip_address),
+        multispace0,
+        tag("]"),
+        multispace1,
+        parse_entry_user_thread_id,
         rest,
     ))(i)?;
 
@@ -108,6 +144,8 @@ pub fn parse_entry_user<'a>(i: &'_ str) -> IResult<&'_ str, EntryUser> {
             user: user.into(),
             sys_user: sys_user.into(),
             host,
+            ip_address,
+            thread_id,
         },
     ))
 }
@@ -370,6 +408,8 @@ mod tests {
             user: "msandbox".to_string(),
             sys_user: "msandbox".to_string(),
             host: "localhost".to_string(),
+            ip_address: None,
+            thread_id: 3,
         };
 
         let res = parse_entry_user(i).unwrap();

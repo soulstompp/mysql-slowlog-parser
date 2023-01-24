@@ -101,6 +101,8 @@ impl EntryContext {
             user: user.user(),
             sys_user: user.sys_user(),
             host: user.host(),
+            ip_address: user.ip_address().unwrap_or("127.0.0.1".into()),
+            thread_id: user.thread_id(),
             query_time: stats.query_time(),
             lock_time: stats.lock_time(),
             rows_sent: stats.rows_sent(),
@@ -354,6 +356,8 @@ pub struct Entry {
     user: String,
     sys_user: String,
     host: String,
+    ip_address: String,
+    thread_id: u32,
     query_time: f64,
     lock_time: f64,
     rows_sent: u32,
@@ -385,6 +389,16 @@ impl Entry {
     /// returns the host name which requested the command
     pub fn host(&self) -> &str {
         &self.host
+    }
+
+    /// returns the ip address which requested the command
+    pub fn ip_address(&self) -> &str {
+        &self.ip_address
+    }
+
+    /// returns the the thread id of the session which requested the command
+    pub fn thread_id(&self) -> u32 {
+        self.thread_id
     }
 
     /// returns how long the query took to run
