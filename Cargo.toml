@@ -9,7 +9,7 @@ license = "MIT"
 [dependencies]
 nom = "7.1.1"
 iso8601 = "0.5.1"
-sqlparser = "0.30.0"
+sqlparser = {version = "0.30.0", features = ["visitor"]}
 thiserror = "1.0.38"
 
 [[example]]

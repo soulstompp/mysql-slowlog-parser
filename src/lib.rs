@@ -3,7 +3,7 @@
 //! A pull parser library for reading MySQL's slow query logs.
 extern crate core;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use thiserror::Error;
 
 use crate::parser::{
@@ -18,9 +18,10 @@ use crate::ReadError::{
     InvalidUserLine,
 };
 use iso8601::DateTime;
-use sqlparser::ast::Statement;
+use sqlparser::ast::{Statement, visit_relations};
 use std::io;
 use std::io::BufRead;
+use std::ops::ControlFlow;
 
 mod parser;
 
@@ -55,12 +56,47 @@ pub struct EntrySqlStatement {
     pub details: HashMap<String, String>,
 }
 
+impl EntrySqlStatement {
+    pub fn objects(&self) -> Vec<EntrySqlStatementObject> {
+        let mut visited = BTreeSet::new();
+
+        visit_relations(&self.statement, |relation| {
+            let ident = &relation.0;
+
+             let _ = visited.insert(
+                 if ident.len() == 2 {
+                     EntrySqlStatementObject {
+                         schema_name: Some(ident[0].value.to_string()),
+                         object_name: ident[1].value.to_string(),
+                     }
+                 }
+                     else {
+                         EntrySqlStatementObject {
+                             schema_name: None,
+                             object_name: ident.last().unwrap().value.to_string(),
+                         }
+                     }
+
+             );
+
+            ControlFlow::<()>::Continue(())
+        });
+        visited.into_iter().collect()
+    }
+}
+
 impl From<Statement> for EntrySqlStatement {
     fn from(statement: Statement) -> Self {
         let details = HashMap::new();
 
         EntrySqlStatement { statement, details }
     }
+}
+
+#[derive(Clone, Debug, Ord, PartialOrd, PartialEq, Eq)]
+pub struct EntrySqlStatementObject {
+    pub schema_name: Option<String>,
+    pub object_name: String,
 }
 
 /// Types of possible statements parsed from the log:
@@ -478,7 +514,7 @@ impl Entry {
 #[cfg(test)]
 mod tests {
     use crate::EntryStatement::SqlStatement;
-    use crate::{EntryMasking, Reader};
+    use crate::{EntryMasking, EntrySqlStatementObject, Reader};
     use std::collections::HashMap;
     use std::fs::File;
     use std::io::BufReader;
@@ -550,6 +586,53 @@ GROUP BY film.film_id, category.name;
 
         assert_eq!(res.len(), 2);
         assert_eq!(res[0], res[1]);
+    }
+
+    #[test]
+    fn parse_select_objects() {
+        let sql = String::from("# Time: 2018-02-05T02:46:47.273786Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:    10
+# Query_time: 0.000352  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1517798807;
+SELECT film.film_id AS FID, film.title AS title, film.description AS description, category.name AS category, film.rental_rate AS price
+FROM category LEFT JOIN film_category ON category.category_id = film_category.category_id LEFT
+JOIN film ON film_category.film_id = film.film_id LEFT JOIN film AS dupe_film ON film_category
+.film_id = dupe_film.film_id LEFT JOIN other.film AS other_film ON other_film.film_id =
+film_category.film_id
+GROUP BY film.film_id, category.name;
+");
+
+        let mut b = sql.as_bytes();
+        let mut r = Reader::new(&mut b, EntryMasking::None).unwrap();
+
+
+        let e = r.read_entry().unwrap().unwrap();
+
+        let expected = vec![
+            EntrySqlStatementObject {
+                schema_name: None,
+                object_name: "category".to_string(),
+            },
+            EntrySqlStatementObject {
+                schema_name: None,
+                object_name: "film".to_string(),
+            },
+            EntrySqlStatementObject {
+                schema_name: None,
+                object_name: "film_category".to_string(),
+            },
+            EntrySqlStatementObject {
+                schema_name: Some("other".to_string()),
+                object_name: "film".to_string(),
+            },
+        ];
+
+        match e.statement() {
+            SqlStatement(s) => {
+                assert_eq!(s.objects(), expected);
+            }
+            _ => { panic!("should have parsed sql as SqlStatement")}
+        }
     }
 
     #[test]
