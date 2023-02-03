@@ -4,6 +4,7 @@
 extern crate core;
 
 use std::collections::{BTreeSet, HashMap};
+use std::fmt::{Display, Formatter};
 use thiserror::Error;
 
 use crate::parser::{
@@ -83,6 +84,45 @@ impl EntrySqlStatement {
         });
         visited.into_iter().collect()
     }
+
+    pub fn entry_sql_type(&self) -> EntrySqlType {
+        match self.statement {
+            Statement::Query(_) => EntrySqlType::Query,
+            Statement::Insert { .. } => EntrySqlType::Insert,
+            Statement::Update { .. } => EntrySqlType::Update,
+            Statement::Delete { .. } => EntrySqlType::Delete,
+            Statement::CreateTable { .. } => EntrySqlType::CreateTable,
+            Statement::CreateIndex { .. } => EntrySqlType::CreateIndex,
+            Statement::CreateView { .. } => EntrySqlType::CreateView,
+            Statement::AlterTable { .. } => EntrySqlType::AlterTable,
+            Statement::AlterIndex { .. } => EntrySqlType::AlterIndex,
+            Statement::Drop { .. } => EntrySqlType::Drop,
+            Statement::DropFunction { .. } => EntrySqlType::DropFunction,
+            Statement::SetVariable { .. } => EntrySqlType::SetVariable,
+            Statement::SetNames { .. } => EntrySqlType::SetNames,
+            Statement::SetNamesDefault { .. } => EntrySqlType::SetNamesDefault,
+            Statement::ShowVariable { .. } => EntrySqlType::ShowVariable,
+            Statement::ShowVariables { .. } => EntrySqlType::ShowVariables,
+            Statement::ShowCreate { .. } => EntrySqlType::ShowCreate,
+            Statement::ShowColumns { .. } => EntrySqlType::ShowColumns,
+            Statement::ShowTables { .. } => EntrySqlType::ShowTables,
+            Statement::ShowCollation { .. } => EntrySqlType::ShowCollation,
+            Statement::Use { .. } => EntrySqlType::Use,
+            Statement::StartTransaction { .. } => EntrySqlType::StartTransaction,
+            Statement::SetTransaction { .. } => EntrySqlType::SetTransaction,
+            Statement::Commit { .. } => EntrySqlType::Commit,
+            Statement::Rollback { .. } => EntrySqlType::Rollback,
+            Statement::CreateSchema { .. } => EntrySqlType::CreateSchema,
+            Statement::CreateDatabase { .. } => EntrySqlType::CreateDatabase,
+            Statement::Grant { .. } => EntrySqlType::Grant,
+            Statement::Revoke { .. } => EntrySqlType::Revoke,
+            Statement::Kill { .. } => EntrySqlType::Kill,
+            Statement::ExplainTable { .. } => EntrySqlType::ExplainTable,
+            Statement::Explain { .. } => EntrySqlType::Explain,
+            Statement::Savepoint { .. } => EntrySqlType::Savepoint,
+            _ => panic!("sql types for MySQL should be exhaustive")
+        }
+    }
 }
 
 impl From<Statement> for EntrySqlStatement {
@@ -108,6 +148,122 @@ pub enum EntryStatement {
     AdminCommand(EntryAdminCommand),
     SqlStatement(EntrySqlStatement),
     InvalidStatement(String),
+}
+
+/// The SQL statement type of the EntrySqlStatement.
+///
+/// NOTE: this is a MySQL specific sub-set of the entries in `sql_parser::ast::Statement`. This is
+/// a simpler enum to match against and displays as the start of the SQL command.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EntrySqlType {
+    /// SELECT
+    Query,
+    /// INSERT
+    Insert,
+    /// UPDATE
+    Update,
+    /// DELETE
+    Delete,
+    /// CREATE TABLE
+    CreateTable,
+    /// CREATE INDEX
+    CreateIndex,
+    /// CREATE VIEW
+    CreateView,
+    /// ALTER TABLE
+    AlterTable,
+    /// ALTER INDEX
+    AlterIndex,
+    /// DROP TABLE
+    Drop,
+    /// DROP FUNCTION
+    DropFunction,
+    /// SET VARIABLE
+    SetVariable,
+    /// SET NAMES
+    SetNames,
+    /// SET NAMES DEFAULT
+    SetNamesDefault,
+    /// SHOW VARIABLE
+    ShowVariable,
+    /// SHOW VARIABLES
+    ShowVariables,
+    /// SHOW CREATE TABLE
+    ShowCreate,
+    /// SHOW COLUMNS
+    ShowColumns,
+    /// SHOW TABLES
+    ShowTables,
+    /// SHOW COLLATION
+    ShowCollation,
+    /// USE
+    Use,
+    /// BEGIN TRANSACTION
+    StartTransaction,
+    /// SET TRANSACTION
+    SetTransaction,
+    /// COMMIT TRANSACTION
+    Commit,
+    /// ROLLBACK TRANSACTION
+    Rollback,
+    /// CREATE SCHEMA
+    CreateSchema,
+    /// CREATE DATABASE
+    CreateDatabase,
+    /// GRANT
+    Grant,
+    /// REVOKE
+    Revoke,
+    /// KILL
+    Kill,
+    /// EXPLAIN TABLE
+    ExplainTable,
+    /// EXPLAIN
+    Explain,
+    /// SAVEPOINT
+    Savepoint,
+}
+
+impl Display for EntrySqlType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let out = match self {
+            Self::Query => "SELECT",
+            Self::Insert => "INSERT",
+            Self::Update => "UPDATE",
+            Self::Delete => "DELETE",
+            Self::CreateTable => "CREATE TABLE",
+            Self::CreateIndex => "CREATE INDEX",
+            Self::CreateView => "CREATE VIEW",
+            Self::AlterTable => "ALTER TABLE",
+            Self::AlterIndex => "ALTER INDEX",
+            Self::Drop => "DROP TABLE",
+            Self::DropFunction => "DROP FUNCTION",
+            Self::SetVariable => "SET VARIABLE",
+            Self::SetNames => "SET NAMES",
+            Self::SetNamesDefault => "SET NAMES DEFAULT",
+            Self::ShowVariable => "SHOW VARIABLE",
+            Self::ShowVariables => "SHOW VARIABLES",
+            Self::ShowCreate => "SHOW CREATE TABLE",
+            Self::ShowColumns => "SHOW COLUMNS",
+            Self::ShowTables => "SHOW TABLES",
+            Self::ShowCollation => "SHOW COLLATION",
+            Self::Use => "USE",
+            Self::StartTransaction => "BEGIN TRANSACTION",
+            Self::SetTransaction => "SET TRANSACTION",
+            Self::Commit => "COMMIT TRANSACTION",
+            Self::Rollback => "ROLLBACK TRANSACTION",
+            Self::CreateSchema => "CREATE SCHEMA",
+            Self::CreateDatabase => "CREATE DATABASE",
+            Self::Grant =>"GRANT",
+            Self::Revoke =>"REVOKE",
+            Self::Kill =>"KILL",
+            Self::ExplainTable => "EXPLAIN TABLE",
+            Self::Explain => "EXPLAIN",
+            Self::Savepoint => "SAVEPOINT",
+        };
+
+        write!(f, "{}", out)
+    }
 }
 
 /// context used internally for a Reader while parsing lines
@@ -212,7 +368,7 @@ impl<'a> Reader<'a> {
                     h.push_str(&l);
                 }
             } else {
-                return Err(ReadError::IncompleteLog);
+                return Err(IncompleteLog);
             }
         }
 
@@ -285,12 +441,12 @@ impl<'a> Reader<'a> {
                     sql.push_str(&l);
 
                     if let Ok((_, command)) = parse_admin_command(&l) {
-                        self.context.statement = Some(EntryStatement::AdminCommand(command))
+                        self.context.statement = Some(AdminCommand(command))
                     } else {
                         if let Ok(s) = parse_sql(&sql, &self.masking) {
                             if s.len() == 1 {
                                 self.context.statement =
-                                    Some(EntryStatement::SqlStatement(EntrySqlStatement {
+                                    Some(SqlStatement(EntrySqlStatement {
                                         statement: s[0].clone(),
                                         details: details.take().unwrap_or(HashMap::new()),
                                     }))
@@ -630,6 +786,7 @@ GROUP BY film.film_id, category.name;
         match e.statement() {
             SqlStatement(s) => {
                 assert_eq!(s.objects(), expected);
+                assert_eq!(s.entry_sql_type().to_string(), "SELECT".to_string());
             }
             _ => { panic!("should have parsed sql as SqlStatement")}
         }
