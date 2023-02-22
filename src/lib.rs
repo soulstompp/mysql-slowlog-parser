@@ -4,14 +4,16 @@
 extern crate core;
 
 use std::collections::{BTreeSet, HashMap};
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 use thiserror::Error;
 
 use crate::parser::{
     parse_admin_command, parse_details_comment, parse_entry_stats, parse_entry_time,
-    parse_entry_user, parse_sql, parse_start_timestamp_command, EntryAdminCommand, EntryStats,
-    EntryTime, EntryUser,
+    parse_entry_user, parse_sql, parse_start_timestamp_command,
 };
+
+pub use crate::parser::{EntryAdminCommand, EntryStats, EntryTime, EntryUser, SqlStatementContext};
+
 use crate::EntryError::MissingField;
 use crate::EntryStatement::{AdminCommand, SqlStatement};
 use crate::ReadError::{
@@ -19,7 +21,7 @@ use crate::ReadError::{
     InvalidUserLine,
 };
 use iso8601::DateTime;
-use sqlparser::ast::{Statement, visit_relations};
+use sqlparser::ast::{visit_relations, Statement};
 use std::io;
 use std::io::BufRead;
 use std::ops::ControlFlow;
@@ -49,12 +51,14 @@ pub enum ReadError {
 pub enum EntryError {
     #[error("entry is missing: {0}")]
     MissingField(String),
+    #[error("duplicate id: {0}")]
+    DuplicateId(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntrySqlStatement {
     pub statement: Statement,
-    pub details: HashMap<String, String>,
+    pub context: Option<SqlStatementContext>,
 }
 
 impl EntrySqlStatement {
@@ -64,21 +68,17 @@ impl EntrySqlStatement {
         visit_relations(&self.statement, |relation| {
             let ident = &relation.0;
 
-             let _ = visited.insert(
-                 if ident.len() == 2 {
-                     EntrySqlStatementObject {
-                         schema_name: Some(ident[0].value.to_string()),
-                         object_name: ident[1].value.to_string(),
-                     }
-                 }
-                     else {
-                         EntrySqlStatementObject {
-                             schema_name: None,
-                             object_name: ident.last().unwrap().value.to_string(),
-                         }
-                     }
-
-             );
+            let _ = visited.insert(if ident.len() == 2 {
+                EntrySqlStatementObject {
+                    schema_name: Some(ident[0].value.to_string()),
+                    object_name: ident[1].value.to_string(),
+                }
+            } else {
+                EntrySqlStatementObject {
+                    schema_name: None,
+                    object_name: ident.last().unwrap().value.to_string(),
+                }
+            });
 
             ControlFlow::<()>::Continue(())
         });
@@ -120,16 +120,17 @@ impl EntrySqlStatement {
             Statement::ExplainTable { .. } => EntrySqlType::ExplainTable,
             Statement::Explain { .. } => EntrySqlType::Explain,
             Statement::Savepoint { .. } => EntrySqlType::Savepoint,
-            _ => panic!("sql types for MySQL should be exhaustive")
+            _ => panic!("sql types for MySQL should be exhaustive"),
         }
     }
 }
 
 impl From<Statement> for EntrySqlStatement {
     fn from(statement: Statement) -> Self {
-        let details = HashMap::new();
-
-        EntrySqlStatement { statement, details }
+        EntrySqlStatement {
+            statement,
+            context: None,
+        }
     }
 }
 
@@ -254,9 +255,9 @@ impl Display for EntrySqlType {
             Self::Rollback => "ROLLBACK TRANSACTION",
             Self::CreateSchema => "CREATE SCHEMA",
             Self::CreateDatabase => "CREATE DATABASE",
-            Self::Grant =>"GRANT",
-            Self::Revoke =>"REVOKE",
-            Self::Kill =>"KILL",
+            Self::Grant => "GRANT",
+            Self::Revoke => "REVOKE",
+            Self::Kill => "KILL",
             Self::ExplainTable => "EXPLAIN TABLE",
             Self::Explain => "EXPLAIN",
             Self::Savepoint => "SAVEPOINT",
@@ -311,7 +312,7 @@ impl EntryContext {
 /// types of masking to apply when parsing SQL statements
 /// * PlaceHolder - mask all sql values with a '?' placeholder
 /// * None - leave all values in place
-#[derive(PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum EntryMasking {
     PlaceHolder,
     None,
@@ -323,21 +324,71 @@ impl Default for EntryMasking {
     }
 }
 
+#[derive(Default)]
+pub struct ReaderConfig {
+    pub masking: EntryMasking,
+    pub map_comment_context:
+        Option<Box<dyn Fn(HashMap<String, String>) -> Option<SqlStatementContext>>>,
+}
+
+impl Debug for ReaderConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.masking)?;
+        write!(f, "map_comment_context: fn")
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum ReaderBuildError {
+    #[error("reader must be set to build Reader")]
+    MissingReader,
+}
+
+#[derive(Default)]
+pub struct ReaderBuilder<'a> {
+    reader: Option<&'a mut dyn BufRead>,
+    config: ReaderConfig,
+}
+
+impl<'a> ReaderBuilder<'a> {
+    pub fn reader(mut self, r: &'a mut dyn BufRead) -> Self {
+        self.reader = Some(r);
+        self
+    }
+
+    pub fn masking(mut self, m: EntryMasking) -> Self {
+        self.config.masking = m;
+        self
+    }
+
+    pub fn comment_context_mapping(
+        mut self,
+        f: Box<dyn Fn(HashMap<String, String>) -> Option<SqlStatementContext>>,
+    ) -> Self {
+        self.config.map_comment_context = Some(f);
+        self
+    }
+
+    pub fn build(mut self) -> Result<Reader<'a>, ReaderBuildError> {
+        Ok(Reader {
+            reader: self.reader.take().ok_or(ReaderBuildError::MissingReader)?,
+            context: Default::default(),
+            header: None,
+            config: self.config,
+        })
+    }
+}
+
 pub struct Reader<'a> {
     reader: &'a mut dyn BufRead,
     context: EntryContext,
-    masking: EntryMasking,
     header: Option<String>,
+    config: ReaderConfig,
 }
 
 impl<'a> Reader<'a> {
-    pub fn new(reader: &'a mut dyn BufRead, m: EntryMasking) -> Result<Self, ReadError> {
-        Ok(Self {
-            reader,
-            context: Default::default(),
-            masking: m,
-            header: Default::default(),
-        })
+    pub fn builder() -> ReaderBuilder<'a> {
+        ReaderBuilder::default()
     }
 
     /// reads next line in BufReader returning None when there is nothing left to read
@@ -443,13 +494,25 @@ impl<'a> Reader<'a> {
                     if let Ok((_, command)) = parse_admin_command(&l) {
                         self.context.statement = Some(AdminCommand(command))
                     } else {
-                        if let Ok(s) = parse_sql(&sql, &self.masking) {
+                        if let Ok(s) = parse_sql(&sql, &self.config.masking) {
                             if s.len() == 1 {
-                                self.context.statement =
-                                    Some(SqlStatement(EntrySqlStatement {
-                                        statement: s[0].clone(),
-                                        details: details.take().unwrap_or(HashMap::new()),
-                                    }))
+                                let context: Option<SqlStatementContext> = if let Some(d) = details
+                                {
+                                    if let Some(f) = &self.config.map_comment_context {
+                                        f(d)
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+
+                                let s = EntrySqlStatement {
+                                    statement: s[0].clone(),
+                                    context,
+                                };
+
+                                self.context.statement = Some(SqlStatement(s))
                             } else {
                                 self.context.statement = Some(EntryStatement::InvalidStatement(sql))
                             }
@@ -669,9 +732,9 @@ impl Entry {
 
 #[cfg(test)]
 mod tests {
+    use crate::parser::SqlStatementContext;
     use crate::EntryStatement::SqlStatement;
     use crate::{EntryMasking, EntrySqlStatementObject, Reader};
-    use std::collections::HashMap;
     use std::fs::File;
     use std::io::BufReader;
     use std::ops::AddAssign;
@@ -689,16 +752,35 @@ GROUP BY film.film_id, category.name;
 ");
 
         let mut b = sql.as_bytes();
-        let mut r = Reader::new(&mut b, EntryMasking::None).unwrap();
+        let rb = Reader::builder()
+            .reader(&mut b)
+            .comment_context_mapping(Box::new(|h| {
+                if let Some(id) = h.get("ID") {
+                    if let Some(c) = h.get("caller") {
+                        Some(SqlStatementContext {
+                            id: Some(id.to_string()),
+                            function: Some(c.to_string()),
+                            ..Default::default()
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }));
+        let mut r = rb.build().unwrap();
 
-        let ed = HashMap::from([
-            ("ID".into(), "123".into()),
-            ("caller".into(), "hello_world()".into()),
-        ]);
+        let context = SqlStatementContext {
+            id: Some("123".to_string()),
+            caller: None,
+            function: Some("hello_world()".into()),
+            line: None,
+        };
 
         while let Some(e) = r.read_entry().unwrap() {
             if let SqlStatement(s) = e.statement {
-                assert_eq!(s.details, ed);
+                assert_eq!(s.context, Some(context.clone()));
             } else {
                 panic!("no statement")
             }
@@ -724,7 +806,8 @@ GROUP BY film.film_id, category.name;
 ");
 
         let mut b = sql.as_bytes();
-        let mut r = Reader::new(&mut b, EntryMasking::None).unwrap();
+        let rb = Reader::builder().reader(&mut b);
+        let mut r = rb.build().unwrap();
 
         let mut i = 0usize;
 
@@ -759,8 +842,8 @@ GROUP BY film.film_id, category.name;
 ");
 
         let mut b = sql.as_bytes();
-        let mut r = Reader::new(&mut b, EntryMasking::None).unwrap();
-
+        let rb = Reader::builder().reader(&mut b);
+        let mut r = rb.build().unwrap();
 
         let e = r.read_entry().unwrap().unwrap();
 
@@ -788,14 +871,20 @@ GROUP BY film.film_id, category.name;
                 assert_eq!(s.objects(), expected);
                 assert_eq!(s.entry_sql_type().to_string(), "SELECT".to_string());
             }
-            _ => { panic!("should have parsed sql as SqlStatement")}
+            _ => {
+                panic!("should have parsed sql as SqlStatement")
+            }
         }
     }
 
     #[test]
     fn parse_slow_log() {
         let mut fr = BufReader::new(File::open("data/slow-test-queries.log").unwrap());
-        let mut r = Reader::new(&mut fr, EntryMasking::PlaceHolder).unwrap();
+
+        let rb = Reader::builder()
+            .reader(&mut fr)
+            .masking(EntryMasking::PlaceHolder);
+        let mut r = rb.build().unwrap();
 
         let mut i = 0usize;
 

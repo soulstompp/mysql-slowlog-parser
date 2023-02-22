@@ -150,6 +150,14 @@ pub fn parse_entry_user<'a>(i: &'_ str) -> IResult<&'_ str, EntryUser> {
     ))
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SqlStatementContext {
+    pub id: Option<String>,
+    pub caller: Option<String>,
+    pub function: Option<String>,
+    pub line: Option<u32>,
+}
+
 pub fn parse_details_comment<'a>(i: &'_ str) -> IResult<&'_ str, HashMap<String, String>> {
     let mut name = None;
 
@@ -158,8 +166,9 @@ pub fn parse_details_comment<'a>(i: &'_ str) -> IResult<&'_ str, HashMap<String,
     let (mut i, _) = tag("--")(i)?;
 
     loop {
-        if let Ok((ii, (_, n, _))) = tuple((multispace0, parse_details_tag, multispace0))(i) {
+        if let Ok((ii, n)) = parse_details_tag(i) {
             i = ii;
+
             name.replace(n.to_string());
 
             if let Some(_) = res.insert(n, String::new()) {
@@ -201,12 +210,13 @@ pub fn parse_details_comment<'a>(i: &'_ str) -> IResult<&'_ str, HashMap<String,
 }
 
 pub fn parse_details_tag<'a>(i: &'_ str) -> IResult<&'_ str, String> {
-    let (i, (_, _, name, _, _)) = tuple((
+    let (i, (_, _, name, _, _, _)) = tuple((
         opt(tag(",")),
         multispace0,
         alphanumeric1,
         multispace0,
         alt((tag(":"), tag("="))),
+        multispace1,
     ))(i)?;
 
     Ok((i, name.into()))
@@ -446,8 +456,8 @@ mod tests {
     #[test]
     fn parses_details_comment() {
         let s0 = "-- Id: 123 long: some kind of details here caller: hello_world()\n";
-        let s1 = "-- Id: 123, long: some kind of details here, caller: hello_world()\n";
-        let s2 = "-- Id= 123, long = some kind of details here, caller =hello_world()\n";
+        let s1 = "-- Id: 123, long: some kind of details here, caller : hello_world()\n";
+        let s2 = "-- Id= 123, long = some kind of details here, caller= hello_world()\n";
 
         let res0 = parse_details_comment(s0).unwrap();
         let res1 = parse_details_comment(s1).unwrap();
@@ -465,6 +475,36 @@ mod tests {
         assert_eq!(res0, expected);
         assert_eq!(res1, expected);
         assert_eq!(res2, expected);
+    }
+
+    #[test]
+    fn parses_details_comment_trailing_key() {
+        let s0 = "-- Id: 123 long: some kind of details here caller: hello_world():52\n";
+        let s1 = "-- Id: 123 long: some kind of details here caller: hello_world(): 52\n";
+
+        let res0 = parse_details_comment(s0).unwrap();
+        let res1 = parse_details_comment(s1).unwrap();
+
+        let expected0 = (
+            "",
+            HashMap::from([
+                ("Id".into(), "123".into()),
+                ("long".into(), "some kind of details here".into()),
+                ("caller".into(), "hello_world():52".into()),
+            ]),
+        );
+
+        let expected1 = (
+            "",
+            HashMap::from([
+                ("Id".into(), "123".into()),
+                ("long".into(), "some kind of details here".into()),
+                ("caller".into(), "hello_world(): 52".into()),
+            ]),
+        );
+
+        assert_eq!(res0, expected0);
+        assert_eq!(res1, expected1);
     }
 
     #[test]
