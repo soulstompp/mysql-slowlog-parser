@@ -4,8 +4,10 @@
 extern crate core;
 
 use std::collections::{BTreeSet, HashMap};
+use std::default::Default;
 use std::fmt::{Debug, Display, Formatter};
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
 
 use crate::parser::{
     parse_admin_command, parse_details_comment, parse_entry_stats, parse_entry_time,
@@ -20,11 +22,12 @@ use crate::ReadError::{
     IncompleteEntry, IncompleteLog, IncompleteSql, InvalidStatsLine, InvalidTimeLine,
     InvalidUserLine,
 };
+use async_stream::try_stream;
+use futures::{Stream, TryStream};
 use iso8601::DateTime;
 use sqlparser::ast::{visit_relations, Statement};
-use std::io;
-use std::io::BufRead;
 use std::ops::ControlFlow;
+use tokio::io::AsyncBufReadExt;
 
 mod parser;
 
@@ -32,7 +35,7 @@ mod parser;
 #[derive(Error, Debug)]
 pub enum ReadError {
     #[error("file read error: {0}")]
-    IO(#[from] io::Error),
+    IO(#[from] tokio::io::Error),
     #[error("invalid time line: {0}")]
     InvalidTimeLine(String),
     #[error("invalid user line: {0}")]
@@ -344,14 +347,22 @@ pub enum ReaderBuildError {
     MissingReader,
 }
 
-#[derive(Default)]
-pub struct ReaderBuilder<'a> {
-    reader: Option<&'a mut dyn BufRead>,
+pub struct ReaderBuilder<R: AsyncReadExt + AsyncBufReadExt + Unpin> {
+    reader: Option<R>,
     config: ReaderConfig,
 }
 
-impl<'a> ReaderBuilder<'a> {
-    pub fn reader(mut self, r: &'a mut dyn BufRead) -> Self {
+impl<R: AsyncReadExt + AsyncBufReadExt + Unpin> Default for ReaderBuilder<R> {
+    fn default() -> Self {
+        ReaderBuilder {
+            reader: None,
+            config: ReaderConfig::default(),
+        }
+    }
+}
+
+impl<R: AsyncReadExt + AsyncBufReadExt + Unpin> ReaderBuilder<R> {
+    pub fn reader(mut self, r: R) -> Self {
         self.reader = Some(r);
         self
     }
@@ -369,7 +380,7 @@ impl<'a> ReaderBuilder<'a> {
         self
     }
 
-    pub fn build(mut self) -> Result<Reader<'a>, ReaderBuildError> {
+    pub fn build(mut self) -> Result<Reader<R>, ReaderBuildError> {
         Ok(Reader {
             reader: self.reader.take().ok_or(ReaderBuildError::MissingReader)?,
             context: Default::default(),
@@ -379,23 +390,23 @@ impl<'a> ReaderBuilder<'a> {
     }
 }
 
-pub struct Reader<'a> {
-    reader: &'a mut dyn BufRead,
+pub struct Reader<R: AsyncReadExt + AsyncBufReadExt + Unpin> {
+    reader: R,
     context: EntryContext,
     header: Option<String>,
     config: ReaderConfig,
 }
 
-impl<'a> Reader<'a> {
-    pub fn builder() -> ReaderBuilder<'a> {
+impl<R: AsyncReadExt + AsyncBufReadExt + Unpin> Reader<R> {
+    pub fn builder() -> ReaderBuilder<R> {
         ReaderBuilder::default()
     }
 
     /// reads next line in BufReader returning None when there is nothing left to read
-    fn read_line(&mut self) -> Result<Option<String>, ReadError> {
+    async fn read_line(&mut self) -> Result<Option<String>, ReadError> {
         let mut l = String::new();
 
-        let bytes = self.reader.read_line(&mut l)?;
+        let bytes = self.reader.read_line(&mut l).await?;
 
         if bytes == 0 {
             return Ok(None);
@@ -405,15 +416,15 @@ impl<'a> Reader<'a> {
     }
 
     /// reads header section of an entry, currently parses the whole header as a String
-    fn read_header(&mut self) -> Result<(), ReadError> {
+    async fn read_header(&mut self) -> Result<(), ReadError> {
         let mut h = String::new();
 
         loop {
-            let line = self.read_line()?;
+            let line = self.read_line().await?;
 
             if let Some(l) = line {
                 if l.starts_with("#") {
-                    self.start_entry(&l)?;
+                    self.start_entry(&l).await?;
                     break;
                 } else {
                     h.push_str(&l);
@@ -433,8 +444,8 @@ impl<'a> Reader<'a> {
     /// String
     ///
     /// *Note: this line sometimes contains an Id: [] portion which is discarded.*
-    fn read_time(&mut self) -> Result<Option<()>, ReadError> {
-        let line = self.read_line()?;
+    async fn read_time(&mut self) -> Result<Option<()>, ReadError> {
+        let line = self.read_line().await?;
 
         if let Some(l) = line {
             if let Ok((_, t)) = parse_entry_time(&l) {
@@ -450,8 +461,8 @@ impl<'a> Reader<'a> {
     }
 
     /// reads the entry line containing statistics on the query
-    fn read_stats(&mut self) -> Result<(), ReadError> {
-        let line = self.read_line()?;
+    async fn read_stats(&mut self) -> Result<(), ReadError> {
+        let line = self.read_line().await?;
 
         if let Some(l) = line {
             if let Ok((_, s)) = parse_entry_stats(&l) {
@@ -467,12 +478,12 @@ impl<'a> Reader<'a> {
     }
 
     /// reads the entry lines containing SQL and admistrator command statements
-    fn read_sql(&mut self) -> Result<Option<Entry>, ReadError> {
+    async fn read_sql(&mut self) -> Result<Option<Entry>, ReadError> {
         let mut sql = String::new();
         let mut details = None;
 
         'sql: loop {
-            let line = self.read_line()?;
+            let line = self.read_line().await?;
 
             if let Some(l) = line {
                 if sql.len() == 0 {
@@ -530,7 +541,7 @@ impl<'a> Reader<'a> {
                 if l.starts_with("#") {
                     let e = self.context.entry().or_else(|e| Err(IncompleteEntry(e)))?;
 
-                    self.start_entry(&l)?;
+                    self.start_entry(&l).await?;
 
                     return Ok(Some(e));
                 } else {
@@ -550,25 +561,40 @@ impl<'a> Reader<'a> {
         }
     }
 
+    pub fn read_entries<'a>(
+        &'a mut self,
+    ) -> impl TryStream + Stream<Item = Result<Entry, ReadError>> + 'a {
+        try_stream! {
+            loop {
+                yield if let Some(e) = self.read_entry().await? {
+                    e
+                }
+                else {
+                    break;
+                };
+            }
+        }
+    }
+
     /// reads lines from BufReader and build
     ///
     /// *Note: the buffer is left at the start of the next entry, with a partially created entry
     /// stored in EntryContext. This partial which will be completed on the next call.*
-    pub fn read_entry(&mut self) -> Result<Option<Entry>, ReadError> {
+    pub async fn read_entry(&mut self) -> Result<Option<Entry>, ReadError> {
         if self.header.is_none() {
-            self.read_header()?;
+            self.read_header().await?;
         }
 
         let mut line = None;
 
         if self.context.started() {
-            line = self.read_line()?;
+            line = self.read_line().await?;
 
             if line.is_none() {
                 return Ok(None);
             }
         } else {
-            if self.read_time()?.is_none() {
+            if self.read_time().await?.is_none() {
                 return Ok(None);
             }
         }
@@ -583,13 +609,13 @@ impl<'a> Reader<'a> {
             return Err(IncompleteLog);
         }
 
-        self.read_stats()?;
+        self.read_stats().await?;
 
-        self.read_sql()
+        self.read_sql().await
     }
 
     /// Parses the first line of an entry and resets `self.context` with only this initial value.
-    fn start_entry(&mut self, l: &str) -> Result<(), ReadError> {
+    async fn start_entry(&mut self, l: &str) -> Result<(), ReadError> {
         if let Ok((_, t)) = parse_entry_time(&l) {
             self.context = EntryContext {
                 time: Some(t),
@@ -735,12 +761,14 @@ mod tests {
     use crate::parser::SqlStatementContext;
     use crate::EntryStatement::SqlStatement;
     use crate::{EntryMasking, EntrySqlStatementObject, Reader};
-    use std::fs::File;
-    use std::io::BufReader;
+    use futures::StreamExt;
     use std::ops::AddAssign;
+    use std::pin::pin;
+    use tokio::fs::File;
+    use tokio::io::BufReader;
 
-    #[test]
-    fn parse_select_entry() {
+    #[tokio::test]
+    async fn parse_select_entry() {
         let sql = String::from("# Time: 2018-02-05T02:46:47.273786Z
 # User@Host: msandbox[msandbox] @ localhost []  Id:    10
 # Query_time: 0.000352  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
@@ -778,7 +806,7 @@ GROUP BY film.film_id, category.name;
             line: None,
         };
 
-        while let Some(e) = r.read_entry().unwrap() {
+        while let Some(e) = r.read_entry().await.unwrap() {
             if let SqlStatement(s) = e.statement {
                 assert_eq!(s.context, Some(context.clone()));
             } else {
@@ -787,8 +815,8 @@ GROUP BY film.film_id, category.name;
         }
     }
 
-    #[test]
-    fn parse_select_entries() {
+    #[tokio::test]
+    async fn parse_select_entries() {
         let sql = String::from("# Time: 2018-02-05T02:46:47.273786Z
 # User@Host: msandbox[msandbox] @ localhost []  Id:    10
 # Query_time: 0.000352  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
@@ -813,7 +841,13 @@ GROUP BY film.film_id, category.name;
 
         let mut res = vec![];
 
-        while let Some(e) = r.read_entry().unwrap() {
+        let mut entries = r.read_entries();
+
+        let mut entries = pin!(entries);
+
+        while let Some(re) = entries.next().await {
+            let e = re.unwrap();
+
             if !e.has_sql_statement() {
                 continue;
             }
@@ -827,8 +861,8 @@ GROUP BY film.film_id, category.name;
         assert_eq!(res[0], res[1]);
     }
 
-    #[test]
-    fn parse_select_objects() {
+    #[tokio::test]
+    async fn parse_select_objects() {
         let sql = String::from("# Time: 2018-02-05T02:46:47.273786Z
 # User@Host: msandbox[msandbox] @ localhost []  Id:    10
 # Query_time: 0.000352  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
@@ -845,7 +879,7 @@ GROUP BY film.film_id, category.name;
         let rb = Reader::builder().reader(&mut b);
         let mut r = rb.build().unwrap();
 
-        let e = r.read_entry().unwrap().unwrap();
+        let e = r.read_entry().await.unwrap().unwrap();
 
         let expected = vec![
             EntrySqlStatementObject {
@@ -877,9 +911,9 @@ GROUP BY film.film_id, category.name;
         }
     }
 
-    #[test]
-    fn parse_slow_log() {
-        let mut fr = BufReader::new(File::open("data/slow-test-queries.log").unwrap());
+    #[tokio::test]
+    async fn parse_slow_log() {
+        let mut fr = BufReader::new(File::open("data/slow-test-queries.log").await.unwrap());
 
         let rb = Reader::builder()
             .reader(&mut fr)
@@ -888,7 +922,7 @@ GROUP BY film.film_id, category.name;
 
         let mut i = 0usize;
 
-        while let Some(_) = r.read_entry().unwrap() {
+        while let Some(_) = r.read_entry().await.unwrap() {
             i += 1;
         }
 
