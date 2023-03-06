@@ -1,18 +1,19 @@
-use nom::bytes::complete::{tag, take_until};
-use nom::character::complete::{alphanumeric1, anychar, digit1, multispace0, multispace1};
+use nom::bytes::complete::{tag, take, take_until};
+use nom::character::complete::{alpha1, alphanumeric1, anychar, digit1, multispace0, multispace1};
 use nom::character::is_space;
 use nom::combinator::{opt, rest};
 use nom::error::{Error, ErrorKind};
 use nom::number::complete::double;
-use nom::sequence::tuple;
-use nom::Err as nomErr;
+use nom::sequence::{terminated, tuple};
 use nom::IResult;
+use nom::{AsChar, Err as nomErr, InputTakeAtPosition};
 use std::collections::HashMap;
 use std::str::FromStr;
 
 use iso8601::parsers::parse_datetime;
 use iso8601::DateTime;
 use nom::branch::alt;
+use nom::multi::{many1, many_m_n};
 use sqlparser::ast::Statement;
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::{Parser, ParserError};
@@ -50,7 +51,7 @@ pub fn parse_entry_time(i: &str) -> IResult<&str, EntryTime> {
 pub struct EntryUser {
     user: String,
     sys_user: String,
-    host: String,
+    host: Option<String>,
     ip_address: Option<String>,
     thread_id: u32,
 }
@@ -65,11 +66,11 @@ impl EntryUser {
     }
 
     pub fn host(&self) -> String {
-        self.host.clone()
+        self.host.clone().unwrap_or(self.ip_address())
     }
 
-    pub fn ip_address(&self) -> Option<String> {
-        self.ip_address.clone()
+    pub fn ip_address(&self) -> String {
+        self.ip_address.clone().unwrap_or("127.0.0.1".to_string())
     }
 
     pub fn thread_id(&self) -> u32 {
@@ -77,23 +78,33 @@ impl EntryUser {
     }
 }
 
-/// an overly simplistic hostname parser
+// borrowed from https://blog.logrocket.com/parsing-in-rust-with-nom/
+fn alphanumerichyphen1<T>(i: T) -> IResult<T, T>
+where
+    T: InputTakeAtPosition,
+    <T as InputTakeAtPosition>::Item: AsChar,
+{
+    i.split_at_position1_complete(
+        |item| {
+            let char_item = item.as_char();
+            !(char_item == '-') && !char_item.is_alphanum()
+        },
+        ErrorKind::AlphaNumeric,
+    )
+}
+
+// borrowed from https://blog.logrocket.com/parsing-in-rust-with-nom/
 pub fn parse_host<'a>(i: &'_ str) -> IResult<&'_ str, String> {
-    let mut acc = String::new();
+    let (i, mut parts) = alt((
+        tuple((many1(terminated(alphanumerichyphen1, tag("."))), alpha1)),
+        tuple((many_m_n(1, 1, alphanumerichyphen1), take(0 as usize))),
+    ))(i)?;
 
-    let mut i = i;
-
-    loop {
-        let (ii, c) = anychar(i)?;
-
-        i = ii;
-
-        if is_space(c as u8) {
-            return Ok((i, acc));
-        }
-
-        acc.push(c);
+    if !parts.1.is_empty() {
+        parts.0.push(parts.1);
     }
+
+    Ok((i, parts.0.join(".")))
 }
 
 /// ip address handler that only handles IP4
@@ -126,7 +137,7 @@ pub fn parse_entry_user<'a>(i: &'_ str) -> IResult<&'_ str, EntryUser> {
         multispace1,
         tag("@"),
         multispace1,
-        parse_host,
+        opt(parse_host),
         multispace0,
         tag("["),
         multispace0,
@@ -411,15 +422,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_user_line() {
+    fn parse_user_line_no_ip() {
         let i = "# User@Host: msandbox[msandbox] @ localhost []  Id:     3";
 
         let expected = EntryUser {
             user: "msandbox".to_string(),
             sys_user: "msandbox".to_string(),
-            host: "localhost".to_string(),
+            host: Some("localhost".to_string()),
             ip_address: None,
             thread_id: 3,
+        };
+
+        let res = parse_entry_user(i).unwrap();
+        assert_eq!(expected, res.1);
+    }
+
+    #[test]
+    fn parse_user_line_no_host() {
+        let i = "# User@Host: lobster[lobster] @ [192.168.56.1]  Id:   190";
+
+        let expected = EntryUser {
+            user: "lobster".to_string(),
+            sys_user: "lobster".to_string(),
+            host: None,
+            ip_address: Some("192.168.56.1".to_string()),
+            thread_id: 190,
         };
 
         let res = parse_entry_user(i).unwrap();

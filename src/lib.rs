@@ -297,7 +297,7 @@ impl EntryContext {
             user: user.user(),
             sys_user: user.sys_user(),
             host: user.host(),
-            ip_address: user.ip_address().unwrap_or("127.0.0.1".into()),
+            ip_address: user.ip_address(),
             thread_id: user.thread_id(),
             query_time: stats.query_time(),
             lock_time: stats.lock_time(),
