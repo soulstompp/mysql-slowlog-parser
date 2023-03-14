@@ -1,21 +1,30 @@
 use futures::StreamExt;
-use mysql_slowlog_parser::Reader;
+use mysql_slowlog_parser::{CodecError, Entry, EntryCodec};
+use std::ops::AddAssign;
+use std::time::Instant;
 use tokio::fs::File;
-use tokio::io::BufReader;
+use tokio_util::codec::FramedRead;
 
 #[tokio::main]
 async fn main() {
-    let mut fr = BufReader::new(File::open("data/slow-test-queries.log").await.unwrap());
-    let rb = Reader::builder().reader(&mut fr);
-    let mut r = rb.build().unwrap();
+    let start = Instant::now();
 
-    let s = r.read_entries();
+    let fr = FramedRead::with_capacity(
+        File::open("/home/soulstompp/dev/mysql8-stresser/data/mysql-slow-lobsters-normal.log")
+            .await
+            .unwrap(),
+        EntryCodec::default(),
+        250000,
+    );
 
-    let mut s = Box::pin(s);
+    let mut i = 0;
 
-    while let Some(re) = s.next().await {
-        let e = re.unwrap();
+    let future = fr.for_each(|re: Result<Entry, CodecError>| async move {
+        let _ = re.unwrap();
 
-        println!("{:#?}", e);
-    }
+        i.add_assign(1);
+    });
+
+    future.await;
+    println!("parsed {} entries in: {}", i, start.elapsed().as_secs_f64());
 }
