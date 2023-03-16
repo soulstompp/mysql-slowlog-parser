@@ -1,7 +1,8 @@
 use std::collections::HashMap;
-use std::ops::Not;
+use std::ops::{Not};
 use std::str;
 use std::str::FromStr;
+use bytes::{BufMut, Bytes, BytesMut};
 
 use iso8601::parsers::parse_datetime;
 use iso8601::DateTime;
@@ -17,6 +18,7 @@ use winnow::error::{ErrMode, Error, ErrorKind, Needed};
 use winnow::multi::{many1, many_m_n};
 use winnow::sequence::{preceded, separated_pair, terminated};
 use winnow::{IResult, Partial};
+use winnow::stream::AsBytes;
 
 use crate::EntryMasking;
 
@@ -46,27 +48,27 @@ pub fn parse_entry_time(i: Stream<'_>) -> IResult<Stream<'_>, EntryTime> {
 /// values from the user entry line
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EntryUser {
-    user: String,
-    sys_user: String,
-    host: Option<String>,
-    ip_address: Option<String>,
+    user: Bytes,
+    sys_user: Bytes,
+    host: Option<Bytes>,
+    ip_address: Option<Bytes>,
     thread_id: u32,
 }
 
 impl EntryUser {
-    pub fn user(&self) -> String {
+    pub fn user(&self) -> Bytes {
         self.user.clone()
     }
 
-    pub fn sys_user(&self) -> String {
+    pub fn sys_user(&self) -> Bytes {
         self.sys_user.clone()
     }
 
-    pub fn host(&self) -> Option<String> {
+    pub fn host(&self) -> Option<Bytes> {
         self.host.clone()
     }
 
-    pub fn ip_address(&self) -> Option<String> {
+    pub fn ip_address(&self) -> Option<Bytes> {
         self.ip_address.clone()
     }
 
@@ -77,9 +79,9 @@ impl EntryUser {
 
 #[derive(Debug, PartialEq)]
 pub struct EntryLogHeader {
-    version: String,
-    tcp_port: Option<String>,
-    socket: Option<String>,
+    version: Bytes,
+    tcp_port: Option<usize>,
+    socket: Option<Bytes>,
 }
 
 pub fn log_header<'a>(i: Stream<'_>) -> IResult<Stream<'_>, EntryLogHeader> {
@@ -101,15 +103,15 @@ pub fn log_header<'a>(i: Stream<'_>) -> IResult<Stream<'_>, EntryLogHeader> {
     Ok((
         i,
         EntryLogHeader {
-            version: String::from_utf8_lossy(version).to_string(),
-            tcp_port: tcp_port.and_then(|v| Some(String::from_utf8_lossy(v).to_string())),
-            socket: socket.and_then(|v| Some(String::from_utf8_lossy(v).to_string())),
+            version: version.to_owned().into(),
+            tcp_port: tcp_port.and_then(|v| Some(str::from_utf8(v).unwrap().parse().unwrap())),
+            socket: socket.and_then(|v| Some(v.to_owned().into())),
         },
     ))
 }
 
-pub fn sql_lines<'a>(mut i: Stream<'_>) -> IResult<Stream<'_>, String> {
-    let mut acc = String::new();
+pub fn sql_lines<'a>(mut i: Stream<'_>) -> IResult<Stream<'_>, Bytes> {
+    let mut acc = BytesMut::new();
 
     let mut escaped = false;
     let mut quotes = vec![];
@@ -120,7 +122,7 @@ pub fn sql_lines<'a>(mut i: Stream<'_>) -> IResult<Stream<'_>, String> {
         i = res.0;
         let c = res.1 as char;
 
-        acc.push(c);
+        acc.put_slice(&[c as u8]);
 
         if escaped.not() && (c == '\'' || c == '\"' || c == '`') {
             if let Some(q) = quotes.last() {
@@ -141,7 +143,7 @@ pub fn sql_lines<'a>(mut i: Stream<'_>) -> IResult<Stream<'_>, String> {
         }
 
         if quotes.len() == 0 && c == ';' {
-            return Ok((i, acc));
+            return Ok((i, acc.freeze()));
         }
     }
 }
@@ -150,7 +152,7 @@ pub fn alphanumerichyphen1<'a>(i: Stream<'_>) -> IResult<Stream<'_>, &'_ [u8]> {
     alt((alphanumeric1, alt((tag("-"), tag("_")))))(i)
 }
 
-pub fn host_name<'a>(i: Stream<'_>) -> IResult<Stream<'_>, String> {
+pub fn host_name<'a>(i: Stream<'_>) -> IResult<Stream<'_>, Bytes> {
     let (i, (mut first, second)): (Stream<'_>, (Vec<&[u8]>, &[u8])) = alt((
         ((many1(terminated(alphanumerichyphen1, tag("."))), alpha1)),
         ((many_m_n(1, 1, alphanumerichyphen1), take(0 as usize))),
@@ -160,39 +162,44 @@ pub fn host_name<'a>(i: Stream<'_>) -> IResult<Stream<'_>, String> {
         first.push(second);
     }
 
+    let b = first
+        .iter()
+        .enumerate()
+        .fold(BytesMut::new(), |mut acc, (c, p)| {
+            if c > 0 {
+                acc.put_slice(".".as_bytes());
+            }
+
+            acc.put_slice(p);
+            acc
+        });
+
     Ok((
         i,
-        first
-            .iter()
-            .enumerate()
-            .fold(String::new(), |mut acc, (c, p)| {
-                if c > 0 {
-                    acc.push('.');
-                }
-
-                acc.push_str(str::from_utf8(p).unwrap());
-                acc
-            }),
+        b.freeze(),
     ))
 }
 
 /// ip address handler that only handles IP4
-pub fn ip_address<'a>(i: Stream<'_>) -> IResult<Stream<'_>, String> {
+pub fn ip_address<'a>(i: Stream<'_>) -> IResult<Stream<'_>, Bytes> {
     let (i, p0) = digit1(i)?;
     let (i, p1) = preceded(tag("."), digit1)(i)?;
     let (i, p2) = preceded(tag("."), digit1)(i)?;
     let (i, p3) = preceded(tag("."), digit1)(i)?;
 
-    Ok((
-        i,
-        format!(
-            "{}.{}.{}.{}",
-            str::from_utf8(p0).unwrap(),
-            str::from_utf8(p1).unwrap(),
-            str::from_utf8(p2).unwrap(),
-            str::from_utf8(p3).unwrap()
-        ),
-    ))
+    let b = [p0, p1, p2, p3]
+        .iter()
+        .enumerate()
+        .fold(BytesMut::new(), |mut acc, (c, p)| {
+            if c > 0 {
+                acc.put_slice(".".as_bytes());
+            }
+
+            acc.put_slice(p);
+            acc
+        });
+
+    Ok((i, b.freeze()))
 }
 
 /// thread id parser for 'Id: [\d+]'
@@ -202,13 +209,21 @@ pub fn entry_user_thread_id<'a>(i: Stream<'_>) -> IResult<Stream<'_>, u32> {
     Ok((i, u32::from_str(str::from_utf8(id).unwrap()).unwrap()))
 }
 
+pub fn user_name<'a>(i: Stream<'a>) -> IResult<Stream<'_>, Bytes> {
+    let (i, user) = alphanumeric1(i)?;
+
+    let b = BytesMut::from(user);
+
+    Ok((i, b.freeze()))
+}
+
 /// user line parser
-pub fn entry_user<'a>(i: Stream<'_>) -> IResult<Stream<'_>, EntryUser> {
+pub fn entry_user<'a>(i: Stream<'a>) -> IResult<Stream<'_>, EntryUser> {
     let (i, _) = tag("# User@Host:")(i)?;
     let (i, _) = multispace1(i)?;
-    let (i, user) = alphanumeric1(i)?;
+    let (i, user) = user_name(i)?;
     let (i, _) = tag("[")(i)?;
-    let (i, sys_user) = alphanumeric1(i)?;
+    let (i, sys_user) = user_name(i)?;
     let (i, _) = tag("]")(i)?;
     let (i, _) = multispace1(i)?;
     let (i, _) = tag("@")(i)?;
@@ -226,8 +241,8 @@ pub fn entry_user<'a>(i: Stream<'_>) -> IResult<Stream<'_>, EntryUser> {
     Ok((
         i,
         EntryUser {
-            user: String::from_utf8(user.into()).unwrap(),
-            sys_user: String::from_utf8(sys_user.into()).unwrap(),
+            user,
+            sys_user,
             host,
             ip_address,
             thread_id,
@@ -237,16 +252,16 @@ pub fn entry_user<'a>(i: Stream<'_>) -> IResult<Stream<'_>, EntryUser> {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SqlStatementContext {
-    pub id: Option<String>,
-    pub caller: Option<String>,
-    pub function: Option<String>,
+    pub id: Option<Bytes>,
+    pub caller: Option<Bytes>,
+    pub function: Option<Bytes>,
     pub line: Option<u32>,
 }
 
-pub fn details_comment<'a>(i: Stream<'_>) -> IResult<Stream<'_>, HashMap<String, String>> {
-    let mut name = None;
+pub fn details_comment<'a>(i: Stream<'_>) -> IResult<Stream<'_>, HashMap<Bytes, Bytes>> {
+    let mut name: Option<Bytes> = None;
 
-    let mut res: HashMap<String, String> = HashMap::new();
+    let mut res : HashMap<Bytes, BytesMut>= HashMap::new();
 
     let (mut i, _) = tag("--")(i)?;
 
@@ -254,9 +269,9 @@ pub fn details_comment<'a>(i: Stream<'_>) -> IResult<Stream<'_>, HashMap<String,
         if let Ok((ii, n)) = details_tag(i) {
             i = ii;
 
-            name.replace(n.to_string());
+            name.replace(n.clone().into());
 
-            if let Some(_) = res.insert(n, String::new()) {
+            if let Some(_) = res.insert(n, BytesMut::new()) {
                 return Err(ErrMode::Cut(Error {
                     input: i,
                     kind: ErrorKind::Assert,
@@ -279,7 +294,7 @@ pub fn details_comment<'a>(i: Stream<'_>) -> IResult<Stream<'_>, HashMap<String,
                     kind: ErrorKind::Assert,
                 }))?;
 
-                v.push(c);
+                v.put_bytes(c as u8, 1);
             } else {
                 return Err(ErrMode::Cut(Error {
                     input: i,
@@ -293,18 +308,18 @@ pub fn details_comment<'a>(i: Stream<'_>) -> IResult<Stream<'_>, HashMap<String,
         }
     }
 
-    Ok((i, res))
+    Ok((i, res.into_iter().map(|(k, v)| (k, v.freeze())).collect()))
 }
 
-pub fn details_tag<'a>(i: Stream<'_>) -> IResult<Stream<'_>, String> {
+pub fn details_tag<'a>(i: Stream<'_>) -> IResult<Stream<'_>, Bytes> {
     let (i, _) = opt(tag(","))(i)?;
     let (i, _) = multispace0(i)?;
-    let (i, name) = alphanumeric1(i)?;
+    let (i, name) = user_name(i)?;
     let (i, _) = multispace0(i)?;
     let (i, _) = alt((tag(":"), tag("=")))(i)?;
     let (i, _) = multispace1(i)?;
 
-    Ok((i, String::from_utf8_lossy(name).to_string()))
+    Ok((i, name.into()))
 }
 
 /// values parsed from stats entry line
@@ -366,7 +381,7 @@ pub fn parse_entry_stats(i: Stream<'_>) -> IResult<Stream<'_>, EntryStats> {
 /// admin command values parsed from sql lines of an entry
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntryAdminCommand {
-    pub command: String,
+    pub command: Bytes,
 }
 
 /// parse "# administrator command: " entry line
@@ -379,20 +394,20 @@ pub fn admin_command<'a>(i: Stream<'_>) -> IResult<Stream<'_>, EntryAdminCommand
     Ok((
         i,
         EntryAdminCommand {
-            command: String::from_utf8_lossy(command.into()).to_string(),
+            command: command.to_owned().into()
         },
     ))
 }
 
 /// parses 'USE database=\w+;' command which shows up at the start of some entry sql
-pub fn use_database(i: Stream<'_>) -> IResult<Stream<'_>, String> {
+pub fn use_database(i: Stream<'_>) -> IResult<Stream<'_>, Bytes> {
     let (i, _) = tag_no_case("USE")(i)?;
     let (i, _) = multispace1(i)?;
-    let (i, db_name) = alphanumerichyphen1(i)?;
+    let (i, db_name) = user_name(i)?;
     let (i, _) = multispace0(i)?;
     let (i, _) = tag(";")(i)?;
 
-    Ok((i, str::from_utf8(db_name).unwrap().to_string()))
+    Ok((i, db_name.into()))
 }
 
 /// parses 'SET timestamp=\d{10};' command which starts
@@ -470,6 +485,7 @@ mod tests {
     use iso8601::{Date, DateTime, Time};
     use std::assert_eq;
     use std::collections::HashMap;
+    use bytes::Bytes;
 
     #[test]
     fn parses_time_line() {
@@ -505,7 +521,7 @@ mod tests {
 
         assert_eq!(
             res,
-            (Stream::new("".as_bytes()), "mysql".trim().to_string())
+            (Stream::new("".as_bytes()), "mysql".trim().into())
         );
     }
 
@@ -517,7 +533,7 @@ mod tests {
 
         assert_eq!(
             res,
-            (Stream::new(" ".as_bytes()), "localhost".trim().to_string())
+            (Stream::new(" ".as_bytes()), i.trim().into())
         );
     }
 
@@ -531,7 +547,7 @@ mod tests {
             res,
             (
                 Stream::new(" ".as_bytes()),
-                "local.tests.rs".trim().to_string()
+                Bytes::from("local.tests.rs".trim())
             )
         );
     }
@@ -542,7 +558,7 @@ mod tests {
 
         let res = ip_address(Stream::new(i.as_bytes())).unwrap();
 
-        assert_eq!(res, (Stream::new(" ".as_bytes()), i.trim().to_string()));
+        assert_eq!(res, (Stream::new(" ".as_bytes()), Bytes::from(i.trim())));
     }
 
     #[test]
@@ -550,9 +566,9 @@ mod tests {
         let i = "# User@Host: msandbox[msandbox] @ localhost []  Id:     3\n";
 
         let expected = EntryUser {
-            user: "msandbox".to_string(),
-            sys_user: "msandbox".to_string(),
-            host: Some("localhost".to_string()),
+            user: Bytes::from("msandbox"),
+            sys_user: Bytes::from("msandbox"),
+            host: Some(Bytes::from("localhost")),
             ip_address: None,
             thread_id: 3,
         };
@@ -566,10 +582,10 @@ mod tests {
         let i = "# User@Host: lobster[lobster] @ [192.168.56.1]  Id:   190\n";
 
         let expected = EntryUser {
-            user: "lobster".to_string(),
-            sys_user: "lobster".to_string(),
+            user: Bytes::from("lobster"),
+            sys_user: Bytes::from("lobster"),
             host: None,
-            ip_address: Some("192.168.56.1".to_string()),
+            ip_address: Some(Bytes::from("192.168.56.1")),
             thread_id: 190,
         };
 
@@ -696,7 +712,7 @@ mod tests {
 
         let res = sql_lines(Stream::new(sql.as_bytes())).unwrap();
 
-        assert_eq!(res, (Stream::new("".as_bytes()), sql.to_string()));
+        assert_eq!(res, (Stream::new("".as_bytes()), sql.into()));
     }
 
     #[test]
@@ -705,7 +721,7 @@ mod tests {
 
         let res = sql_lines(Stream::new(sql.as_bytes())).unwrap();
 
-        assert_eq!(res, (Stream::new("\n".as_bytes()), sql.trim().to_string()));
+        assert_eq!(res, (Stream::new("\n".as_bytes()), sql.trim().into()));
     }
 
     #[test]
@@ -732,7 +748,7 @@ FROM sakila.actor a;
 
         let res = sql_lines(Stream::new(sql.as_bytes())).unwrap();
 
-        assert_eq!(res, (Stream::new("\n".as_bytes()), sql.trim().to_string()));
+        assert_eq!(res, (Stream::new("\n".as_bytes()), sql.trim().into()));
     }
 
     #[test]
@@ -759,7 +775,7 @@ FROM sakila.actor a;
 
         let res = sql_lines(Stream::new(sql.as_bytes())).unwrap();
 
-        assert_eq!(res, (Stream::new("\n".as_bytes()), sql.trim().to_string()));
+        assert_eq!(res, (Stream::new("\n".as_bytes()), sql.trim().into()));
     }
 
     #[test]
@@ -775,9 +791,9 @@ Time                 Id Command    Argument\n";
             (
                 Stream::new("\n".as_bytes()),
                 EntryLogHeader {
-                    version: "5.7.20-log (MySQL Community Server (GPL))".to_string(),
-                    tcp_port: Some(12345.to_string()),
-                    socket: Some("/tmp/12345/mysql_sandbox12345.sock".to_string()),
+                    version: Bytes::from("5.7.20-log (MySQL Community Server (GPL))"),
+                    tcp_port: Some(12345),
+                    socket: Some(Bytes::from("/tmp/12345/mysql_sandbox12345.sock")),
                 }
             )
         );

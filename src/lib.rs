@@ -13,6 +13,7 @@ pub use crate::parser::{EntryAdminCommand, EntryStats, EntryTime, EntryUser, Sql
 use iso8601::DateTime;
 use sqlparser::ast::{visit_relations, Statement};
 use std::ops::ControlFlow;
+use bytes::Bytes;
 
 pub use crate::codec::{CodecError, EntryCodec, EntryError};
 
@@ -49,13 +50,13 @@ impl EntrySqlStatement {
 
             let _ = visited.insert(if ident.len() == 2 {
                 EntrySqlStatementObject {
-                    schema_name: Some(ident[0].value.to_string()),
-                    object_name: ident[1].value.to_string(),
+                    schema_name: Some(ident[0].value.to_owned().into()),
+                    object_name: ident[1].value.to_owned().into(),
                 }
             } else {
                 EntrySqlStatementObject {
                     schema_name: None,
-                    object_name: ident.last().unwrap().value.to_string(),
+                    object_name: ident.last().unwrap().value.to_owned().into(),
                 }
             });
 
@@ -115,8 +116,8 @@ impl From<Statement> for EntrySqlStatement {
 
 #[derive(Clone, Debug, Ord, PartialOrd, PartialEq, Eq)]
 pub struct EntrySqlStatementObject {
-    pub schema_name: Option<String>,
-    pub object_name: String,
+    pub schema_name: Option<Bytes>,
+    pub object_name: Bytes,
 }
 
 /// Types of possible statements parsed from the log:
@@ -265,7 +266,7 @@ impl Default for EntryMasking {
 pub struct ReaderConfig {
     pub masking: EntryMasking,
     pub map_comment_context:
-        Option<Box<dyn Fn(HashMap<String, String>) -> Option<SqlStatementContext>>>,
+        Option<Box<dyn Fn(HashMap<Bytes, Bytes>) -> Option<SqlStatementContext>>>,
 }
 
 impl Debug for ReaderConfig {
@@ -286,10 +287,10 @@ pub enum ReaderBuildError {
 pub struct Entry {
     time: DateTime,
     start_timestamp: u32,
-    user: String,
-    sys_user: String,
-    host: Option<String>,
-    ip_address: Option<String>,
+    user: Bytes,
+    sys_user: Bytes,
+    host: Option<Bytes>,
+    ip_address: Option<Bytes>,
     thread_id: u32,
     query_time: f64,
     lock_time: f64,
@@ -310,22 +311,22 @@ impl Entry {
     }
 
     /// returns the mysql user name that requested the command
-    pub fn user(&self) -> &str {
-        &self.user
+    pub fn user(&self) -> Bytes {
+        self.user.clone()
     }
 
     /// returns the system user name that requested the command
-    pub fn sys_user(&self) -> &str {
-        &self.sys_user
+    pub fn sys_user(&self) -> Bytes {
+        self.sys_user.clone()
     }
 
     /// returns the host name which requested the command
-    pub fn host(&self) -> Option<String> {
+    pub fn host(&self) -> Option<Bytes> {
         self.host.clone()
     }
 
     /// returns the ip address which requested the command
-    pub fn ip_address(&self) -> Option<String> {
+    pub fn ip_address(&self) -> Option<Bytes> {
         self.ip_address.clone()
     }
 

@@ -14,7 +14,7 @@ async fn main() {
             .await
             .unwrap(),
         EntryCodec::default(),
-        250000,
+        140000,
     );
 
     let mut i = 0;

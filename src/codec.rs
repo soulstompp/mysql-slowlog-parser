@@ -14,7 +14,7 @@ use crate::{
     Entry, EntrySqlStatement, EntryStatement, EntryStats, EntryTime, EntryUser, ReaderConfig,
     SqlStatementContext,
 };
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use log::debug;
 use tokio::io;
 use winnow::character::multispace0;
@@ -123,7 +123,8 @@ pub struct EntryCodec {
 }
 
 impl EntryCodec {
-    fn parse_next<'b>(&mut self, i: &'b [u8]) -> IResult<Stream<'b>, Option<Entry>> {
+    fn parse_next<'b>(&mut self, i: &'b [u8]) -> IResult<Stream<'b>,
+        Option<Entry>> {
         let mut i = Stream::new(i);
 
         let s = (i.len()).min(800);
@@ -201,7 +202,9 @@ impl EntryCodec {
                     let (rem, sql_lines) = sql_lines(i)?;
                     i = rem;
 
-                    let s = if let Ok(s) = parse_sql(sql_lines.as_str(), &self.config.masking) {
+                    let s = if let Ok(s) = parse_sql(&String::from_utf8_lossy(&sql_lines),
+                                                     &self.config
+                        .masking) {
                         if s.len() == 1 {
                             let context: Option<SqlStatementContext> = if let Some(d) = details {
                                 if let Some(f) = &self.config.map_comment_context {
@@ -220,10 +223,11 @@ impl EntryCodec {
 
                             SqlStatement(s)
                         } else {
-                            EntryStatement::InvalidStatement(sql_lines)
+                            EntryStatement::InvalidStatement(String::from_utf8_lossy(&sql_lines)
+                                .to_string())
                         }
                     } else {
-                        EntryStatement::InvalidStatement(sql_lines)
+                        EntryStatement::InvalidStatement(String::from_utf8_lossy(&sql_lines).to_string())
                     };
 
                     self.context.statement = Some(s);
@@ -239,7 +243,6 @@ impl EntryCodec {
         return if let Some(e) = entry {
             self.processed.add_assign(1);
 
-            self.context = EntryContext::default();
             Ok((i, Some(e)))
         } else {
             Ok((i, None))
@@ -263,6 +266,9 @@ impl Decoder for EntryCodec {
                 Ok((rem, e)) => {
                     if let Some(e) = e {
                         buf.extend_from_slice(*rem);
+
+                        self.context = EntryContext::default();
+
                         return Ok(Some(e));
                     } else {
                         debug!("preparing input for next parser\n");
@@ -317,6 +323,7 @@ mod tests {
     use std::default::Default;
     use std::io::Cursor;
     use std::ops::AddAssign;
+    use bytes::Bytes;
     use tokio::fs::File;
     use tokio_util::codec::Framed;
 
@@ -355,9 +362,9 @@ SET timestamp=1517798807;
             Entry {
                 time: datetime(time).unwrap(),
                 start_timestamp: 1517798807,
-                user: "msandbox".to_string(),
-                sys_user: "msandbox".to_string(),
-                host: Some("localhost".to_string()),
+                user: Bytes::from("msandbox"),
+                sys_user: Bytes::from("msandbox"),
+                host: Some(Bytes::from("localhost")),
                 ip_address: None,
                 thread_id: 10,
                 query_time: 0.000352,
@@ -437,19 +444,19 @@ GROUP BY film2.film_id, category.name;
         let expected = vec![
             EntrySqlStatementObject {
                 schema_name: None,
-                object_name: "category".to_string(),
+                object_name: "category".as_bytes().into(),
             },
             EntrySqlStatementObject {
                 schema_name: None,
-                object_name: "film".to_string(),
+                object_name: "film".as_bytes().into(),
             },
             EntrySqlStatementObject {
                 schema_name: None,
-                object_name: "film_category".to_string(),
+                object_name: "film_category".as_bytes().into(),
             },
             EntrySqlStatementObject {
-                schema_name: Some("other".to_string()),
-                object_name: "film".to_string(),
+                schema_name: Some("other".as_bytes().into()),
+                object_name: "film".as_bytes().into(),
             },
         ];
 
