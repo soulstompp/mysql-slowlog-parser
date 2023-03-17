@@ -14,7 +14,7 @@ use crate::{
     Entry, EntrySqlStatement, EntryStatement, EntryStats, EntryTime, EntryUser, ReaderConfig,
     SqlStatementContext,
 };
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use log::debug;
 use tokio::io;
 use winnow::character::multispace0;
@@ -123,8 +123,7 @@ pub struct EntryCodec {
 }
 
 impl EntryCodec {
-    fn parse_next<'b>(&mut self, i: &'b [u8]) -> IResult<Stream<'b>,
-        Option<Entry>> {
+    fn parse_next<'b>(&mut self, i: &'b [u8]) -> IResult<Stream<'b>, Option<Entry>> {
         let mut i = Stream::new(i);
 
         let s = (i.len()).min(800);
@@ -202,9 +201,9 @@ impl EntryCodec {
                     let (rem, sql_lines) = sql_lines(i)?;
                     i = rem;
 
-                    let s = if let Ok(s) = parse_sql(&String::from_utf8_lossy(&sql_lines),
-                                                     &self.config
-                        .masking) {
+                    let s = if let Ok(s) =
+                        parse_sql(&String::from_utf8_lossy(&sql_lines), &self.config.masking)
+                    {
                         if s.len() == 1 {
                             let context: Option<SqlStatementContext> = if let Some(d) = details {
                                 if let Some(f) = &self.config.map_comment_context {
@@ -223,11 +222,14 @@ impl EntryCodec {
 
                             SqlStatement(s)
                         } else {
-                            EntryStatement::InvalidStatement(String::from_utf8_lossy(&sql_lines)
-                                .to_string())
+                            EntryStatement::InvalidStatement(
+                                String::from_utf8_lossy(&sql_lines).to_string(),
+                            )
                         }
                     } else {
-                        EntryStatement::InvalidStatement(String::from_utf8_lossy(&sql_lines).to_string())
+                        EntryStatement::InvalidStatement(
+                            String::from_utf8_lossy(&sql_lines).to_string(),
+                        )
                     };
 
                     self.context.statement = Some(s);
@@ -318,12 +320,12 @@ mod tests {
     use crate::parser::parse_sql;
     use crate::EntryStatement::SqlStatement;
     use crate::{Entry, EntryMasking, EntrySqlStatement, EntrySqlStatementObject, EntryStatement};
+    use bytes::Bytes;
     use futures::StreamExt;
     use iso8601::datetime;
     use std::default::Default;
     use std::io::Cursor;
     use std::ops::AddAssign;
-    use bytes::Bytes;
     use tokio::fs::File;
     use tokio_util::codec::Framed;
 

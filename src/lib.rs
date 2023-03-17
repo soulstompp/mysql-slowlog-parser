@@ -3,6 +3,7 @@
 //! A pull parser library for reading MySQL's slow query logs.
 extern crate core;
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::default::Default;
 use std::fmt::{Debug, Display, Formatter};
@@ -10,10 +11,10 @@ use thiserror::Error;
 
 pub use crate::parser::{EntryAdminCommand, EntryStats, EntryTime, EntryUser, SqlStatementContext};
 
+use bytes::Bytes;
 use iso8601::DateTime;
 use sqlparser::ast::{visit_relations, Statement};
 use std::ops::ControlFlow;
-use bytes::Bytes;
 
 pub use crate::codec::{CodecError, EntryCodec, EntryError};
 
@@ -311,22 +312,52 @@ impl Entry {
     }
 
     /// returns the mysql user name that requested the command
-    pub fn user(&self) -> Bytes {
-        self.user.clone()
+    pub fn user(&self) -> Cow<str> {
+        String::from_utf8_lossy(&self.user)
+    }
+
+    /// returns the mysql user name that requested the command
+    pub fn user_bytes(&self) -> Bytes {
+            self.user.clone()
     }
 
     /// returns the system user name that requested the command
-    pub fn sys_user(&self) -> Bytes {
+    pub fn sys_user(&self) -> Cow<str> {
+        String::from_utf8_lossy(&self.sys_user)
+    }
+
+    /// returns the system user name that requested the command
+    pub fn sys_user_bytes(&self) -> Bytes {
         self.sys_user.clone()
     }
 
     /// returns the host name which requested the command
-    pub fn host(&self) -> Option<Bytes> {
+    pub fn host(&self) -> Option<Cow<str>> {
+        if let Some(v) = &self.ip_address {
+            Some(String::from_utf8_lossy(v.as_ref()))
+        }
+        else {
+            None
+        }
+    }
+
+    /// returns the host name which requested the command
+    pub fn host_bytes(&self) -> Option<Bytes> {
         self.host.clone()
     }
 
     /// returns the ip address which requested the command
-    pub fn ip_address(&self) -> Option<Bytes> {
+    pub fn ip_address(&self) -> Option<Cow<'_, str>> {
+        if let Some(v) = &self.ip_address {
+            Some(String::from_utf8_lossy(v.as_ref()))
+        }
+        else {
+            None
+        }
+    }
+
+    /// returns the ip address which requested the command
+    pub fn ip_address_bytes(&self) -> Option<Bytes> {
         self.ip_address.clone()
     }
 

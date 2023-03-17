@@ -1,8 +1,9 @@
+use std::borrow::Cow;
+use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
-use std::ops::{Not};
+use std::ops::Not;
 use std::str;
 use std::str::FromStr;
-use bytes::{BufMut, Bytes, BytesMut};
 
 use iso8601::parsers::parse_datetime;
 use iso8601::DateTime;
@@ -18,7 +19,6 @@ use winnow::error::{ErrMode, Error, ErrorKind, Needed};
 use winnow::multi::{many1, many_m_n};
 use winnow::sequence::{preceded, separated_pair, terminated};
 use winnow::{IResult, Partial};
-use winnow::stream::AsBytes;
 
 use crate::EntryMasking;
 
@@ -174,10 +174,7 @@ pub fn host_name<'a>(i: Stream<'_>) -> IResult<Stream<'_>, Bytes> {
             acc
         });
 
-    Ok((
-        i,
-        b.freeze(),
-    ))
+    Ok((i, b.freeze()))
 }
 
 /// ip address handler that only handles IP4
@@ -258,10 +255,40 @@ pub struct SqlStatementContext {
     pub line: Option<u32>,
 }
 
+impl SqlStatementContext {
+    pub fn id(&self) -> Option<Cow<str>> {
+        if let Some(i) = &self.id {
+            Some(String::from_utf8_lossy(i.as_ref()))
+        } else {
+            None
+        }
+    }
+
+    pub fn caller(&self) -> Option<Cow<str>> {
+        if let Some(c) = &self.caller {
+            Some(String::from_utf8_lossy(c.as_ref()))
+        } else {
+            None
+        }
+    }
+
+    pub fn function(&self) -> Option<Cow<str>> {
+        if let Some(f) = &self.function {
+            Some(String::from_utf8_lossy(f.as_ref()))
+        } else {
+            None
+        }
+    }
+
+    pub fn line(&self) -> Option<u32> {
+        self.line
+    }
+}
+
 pub fn details_comment<'a>(i: Stream<'_>) -> IResult<Stream<'_>, HashMap<Bytes, Bytes>> {
     let mut name: Option<Bytes> = None;
 
-    let mut res : HashMap<Bytes, BytesMut>= HashMap::new();
+    let mut res: HashMap<Bytes, BytesMut> = HashMap::new();
 
     let (mut i, _) = tag("--")(i)?;
 
@@ -394,7 +421,7 @@ pub fn admin_command<'a>(i: Stream<'_>) -> IResult<Stream<'_>, EntryAdminCommand
     Ok((
         i,
         EntryAdminCommand {
-            command: command.to_owned().into()
+            command: command.to_owned().into(),
         },
     ))
 }
@@ -482,10 +509,10 @@ mod tests {
         use_database, EntryAdminCommand, EntryLogHeader, EntryStats, EntryTime, EntryUser, Stream,
     };
     use crate::EntryMasking;
+    use bytes::Bytes;
     use iso8601::{Date, DateTime, Time};
     use std::assert_eq;
     use std::collections::HashMap;
-    use bytes::Bytes;
 
     #[test]
     fn parses_time_line() {
@@ -519,10 +546,7 @@ mod tests {
 
         let res = use_database(Stream::new(i.as_bytes())).unwrap();
 
-        assert_eq!(
-            res,
-            (Stream::new("".as_bytes()), "mysql".trim().into())
-        );
+        assert_eq!(res, (Stream::new("".as_bytes()), "mysql".trim().into()));
     }
 
     #[test]
@@ -531,10 +555,7 @@ mod tests {
 
         let res = host_name(Stream::new(i.as_bytes())).unwrap();
 
-        assert_eq!(
-            res,
-            (Stream::new(" ".as_bytes()), i.trim().into())
-        );
+        assert_eq!(res, (Stream::new(" ".as_bytes()), i.trim().into()));
     }
 
     #[test]
