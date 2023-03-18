@@ -14,13 +14,13 @@ async fn main() {
             .await
             .unwrap(),
         EntryCodec::default(),
-        140000,
+        400000,
     );
 
     let mut i = 0;
 
     let future = fr.for_each(|re: Result<Entry, CodecError>| async move {
-        let _ = re.unwrap();
+        let e = re.unwrap();
 
         i.add_assign(1);
     });

@@ -3,24 +3,25 @@
 //! A pull parser library for reading MySQL's slow query logs.
 extern crate core;
 
-use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::default::Default;
-use std::fmt::{Debug, Display, Formatter};
+use std::fmt::{Debug, Formatter};
 use thiserror::Error;
 
-pub use crate::parser::{EntryAdminCommand, EntryStats, EntryTime, EntryUser, SqlStatementContext};
+pub use crate::parser::{EntryAdminCommand, SessionLine, SqlStatementContext, StatsLine, TimeLine};
 
 use bytes::Bytes;
-use iso8601::DateTime;
-use sqlparser::ast::{visit_relations, Statement};
-use std::ops::ControlFlow;
 
 pub use crate::codec::{CodecError, EntryCodec, EntryError};
 
 mod codec;
 mod parser;
+mod types;
 
+pub use types::{
+    Entry, EntryCall, EntryContext, EntrySession, EntrySqlAttributes, EntrySqlStatementObject,
+    EntrySqlType, EntryStatement, EntryStats,
+};
 /// Error returned to cover all cases when reading/parsing a log
 #[derive(Error, Debug)]
 pub enum ReadError {
@@ -34,218 +35,6 @@ pub enum ReadError {
     IncompleteSql,
     #[error("Invalid log format or format contains no entries")]
     IncompleteLog,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct EntrySqlStatement {
-    pub statement: Statement,
-    pub context: Option<SqlStatementContext>,
-}
-
-impl EntrySqlStatement {
-    pub fn objects(&self) -> Vec<EntrySqlStatementObject> {
-        let mut visited = BTreeSet::new();
-
-        visit_relations(&self.statement, |relation| {
-            let ident = &relation.0;
-
-            let _ = visited.insert(if ident.len() == 2 {
-                EntrySqlStatementObject {
-                    schema_name: Some(ident[0].value.to_owned().into()),
-                    object_name: ident[1].value.to_owned().into(),
-                }
-            } else {
-                EntrySqlStatementObject {
-                    schema_name: None,
-                    object_name: ident.last().unwrap().value.to_owned().into(),
-                }
-            });
-
-            ControlFlow::<()>::Continue(())
-        });
-        visited.into_iter().collect()
-    }
-
-    pub fn entry_sql_type(&self) -> EntrySqlType {
-        match self.statement {
-            Statement::Query(_) => EntrySqlType::Query,
-            Statement::Insert { .. } => EntrySqlType::Insert,
-            Statement::Update { .. } => EntrySqlType::Update,
-            Statement::Delete { .. } => EntrySqlType::Delete,
-            Statement::CreateTable { .. } => EntrySqlType::CreateTable,
-            Statement::CreateIndex { .. } => EntrySqlType::CreateIndex,
-            Statement::CreateView { .. } => EntrySqlType::CreateView,
-            Statement::AlterTable { .. } => EntrySqlType::AlterTable,
-            Statement::AlterIndex { .. } => EntrySqlType::AlterIndex,
-            Statement::Drop { .. } => EntrySqlType::Drop,
-            Statement::DropFunction { .. } => EntrySqlType::DropFunction,
-            Statement::SetVariable { .. } => EntrySqlType::SetVariable,
-            Statement::SetNames { .. } => EntrySqlType::SetNames,
-            Statement::SetNamesDefault { .. } => EntrySqlType::SetNamesDefault,
-            Statement::ShowVariable { .. } => EntrySqlType::ShowVariable,
-            Statement::ShowVariables { .. } => EntrySqlType::ShowVariables,
-            Statement::ShowCreate { .. } => EntrySqlType::ShowCreate,
-            Statement::ShowColumns { .. } => EntrySqlType::ShowColumns,
-            Statement::ShowTables { .. } => EntrySqlType::ShowTables,
-            Statement::ShowCollation { .. } => EntrySqlType::ShowCollation,
-            Statement::Use { .. } => EntrySqlType::Use,
-            Statement::StartTransaction { .. } => EntrySqlType::StartTransaction,
-            Statement::SetTransaction { .. } => EntrySqlType::SetTransaction,
-            Statement::Commit { .. } => EntrySqlType::Commit,
-            Statement::Rollback { .. } => EntrySqlType::Rollback,
-            Statement::CreateSchema { .. } => EntrySqlType::CreateSchema,
-            Statement::CreateDatabase { .. } => EntrySqlType::CreateDatabase,
-            Statement::Grant { .. } => EntrySqlType::Grant,
-            Statement::Revoke { .. } => EntrySqlType::Revoke,
-            Statement::Kill { .. } => EntrySqlType::Kill,
-            Statement::ExplainTable { .. } => EntrySqlType::ExplainTable,
-            Statement::Explain { .. } => EntrySqlType::Explain,
-            Statement::Savepoint { .. } => EntrySqlType::Savepoint,
-            _ => panic!("sql types for MySQL should be exhaustive"),
-        }
-    }
-}
-
-impl From<Statement> for EntrySqlStatement {
-    fn from(statement: Statement) -> Self {
-        EntrySqlStatement {
-            statement,
-            context: None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Ord, PartialOrd, PartialEq, Eq)]
-pub struct EntrySqlStatementObject {
-    pub schema_name: Option<Bytes>,
-    pub object_name: Bytes,
-}
-
-/// Types of possible statements parsed from the log:
-/// * SqlStatement: parseable statement with a proper SQL AST
-/// * AdminCommand: commands passed from the mysql cli/admin tools
-/// * InvalidStatement: statement which isn't currently parseable as plain-text
-#[derive(Clone, Debug, PartialEq)]
-pub enum EntryStatement {
-    AdminCommand(EntryAdminCommand),
-    SqlStatement(EntrySqlStatement),
-    InvalidStatement(String),
-}
-
-/// The SQL statement type of the EntrySqlStatement.
-///
-/// NOTE: this is a MySQL specific sub-set of the entries in `sql_parser::ast::Statement`. This is
-/// a simpler enum to match against and displays as the start of the SQL command.
-#[derive(Clone, Debug, PartialEq)]
-pub enum EntrySqlType {
-    /// SELECT
-    Query,
-    /// INSERT
-    Insert,
-    /// UPDATE
-    Update,
-    /// DELETE
-    Delete,
-    /// CREATE TABLE
-    CreateTable,
-    /// CREATE INDEX
-    CreateIndex,
-    /// CREATE VIEW
-    CreateView,
-    /// ALTER TABLE
-    AlterTable,
-    /// ALTER INDEX
-    AlterIndex,
-    /// DROP TABLE
-    Drop,
-    /// DROP FUNCTION
-    DropFunction,
-    /// SET VARIABLE
-    SetVariable,
-    /// SET NAMES
-    SetNames,
-    /// SET NAMES DEFAULT
-    SetNamesDefault,
-    /// SHOW VARIABLE
-    ShowVariable,
-    /// SHOW VARIABLES
-    ShowVariables,
-    /// SHOW CREATE TABLE
-    ShowCreate,
-    /// SHOW COLUMNS
-    ShowColumns,
-    /// SHOW TABLES
-    ShowTables,
-    /// SHOW COLLATION
-    ShowCollation,
-    /// USE
-    Use,
-    /// BEGIN TRANSACTION
-    StartTransaction,
-    /// SET TRANSACTION
-    SetTransaction,
-    /// COMMIT TRANSACTION
-    Commit,
-    /// ROLLBACK TRANSACTION
-    Rollback,
-    /// CREATE SCHEMA
-    CreateSchema,
-    /// CREATE DATABASE
-    CreateDatabase,
-    /// GRANT
-    Grant,
-    /// REVOKE
-    Revoke,
-    /// KILL
-    Kill,
-    /// EXPLAIN TABLE
-    ExplainTable,
-    /// EXPLAIN
-    Explain,
-    /// SAVEPOINT
-    Savepoint,
-}
-
-impl Display for EntrySqlType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let out = match self {
-            Self::Query => "SELECT",
-            Self::Insert => "INSERT",
-            Self::Update => "UPDATE",
-            Self::Delete => "DELETE",
-            Self::CreateTable => "CREATE TABLE",
-            Self::CreateIndex => "CREATE INDEX",
-            Self::CreateView => "CREATE VIEW",
-            Self::AlterTable => "ALTER TABLE",
-            Self::AlterIndex => "ALTER INDEX",
-            Self::Drop => "DROP TABLE",
-            Self::DropFunction => "DROP FUNCTION",
-            Self::SetVariable => "SET VARIABLE",
-            Self::SetNames => "SET NAMES",
-            Self::SetNamesDefault => "SET NAMES DEFAULT",
-            Self::ShowVariable => "SHOW VARIABLE",
-            Self::ShowVariables => "SHOW VARIABLES",
-            Self::ShowCreate => "SHOW CREATE TABLE",
-            Self::ShowColumns => "SHOW COLUMNS",
-            Self::ShowTables => "SHOW TABLES",
-            Self::ShowCollation => "SHOW COLLATION",
-            Self::Use => "USE",
-            Self::StartTransaction => "BEGIN TRANSACTION",
-            Self::SetTransaction => "SET TRANSACTION",
-            Self::Commit => "COMMIT TRANSACTION",
-            Self::Rollback => "ROLLBACK TRANSACTION",
-            Self::CreateSchema => "CREATE SCHEMA",
-            Self::CreateDatabase => "CREATE DATABASE",
-            Self::Grant => "GRANT",
-            Self::Revoke => "REVOKE",
-            Self::Kill => "KILL",
-            Self::ExplainTable => "EXPLAIN TABLE",
-            Self::Explain => "EXPLAIN",
-            Self::Savepoint => "SAVEPOINT",
-        };
-
-        write!(f, "{}", out)
-    }
 }
 
 /// types of masking to apply when parsing SQL statements
@@ -281,112 +70,4 @@ impl Debug for ReaderConfig {
 pub enum ReaderBuildError {
     #[error("reader must be set to build Reader")]
     MissingReader,
-}
-
-/// a struct representing the values parsed from the log entry
-#[derive(Clone, Debug, PartialEq)]
-pub struct Entry {
-    time: DateTime,
-    start_timestamp: u32,
-    user: Bytes,
-    sys_user: Bytes,
-    host: Option<Bytes>,
-    ip_address: Option<Bytes>,
-    thread_id: u32,
-    query_time: f64,
-    lock_time: f64,
-    rows_sent: u32,
-    rows_examined: u32,
-    statement: EntryStatement,
-}
-
-impl Entry {
-    /// return entry time as an `iso8601::DateTime`
-    pub fn time(&self) -> DateTime {
-        self.time
-    }
-
-    /// returns the time stamp set at the beginning of each entry
-    pub fn start_timestamp(&self) -> u32 {
-        self.start_timestamp
-    }
-
-    /// returns the mysql user name that requested the command
-    pub fn user(&self) -> Cow<str> {
-        String::from_utf8_lossy(&self.user)
-    }
-
-    /// returns the mysql user name that requested the command
-    pub fn user_bytes(&self) -> Bytes {
-            self.user.clone()
-    }
-
-    /// returns the system user name that requested the command
-    pub fn sys_user(&self) -> Cow<str> {
-        String::from_utf8_lossy(&self.sys_user)
-    }
-
-    /// returns the system user name that requested the command
-    pub fn sys_user_bytes(&self) -> Bytes {
-        self.sys_user.clone()
-    }
-
-    /// returns the host name which requested the command
-    pub fn host(&self) -> Option<Cow<str>> {
-        if let Some(v) = &self.ip_address {
-            Some(String::from_utf8_lossy(v.as_ref()))
-        }
-        else {
-            None
-        }
-    }
-
-    /// returns the host name which requested the command
-    pub fn host_bytes(&self) -> Option<Bytes> {
-        self.host.clone()
-    }
-
-    /// returns the ip address which requested the command
-    pub fn ip_address(&self) -> Option<Cow<'_, str>> {
-        if let Some(v) = &self.ip_address {
-            Some(String::from_utf8_lossy(v.as_ref()))
-        }
-        else {
-            None
-        }
-    }
-
-    /// returns the ip address which requested the command
-    pub fn ip_address_bytes(&self) -> Option<Bytes> {
-        self.ip_address.clone()
-    }
-
-    /// returns the the thread id of the session which requested the command
-    pub fn thread_id(&self) -> u32 {
-        self.thread_id
-    }
-
-    /// returns how long the query took to run
-    pub fn query_time(&self) -> f64 {
-        self.query_time
-    }
-
-    /// returns how long it took to lock
-    pub fn lock_time(&self) -> f64 {
-        self.lock_time
-    }
-
-    /// returns number of rows returned when query was executed
-    pub fn rows_sent(&self) -> u32 {
-        self.rows_sent
-    }
-
-    /// returns how many rows where examined to execute the query
-    pub fn rows_examined(&self) -> u32 {
-        self.rows_examined
-    }
-
-    pub fn statement(&self) -> EntryStatement {
-        self.statement.clone()
-    }
 }

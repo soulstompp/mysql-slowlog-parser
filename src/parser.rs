@@ -1,5 +1,5 @@
-use std::borrow::Cow;
 use bytes::{BufMut, Bytes, BytesMut};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Not;
 use std::str;
@@ -26,36 +26,36 @@ pub type Stream<'i> = Partial<&'i [u8]>;
 
 /// values from the time entry line
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EntryTime {
+pub struct TimeLine {
     time: DateTime,
 }
 
-impl EntryTime {
+impl TimeLine {
     pub fn time(&self) -> DateTime {
         self.time.clone()
     }
 }
 // "# Time: 2015-06-26T16:43:23+0200";
 /// parses "# Time: ...." entry line
-pub fn parse_entry_time(i: Stream<'_>) -> IResult<Stream<'_>, EntryTime> {
+pub fn parse_entry_time(i: Stream<'_>) -> IResult<Stream<'_>, DateTime> {
     let (i, _) = tag("# Time:")(i)?;
     let (i, _) = multispace1(i)?;
     let (i, dt) = parse_datetime(*i).or(Err(ErrMode::Incomplete(Needed::Unknown)))?;
 
-    Ok((Stream::new(i), EntryTime { time: dt }))
+    Ok((Stream::new(i), dt))
 }
 
 /// values from the user entry line
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EntryUser {
-    user: Bytes,
-    sys_user: Bytes,
-    host: Option<Bytes>,
-    ip_address: Option<Bytes>,
-    thread_id: u32,
+pub struct SessionLine {
+    pub(crate) user: Bytes,
+    pub(crate) sys_user: Bytes,
+    pub(crate) host: Option<Bytes>,
+    pub(crate) ip_address: Option<Bytes>,
+    pub(crate) thread_id: u32,
 }
 
-impl EntryUser {
+impl SessionLine {
     pub fn user(&self) -> Bytes {
         self.user.clone()
     }
@@ -78,13 +78,13 @@ impl EntryUser {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct EntryLogHeader {
+pub struct HeaderLines {
     version: Bytes,
     tcp_port: Option<usize>,
     socket: Option<Bytes>,
 }
 
-pub fn log_header<'a>(i: Stream<'_>) -> IResult<Stream<'_>, EntryLogHeader> {
+pub fn log_header<'a>(i: Stream<'_>) -> IResult<Stream<'_>, HeaderLines> {
     // check for the '#' since the last parser in the set is greedy
     let (i, _) = not(tag("#"))(i)?;
     let (i, _) = take_until1(", Version: ")(i)?;
@@ -102,7 +102,7 @@ pub fn log_header<'a>(i: Stream<'_>) -> IResult<Stream<'_>, EntryLogHeader> {
 
     Ok((
         i,
-        EntryLogHeader {
+        HeaderLines {
             version: version.to_owned().into(),
             tcp_port: tcp_port.and_then(|v| Some(str::from_utf8(v).unwrap().parse().unwrap())),
             socket: socket.and_then(|v| Some(v.to_owned().into())),
@@ -206,7 +206,7 @@ pub fn entry_user_thread_id<'a>(i: Stream<'_>) -> IResult<Stream<'_>, u32> {
     Ok((i, u32::from_str(str::from_utf8(id).unwrap()).unwrap()))
 }
 
-pub fn user_name<'a>(i: Stream<'a>) -> IResult<Stream<'_>, Bytes> {
+pub fn user_name(i: Stream) -> IResult<Stream, Bytes> {
     let (i, user) = alphanumeric1(i)?;
 
     let b = BytesMut::from(user);
@@ -215,7 +215,7 @@ pub fn user_name<'a>(i: Stream<'a>) -> IResult<Stream<'_>, Bytes> {
 }
 
 /// user line parser
-pub fn entry_user<'a>(i: Stream<'a>) -> IResult<Stream<'_>, EntryUser> {
+pub fn entry_user(i: Stream) -> IResult<Stream, SessionLine> {
     let (i, _) = tag("# User@Host:")(i)?;
     let (i, _) = multispace1(i)?;
     let (i, user) = user_name(i)?;
@@ -237,7 +237,7 @@ pub fn entry_user<'a>(i: Stream<'a>) -> IResult<Stream<'_>, EntryUser> {
 
     Ok((
         i,
-        EntryUser {
+        SessionLine {
             user,
             sys_user,
             host,
@@ -249,15 +249,15 @@ pub fn entry_user<'a>(i: Stream<'a>) -> IResult<Stream<'_>, EntryUser> {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SqlStatementContext {
-    pub id: Option<Bytes>,
+    pub request_id: Option<Bytes>,
     pub caller: Option<Bytes>,
     pub function: Option<Bytes>,
     pub line: Option<u32>,
 }
 
 impl SqlStatementContext {
-    pub fn id(&self) -> Option<Cow<str>> {
-        if let Some(i) = &self.id {
+    pub fn request_id(&self) -> Option<Cow<str>> {
+        if let Some(i) = &self.request_id {
             Some(String::from_utf8_lossy(i.as_ref()))
         } else {
             None
@@ -351,14 +351,14 @@ pub fn details_tag<'a>(i: Stream<'_>) -> IResult<Stream<'_>, Bytes> {
 
 /// values parsed from stats entry line
 #[derive(Clone, Debug, PartialEq)]
-pub struct EntryStats {
-    query_time: f64,
-    lock_time: f64,
-    rows_sent: u32,
-    rows_examined: u32,
+pub struct StatsLine {
+    pub(crate) query_time: f64,
+    pub(crate) lock_time: f64,
+    pub(crate) rows_sent: u32,
+    pub(crate) rows_examined: u32,
 }
 
-impl EntryStats {
+impl StatsLine {
     pub fn query_time(&self) -> f64 {
         self.query_time.clone()
     }
@@ -375,7 +375,7 @@ impl EntryStats {
 }
 
 /// parse '# Query_time:...' entry line
-pub fn parse_entry_stats(i: Stream<'_>) -> IResult<Stream<'_>, EntryStats> {
+pub fn parse_entry_stats(i: Stream<'_>) -> IResult<Stream<'_>, StatsLine> {
     let (i, _) = tag("#")(i)?;
     let (i, _) = multispace1(i)?;
     let (i, _) = tag("Query_time:")(i)?;
@@ -396,7 +396,7 @@ pub fn parse_entry_stats(i: Stream<'_>) -> IResult<Stream<'_>, EntryStats> {
 
     Ok((
         i,
-        EntryStats {
+        StatsLine {
             query_time,
             lock_time,
             rows_sent: u32::from_str(str::from_utf8(rows_sent).unwrap()).unwrap(),
@@ -506,7 +506,7 @@ mod tests {
     use crate::parser::{
         admin_command, details_comment, entry_user, host_name, ip_address, log_header,
         parse_entry_stats, parse_entry_time, parse_sql, sql_lines, start_timestamp_command,
-        use_database, EntryAdminCommand, EntryLogHeader, EntryStats, EntryTime, EntryUser, Stream,
+        use_database, EntryAdminCommand, HeaderLines, SessionLine, StatsLine, Stream,
     };
     use crate::EntryMasking;
     use bytes::Bytes;
@@ -518,21 +518,19 @@ mod tests {
     fn parses_time_line() {
         let i = "# Time: 2015-06-26T16:43:23+0200";
 
-        let expected = EntryTime {
-            time: DateTime {
-                date: Date::YMD {
-                    year: 2015,
-                    month: 6,
-                    day: 26,
-                },
-                time: Time {
-                    hour: 16,
-                    minute: 43,
-                    second: 23,
-                    millisecond: 0,
-                    tz_offset_hours: 2,
-                    tz_offset_minutes: 0,
-                },
+        let expected = DateTime {
+            date: Date::YMD {
+                year: 2015,
+                month: 6,
+                day: 26,
+            },
+            time: Time {
+                hour: 16,
+                minute: 43,
+                second: 23,
+                millisecond: 0,
+                tz_offset_hours: 2,
+                tz_offset_minutes: 0,
             },
         };
 
@@ -586,7 +584,7 @@ mod tests {
     fn parses_user_line_no_ip() {
         let i = "# User@Host: msandbox[msandbox] @ localhost []  Id:     3\n";
 
-        let expected = EntryUser {
+        let expected = SessionLine {
             user: Bytes::from("msandbox"),
             sys_user: Bytes::from("msandbox"),
             host: Some(Bytes::from("localhost")),
@@ -602,7 +600,7 @@ mod tests {
     fn parses_user_line_no_host() {
         let i = "# User@Host: lobster[lobster] @ [192.168.56.1]  Id:   190\n";
 
-        let expected = EntryUser {
+        let expected = SessionLine {
             user: Bytes::from("lobster"),
             sys_user: Bytes::from("lobster"),
             host: None,
@@ -618,7 +616,7 @@ mod tests {
     fn parses_stats_line() {
         let i = "# Query_time: 1.000016  Lock_time: 2.000000 Rows_sent: 3  Rows_examined: 4\n";
 
-        let expected = EntryStats {
+        let expected = StatsLine {
             query_time: 1.000016,
             lock_time: 2.0,
             rows_sent: 3,
@@ -811,7 +809,7 @@ Time                 Id Command    Argument\n";
             res,
             (
                 Stream::new("\n".as_bytes()),
-                EntryLogHeader {
+                HeaderLines {
                     version: Bytes::from("5.7.20-log (MySQL Community Server (GPL))"),
                     tcp_port: Some(12345),
                     socket: Some(Bytes::from("/tmp/12345/mysql_sandbox12345.sock")),

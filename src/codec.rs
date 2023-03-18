@@ -1,7 +1,9 @@
+use std::default::Default;
 use std::fmt::{Display, Formatter};
 use std::num::NonZeroUsize;
 use std::ops::AddAssign;
 use thiserror::Error;
+use time::format_description::well_known::Iso8601;
 use tokio_util::codec::Decoder;
 
 use crate::codec::EntryError::MissingField;
@@ -9,13 +11,13 @@ use crate::parser::{
     admin_command, details_comment, entry_user, log_header, parse_entry_stats, parse_entry_time,
     parse_sql, sql_lines, start_timestamp_command, use_database, Stream,
 };
-use crate::EntryStatement::SqlStatement;
-use crate::{
-    Entry, EntrySqlStatement, EntryStatement, EntryStats, EntryTime, EntryUser, ReaderConfig,
-    SqlStatementContext,
-};
+use crate::types::EntryStatement::SqlStatement;
+use crate::types::{Entry, EntryCall, EntrySqlAttributes, EntrySqlStatement, EntryStatement};
+use crate::{ReaderConfig, SessionLine, SqlStatementContext, StatsLine};
 use bytes::BytesMut;
+use iso8601::DateTime;
 use log::debug;
+use time::OffsetDateTime;
 use tokio::io;
 use winnow::character::multispace0;
 use winnow::combinator::opt;
@@ -73,36 +75,31 @@ impl Display for CodecExpect {
 #[derive(Debug, Default)]
 struct EntryContext {
     expects: CodecExpect,
-    time: Option<EntryTime>,
-    user: Option<EntryUser>,
-    stats: Option<EntryStats>,
+    time: Option<DateTime>,
+    user: Option<SessionLine>,
+    stats: Option<StatsLine>,
     set_timestamp: Option<u32>,
-    statement: Option<EntryStatement>,
+    attributes: Option<EntrySqlAttributes>,
 }
 
 impl EntryContext {
     fn complete(&mut self) -> Result<Entry, EntryError> {
         let time = self.time.clone().ok_or(MissingField("time".into()))?;
-        let user = self.user.clone().ok_or(MissingField("user".into()))?;
+        let session = self.user.clone().ok_or(MissingField("user".into()))?;
         let stats = self.stats.clone().ok_or(MissingField("stats".into()))?;
         let set_timestamp = self
             .set_timestamp
             .clone()
             .ok_or(MissingField("set timestamp".into()))?;
-        let statement = self.statement.clone().ok_or(MissingField("sql".into()))?;
+        let attributes = self.attributes.clone().ok_or(MissingField("sql".into()))?;
         let e = Entry {
-            time: time.time(),
-            start_timestamp: set_timestamp,
-            user: user.user(),
-            sys_user: user.sys_user(),
-            host: user.host(),
-            ip_address: user.ip_address(),
-            thread_id: user.thread_id(),
-            query_time: stats.query_time(),
-            lock_time: stats.lock_time(),
-            rows_sent: stats.rows_sent(),
-            rows_examined: stats.rows_examined(),
-            statement,
+            call: EntryCall {
+                start_time: OffsetDateTime::from_unix_timestamp(set_timestamp as i64).unwrap(),
+                log_time: OffsetDateTime::parse(&time.to_string(), &Iso8601::DEFAULT).unwrap(),
+            },
+            session: session.into(),
+            stats: stats.into(),
+            sql_attributes: attributes,
         };
 
         self.reset();
@@ -189,7 +186,10 @@ impl EntryCodec {
 
                 if let Ok((rem, c)) = admin_command(i) {
                     i = rem;
-                    self.context.statement = Some(EntryStatement::AdminCommand(c));
+                    self.context.attributes = Some(EntrySqlAttributes {
+                        sql: (c.command.clone()),
+                        statement: EntryStatement::AdminCommand(c),
+                    });
                 } else {
                     let mut details = None;
 
@@ -232,7 +232,11 @@ impl EntryCodec {
                         )
                     };
 
-                    self.context.statement = Some(s);
+                    self.context.attributes = Some(EntrySqlAttributes {
+                        sql: sql_lines,
+                        //-- TODO: pull this from the Entry Statement
+                        statement: s,
+                    });
                 }
 
                 let e = self.context.complete().unwrap();
@@ -318,33 +322,40 @@ impl Decoder for EntryCodec {
 mod tests {
     use crate::codec::EntryCodec;
     use crate::parser::parse_sql;
-    use crate::EntryStatement::SqlStatement;
-    use crate::{Entry, EntryMasking, EntrySqlStatement, EntrySqlStatementObject, EntryStatement};
+    use crate::types::EntryStatement::SqlStatement;
+    use crate::types::{
+        Entry, EntryCall, EntrySession, EntrySqlAttributes, EntrySqlStatement,
+        EntrySqlStatementObject, EntryStatement, EntryStats,
+    };
+    use crate::EntryMasking;
     use bytes::Bytes;
     use futures::StreamExt;
-    use iso8601::datetime;
     use std::default::Default;
     use std::io::Cursor;
     use std::ops::AddAssign;
+    use time::format_description::well_known::Iso8601;
+    use time::OffsetDateTime;
     use tokio::fs::File;
     use tokio_util::codec::Framed;
 
     #[tokio::test]
     async fn parses_select_entry() {
-        let sql = "-- ID: 123 caller: hello_world()
-        SELECT film.film_id AS FID, film.title AS title, film.description AS description, category.name AS category, film.rental_rate AS price
+        let sql_comment = "-- ID: 123 caller: hello_world()";
+        let sql = "SELECT film.film_id AS FID, film.title AS title, film.description AS description, category.name AS category, film.rental_rate AS price
         FROM category LEFT JOIN film_category ON category.category_id = film_category.category_id LEFT JOIN film ON film_category.film_id = film.film_id
         GROUP BY film.film_id, category.name;";
-        let time = "2018-02-05T02:46:47.273786Z";
+        //NOTE: decimal places were shortened by parser, so this time is shortened
+        let time = "2018-02-05T02:46:47.273Z";
         let entry = format!(
             "# Time: {}
 # User@Host: msandbox[msandbox] @ localhost []  Id:    10
 # Query_time: 0.000352  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
 use mysql;
 SET timestamp=1517798807;
-{}
+{},
+{},
 ",
-            time, sql
+            time, sql_comment, sql
         );
 
         let mut eb = entry.as_bytes().to_vec();
@@ -362,18 +373,27 @@ SET timestamp=1517798807;
         assert_eq!(
             e,
             Entry {
-                time: datetime(time).unwrap(),
-                start_timestamp: 1517798807,
-                user: Bytes::from("msandbox"),
-                sys_user: Bytes::from("msandbox"),
-                host: Some(Bytes::from("localhost")),
-                ip_address: None,
-                thread_id: 10,
-                query_time: 0.000352,
-                lock_time: 0.0,
-                rows_sent: 0,
-                rows_examined: 0,
-                statement: SqlStatement(expected_stmt),
+                call: EntryCall {
+                    log_time: OffsetDateTime::parse(time, &Iso8601::DEFAULT).unwrap(),
+                    start_time: OffsetDateTime::from_unix_timestamp(1517798807 as i64).unwrap(),
+                },
+                session: EntrySession {
+                    user_name: Bytes::from("msandbox"),
+                    sys_user_name: Bytes::from("msandbox"),
+                    host_name: Some(Bytes::from("localhost")),
+                    ip_address: None,
+                    thread_id: 10,
+                },
+                stats: EntryStats {
+                    query_time: 0.000352,
+                    lock_time: 0.0,
+                    rows_sent: 0,
+                    rows_examined: 0,
+                },
+                sql_attributes: EntrySqlAttributes {
+                    sql: Bytes::from(sql.trim()),
+                    statement: SqlStatement(expected_stmt),
+                }
             }
         )
     }
@@ -416,7 +436,7 @@ GROUP BY film2.film_id, category.name;
             let e = res.unwrap();
             found.add_assign(1);
 
-            if let EntryStatement::InvalidStatement(_) = e.statement {
+            if let EntryStatement::InvalidStatement(_) = e.sql_attributes.statement {
                 invalid.add_assign(1);
             }
         }
@@ -467,10 +487,10 @@ GROUP BY film2.film_id, category.name;
         let mut ff = Framed::new(Cursor::new(&mut eb), EntryCodec::default());
         let e = ff.next().await.unwrap().unwrap();
 
-        match e.statement() {
+        match e.sql_attributes.statement() {
             SqlStatement(s) => {
                 assert_eq!(s.objects(), expected);
-                assert_eq!(s.entry_sql_type().to_string(), "SELECT".to_string());
+                assert_eq!(s.sql_type().to_string(), "SELECT".to_string());
             }
             _ => {
                 panic!("should have parsed sql as SqlStatement")
