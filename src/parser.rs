@@ -149,7 +149,7 @@ pub fn sql_lines<'a>(mut i: Stream<'_>) -> IResult<Stream<'_>, Bytes> {
 }
 
 pub fn alphanumerichyphen1<'a>(i: Stream<'_>) -> IResult<Stream<'_>, &'_ [u8]> {
-    alt((alphanumeric1, alt((tag("-"), tag("_")))))(i)
+    alt((alphanumeric1, tag("_"), tag("-")))(i)
 }
 
 pub fn host_name<'a>(i: Stream<'_>) -> IResult<Stream<'_>, Bytes> {
@@ -207,9 +207,12 @@ pub fn entry_user_thread_id<'a>(i: Stream<'_>) -> IResult<Stream<'_>, u32> {
 }
 
 pub fn user_name(i: Stream) -> IResult<Stream, Bytes> {
-    let (i, user) = alphanumeric1(i)?;
+    let (i, parts): (Stream, Vec<&[u8]>) = many1(alt((alphanumeric1, tag("_"))))(i)?;
 
-    let b = BytesMut::from(user);
+    let b = parts.iter().fold(BytesMut::new(), |mut acc, p| {
+        acc.put_slice(p);
+        acc
+    });
 
     Ok((i, b.freeze()))
 }

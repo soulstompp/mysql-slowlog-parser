@@ -53,13 +53,13 @@ impl Default for EntryMasking {
 }
 
 #[derive(Default)]
-pub struct ReaderConfig {
+pub struct CodecConfig {
     pub masking: EntryMasking,
     pub map_comment_context:
         Option<Box<dyn Fn(HashMap<Bytes, Bytes>) -> Option<SqlStatementContext>>>,
 }
 
-impl Debug for ReaderConfig {
+impl Debug for CodecConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.masking)?;
         write!(f, "map_comment_context: fn")

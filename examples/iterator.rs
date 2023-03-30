@@ -20,7 +20,7 @@ async fn main() {
     let mut i = 0;
 
     let future = fr.for_each(|re: Result<Entry, CodecError>| async move {
-        let e = re.unwrap();
+        let _ = re.unwrap();
 
         i.add_assign(1);
     });

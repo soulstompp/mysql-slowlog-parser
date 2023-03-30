@@ -13,7 +13,7 @@ use crate::parser::{
 };
 use crate::types::EntryStatement::SqlStatement;
 use crate::types::{Entry, EntryCall, EntrySqlAttributes, EntrySqlStatement, EntryStatement};
-use crate::{ReaderConfig, SessionLine, SqlStatementContext, StatsLine};
+use crate::{CodecConfig, SessionLine, SqlStatementContext, StatsLine};
 use bytes::BytesMut;
 use iso8601::DateTime;
 use log::debug;
@@ -116,19 +116,18 @@ impl EntryContext {
 pub struct EntryCodec {
     processed: usize,
     context: EntryContext,
-    config: ReaderConfig,
+    config: CodecConfig,
 }
 
 impl EntryCodec {
+    pub fn new(c: CodecConfig) -> Self {
+        Self {
+            config: c,
+            ..Default::default()
+        }
+    }
     fn parse_next<'b>(&mut self, i: &'b [u8]) -> IResult<Stream<'b>, Option<Entry>> {
         let mut i = Stream::new(i);
-
-        let s = (i.len()).min(800);
-        debug!(
-            "expecting {} from: \n{}",
-            self.context.expects,
-            std::str::from_utf8(&i[..s]).unwrap()
-        );
 
         let (rem, entry) = match self.context.expects {
             CodecExpect::Header => {
@@ -327,8 +326,8 @@ mod tests {
         Entry, EntryCall, EntrySession, EntrySqlAttributes, EntrySqlStatement,
         EntrySqlStatementObject, EntryStatement, EntryStats,
     };
-    use crate::EntryMasking;
-    use bytes::Bytes;
+    use crate::{CodecConfig, EntryMasking, SqlStatementContext};
+    use bytes::{Bytes, BytesMut};
     use futures::StreamExt;
     use std::default::Default;
     use std::io::Cursor;
@@ -340,7 +339,8 @@ mod tests {
 
     #[tokio::test]
     async fn parses_select_entry() {
-        let sql_comment = "-- ID: 123 caller: hello_world()";
+        let sql_comment = "-- request_id: apLo5wdqkmKw4W7vGfiBc5 file: src/endpoints/original/mod\
+        .rs method: notifications() line: 38";
         let sql = "SELECT film.film_id AS FID, film.title AS title, film.description AS description, category.name AS category, film.rental_rate AS price
         FROM category LEFT JOIN film_category ON category.category_id = film_category.category_id LEFT JOIN film ON film_category.film_id = film.film_id
         GROUP BY film.film_id, category.name;";
@@ -352,7 +352,7 @@ mod tests {
 # Query_time: 0.000352  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
 use mysql;
 SET timestamp=1517798807;
-{},
+{}
 {},
 ",
             time, sql_comment, sql
@@ -360,14 +360,45 @@ SET timestamp=1517798807;
 
         let mut eb = entry.as_bytes().to_vec();
 
-        let mut ff = Framed::new(Cursor::new(&mut eb), EntryCodec::default());
+        let config = CodecConfig {
+            masking: Default::default(),
+            map_comment_context: Some(Box::new(|d| {
+                let acc = SqlStatementContext {
+                    request_id: d
+                        .get(&*BytesMut::from("request_id"))
+                        .and_then(|b| Some(b.clone())),
+                    caller: d
+                        .get(&*BytesMut::from("file"))
+                        .and_then(|b| Some(b.clone())),
+                    function: d
+                        .get(&*BytesMut::from("method"))
+                        .and_then(|b| Some(b.clone())),
+                    line: d
+                        .get(&*BytesMut::from("line"))
+                        .and_then(|b| String::from_utf8_lossy(b).parse().ok()),
+                };
+
+                if acc == SqlStatementContext::default() {
+                    None
+                } else {
+                    Some(acc)
+                }
+            })),
+        };
+
+        let mut ff = Framed::new(Cursor::new(&mut eb), EntryCodec::new(config));
         let e = ff.next().await.unwrap().unwrap();
 
         let stmts = parse_sql(sql, &EntryMasking::None).unwrap();
 
         let expected_stmt = EntrySqlStatement {
             statement: stmts.get(0).unwrap().clone(),
-            context: None,
+            context: Some(SqlStatementContext {
+                request_id: Some("apLo5wdqkmKw4W7vGfiBc5".into()),
+                caller: Some("src/endpoints/original/mod.rs".into()),
+                function: Some("notifications()".into()),
+                line: Some(38),
+            }),
         };
 
         assert_eq!(
