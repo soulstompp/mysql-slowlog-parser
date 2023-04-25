@@ -14,7 +14,7 @@ use crate::parser::{
 use crate::types::EntryStatement::SqlStatement;
 use crate::types::{Entry, EntryCall, EntrySqlAttributes, EntrySqlStatement, EntryStatement};
 use crate::{CodecConfig, SessionLine, SqlStatementContext, StatsLine};
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use iso8601::DateTime;
 use log::debug;
 use time::OffsetDateTime;
@@ -197,7 +197,7 @@ impl EntryCodec {
                         details = Some(d);
                     }
 
-                    let (rem, sql_lines) = sql_lines(i)?;
+                    let (rem, mut sql_lines) = sql_lines(i)?;
                     i = rem;
 
                     let s = if let Ok(s) =
@@ -219,6 +219,7 @@ impl EntryCodec {
                                 context,
                             };
 
+                            sql_lines = Bytes::from(s.statement.to_string());
                             SqlStatement(s)
                         } else {
                             EntryStatement::InvalidStatement(
@@ -341,9 +342,9 @@ mod tests {
     async fn parses_select_entry() {
         let sql_comment = "-- request_id: apLo5wdqkmKw4W7vGfiBc5 file: src/endpoints/original/mod\
         .rs method: notifications() line: 38";
-        let sql = "SELECT film.film_id AS FID, film.title AS title, film.description AS description, category.name AS category, film.rental_rate AS price
-        FROM category LEFT JOIN film_category ON category.category_id = film_category.category_id LEFT JOIN film ON film_category.film_id = film.film_id
-        GROUP BY film.film_id, category.name;";
+        let sql = "SELECT film.film_id AS FID, film.title AS title, film.description AS
+        description, category.name AS category, film.rental_rate AS price FROM category LEFT JOIN
+         film_category ON category.category_id = film_category.category_id LEFT JOIN film ON film_category.film_id = film.film_id GROUP BY film.film_id, category.name;";
         //NOTE: decimal places were shortened by parser, so this time is shortened
         let time = "2018-02-05T02:46:47.273Z";
         let entry = format!(
