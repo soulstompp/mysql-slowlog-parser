@@ -94,7 +94,7 @@ impl EntryContext {
         let attributes = self.attributes.clone().ok_or(MissingField("sql".into()))?;
         let e = Entry {
             call: EntryCall {
-                start_time: OffsetDateTime::from_unix_timestamp(set_timestamp as i64).unwrap(),
+                set_timestamp: OffsetDateTime::from_unix_timestamp(set_timestamp as i64).unwrap(),
                 log_time: OffsetDateTime::parse(&time.to_string(), &Iso8601::DEFAULT).unwrap(),
             },
             session: session.into(),
@@ -342,11 +342,14 @@ mod tests {
     async fn parses_select_entry() {
         let sql_comment = "-- request_id: apLo5wdqkmKw4W7vGfiBc5 file: src/endpoints/original/mod\
         .rs method: notifications() line: 38";
-        let sql = "SELECT film.film_id AS FID, film.title AS title, film.description AS
-        description, category.name AS category, film.rental_rate AS price FROM category LEFT JOIN
-         film_category ON category.category_id = film_category.category_id LEFT JOIN film ON film_category.film_id = film.film_id GROUP BY film.film_id, category.name;";
+        let sql = "SELECT film.film_id AS FID, film.title AS title, film.description AS \
+        description, category.name AS category, film.rental_rate AS price FROM category LEFT JOIN \
+         film_category ON category.category_id = film_category.category_id LEFT JOIN film ON \
+         film_category.film_id = film.film_id GROUP BY film.film_id, category.name;";
         //NOTE: decimal places were shortened by parser, so this time is shortened
         let time = "2018-02-05T02:46:47.273Z";
+        let set_timestamp = 1517798807;
+
         let entry = format!(
             "# Time: {}
 # User@Host: msandbox[msandbox] @ localhost []  Id:    10
@@ -402,32 +405,35 @@ SET timestamp=1517798807;
             }),
         };
 
-        assert_eq!(
-            e,
-            Entry {
-                call: EntryCall {
-                    log_time: OffsetDateTime::parse(time, &Iso8601::DEFAULT).unwrap(),
-                    start_time: OffsetDateTime::from_unix_timestamp(1517798807 as i64).unwrap(),
-                },
-                session: EntrySession {
-                    user_name: Bytes::from("msandbox"),
-                    sys_user_name: Bytes::from("msandbox"),
-                    host_name: Some(Bytes::from("localhost")),
-                    ip_address: None,
-                    thread_id: 10,
-                },
-                stats: EntryStats {
-                    query_time: 0.000352,
-                    lock_time: 0.0,
-                    rows_sent: 0,
-                    rows_examined: 0,
-                },
-                sql_attributes: EntrySqlAttributes {
-                    sql: Bytes::from(sql.trim()),
-                    statement: SqlStatement(expected_stmt),
-                }
-            }
-        )
+        let expected_sql = sql.trim().strip_suffix(";").unwrap();
+
+        let expected_entry = Entry {
+            call: EntryCall {
+                log_time: OffsetDateTime::parse(time, &Iso8601::DEFAULT).unwrap(),
+                set_timestamp: OffsetDateTime::from_unix_timestamp(1517798807 as i64).unwrap(),
+            },
+            session: EntrySession {
+                user_name: Bytes::from("msandbox"),
+                sys_user_name: Bytes::from("msandbox"),
+                host_name: Some(Bytes::from("localhost")),
+                ip_address: None,
+                thread_id: 10,
+            },
+            stats: EntryStats {
+                query_time: 0.000352,
+                lock_time: 0.0,
+                rows_sent: 0,
+                rows_examined: 0,
+            },
+            sql_attributes: EntrySqlAttributes {
+                sql: Bytes::from(expected_sql),
+                statement: SqlStatement(expected_stmt),
+            },
+        };
+
+        assert_eq!(e, expected_entry);
+
+        assert_eq!(e.query_start_time().unix_timestamp(), set_timestamp);
     }
 
     #[tokio::test]

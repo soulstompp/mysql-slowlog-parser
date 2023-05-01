@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
 use std::ops::ControlFlow;
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 
 /// a struct representing the values parsed from the log entry
 #[derive(Clone, Debug, PartialEq)]
@@ -17,6 +17,23 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// returns the time the entry was recorded
+    pub fn log_time(&self) -> OffsetDateTime {
+        self.call.log_time
+    }
+
+    pub fn query_start_time(&self) -> OffsetDateTime {
+        self.call.log_time
+            - Duration::microseconds(
+                ((self.lock_time() + self.query_time()) * 1_000_000.0).round() as i64,
+            )
+    }
+
+    pub fn query_lock_end_time(&self) -> OffsetDateTime {
+        self.call.log_time
+            - Duration::microseconds((self.query_time() * 1_000_000.0).round() as i64)
+    }
+
     /// returns the mysql user name that requested the command
     pub fn user_name(&self) -> Cow<str> {
         String::from_utf8_lossy(&self.session.user_name)
@@ -486,19 +503,19 @@ impl EntrySqlAttributes {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntryCall {
-    pub start_time: OffsetDateTime,
+    pub set_timestamp: OffsetDateTime,
     pub log_time: OffsetDateTime,
 }
 
 impl EntryCall {
-    /// return entry time as an `iso8601::DateTime`
+    /// returns the entry time as an `time::OffsetDateTime`
     pub fn log_time(&self) -> OffsetDateTime {
         self.log_time
     }
 
     /// returns the time stamp set at the beginning of each entry
-    pub fn start_time(&self) -> OffsetDateTime {
-        self.start_time
+    pub fn set_timestamp(&self) -> OffsetDateTime {
+        self.set_timestamp
     }
 }
 
