@@ -23,15 +23,11 @@ impl Entry {
     }
 
     pub fn query_start_time(&self) -> OffsetDateTime {
-        self.call.log_time
-            - Duration::microseconds(
-                ((self.lock_time() + self.query_time()) * 1_000_000.0).round() as i64,
-            )
+        self.call.start_time()
     }
 
     pub fn query_lock_end_time(&self) -> OffsetDateTime {
-        self.call.log_time
-            - Duration::microseconds((self.query_time() * 1_000_000.0).round() as i64)
+        self.call.lock_end_time()
     }
 
     /// returns the mysql user name that requested the command
@@ -503,11 +499,29 @@ impl EntrySqlAttributes {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntryCall {
-    pub set_timestamp: OffsetDateTime,
     pub log_time: OffsetDateTime,
+    pub set_timestamp: OffsetDateTime,
+    pub start_time: OffsetDateTime,
+    pub lock_end_time: OffsetDateTime,
 }
 
 impl EntryCall {
+    pub fn new(
+        log_time: OffsetDateTime,
+        set_timestamp: OffsetDateTime,
+        query_time: f64,
+        lock_time: f64,
+    ) -> Self {
+        Self {
+            log_time,
+            set_timestamp,
+            start_time: log_time
+                - Duration::microseconds(((lock_time + query_time) * 1_000_000.0).round() as i64),
+            lock_end_time: log_time
+                - Duration::microseconds((query_time * 1_000_000.0).round() as i64),
+        }
+    }
+
     /// returns the entry time as an `time::OffsetDateTime`
     pub fn log_time(&self) -> OffsetDateTime {
         self.log_time
@@ -516,6 +530,14 @@ impl EntryCall {
     /// returns the time stamp set at the beginning of each entry
     pub fn set_timestamp(&self) -> OffsetDateTime {
         self.set_timestamp
+    }
+
+    pub fn start_time(&self) -> OffsetDateTime {
+        self.start_time
+    }
+
+    pub fn lock_end_time(&self) -> OffsetDateTime {
+        self.lock_end_time
     }
 }
 

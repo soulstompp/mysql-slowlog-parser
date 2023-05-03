@@ -93,10 +93,12 @@ impl EntryContext {
             .ok_or(MissingField("set timestamp".into()))?;
         let attributes = self.attributes.clone().ok_or(MissingField("sql".into()))?;
         let e = Entry {
-            call: EntryCall {
-                set_timestamp: OffsetDateTime::from_unix_timestamp(set_timestamp as i64).unwrap(),
-                log_time: OffsetDateTime::parse(&time.to_string(), &Iso8601::DEFAULT).unwrap(),
-            },
+            call: EntryCall::new(
+                OffsetDateTime::parse(&time.to_string(), &Iso8601::DEFAULT).unwrap(),
+                OffsetDateTime::from_unix_timestamp(set_timestamp as i64).unwrap(),
+                stats.query_time,
+                stats.lock_time,
+            ),
             session: session.into(),
             stats: stats.into(),
             sql_attributes: attributes,
@@ -408,10 +410,12 @@ SET timestamp=1517798807;
         let expected_sql = sql.trim().strip_suffix(";").unwrap();
 
         let expected_entry = Entry {
-            call: EntryCall {
-                log_time: OffsetDateTime::parse(time, &Iso8601::DEFAULT).unwrap(),
-                set_timestamp: OffsetDateTime::from_unix_timestamp(1517798807 as i64).unwrap(),
-            },
+            call: EntryCall::new(
+                OffsetDateTime::parse(time, &Iso8601::DEFAULT).unwrap(),
+                OffsetDateTime::from_unix_timestamp(1517798807 as i64).unwrap(),
+                0.000352,
+                0.0,
+            ),
             session: EntrySession {
                 user_name: Bytes::from("msandbox"),
                 sys_user_name: Bytes::from("msandbox"),
