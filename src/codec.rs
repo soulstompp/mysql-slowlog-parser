@@ -554,4 +554,19 @@ GROUP BY film2.film_id, category.name;
 
         assert_eq!(i, 310);
     }
+
+    #[tokio::test]
+    async fn parse_mysql8_log_file() {
+        let f = File::open("data/lobsters8-mysql-slow.log").await.unwrap();
+        let mut ff = Framed::new(f, EntryCodec::default());
+
+        let mut i = 0;
+
+        while let Some(res) = ff.next().await {
+            let _ = res.unwrap();
+            i.add_assign(1);
+        }
+
+        assert_eq!(i, 104160);
+    }
 }
