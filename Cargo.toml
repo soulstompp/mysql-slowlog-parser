@@ -10,8 +10,8 @@ license = "MIT"
 bytes = "1.4.0"
 env_logger = "0.11.5"
 futures = "0.3.26"
-winnow = "0.3.5"
-iso8601 = "0.6.1"
+winnow = {  version = "0.6.20", features = ["default"] }
+winnow_iso8601 = {  version = "0.1.0" , path = "../winnow-iso8601" }
 sqlparser = {version = "0.51.0", features = ["visitor"]}
 thiserror = "1.0.38"
 log = "0.4.17"

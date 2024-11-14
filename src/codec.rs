@@ -1,28 +1,26 @@
 use std::default::Default;
 use std::fmt::{Display, Formatter};
-use std::num::NonZeroUsize;
-use std::ops::AddAssign;
+use std::ops::{AddAssign};
 use thiserror::Error;
 use time::format_description::well_known::Iso8601;
 use tokio_util::codec::Decoder;
-
+use winnow::Parser;
 use crate::codec::EntryError::MissingField;
-use crate::parser::{
-    admin_command, details_comment, entry_user, log_header, parse_entry_stats, parse_entry_time,
-    parse_sql, sql_lines, start_timestamp_command, use_database, Stream,
-};
+use crate::parser::{admin_command, details_comment, entry_user, log_header, parse_entry_stats, parse_entry_time, parse_sql, sql_lines, start_timestamp_command, use_database, HeaderLines, Stream};
 use crate::types::EntryStatement::SqlStatement;
 use crate::types::{Entry, EntryCall, EntrySqlAttributes, EntrySqlStatement, EntryStatement};
 use crate::{CodecConfig, SessionLine, SqlStatementContext, StatsLine};
 use bytes::{Bytes, BytesMut};
-use iso8601::DateTime;
+use winnow_iso8601::DateTime;
 use log::debug;
 use time::OffsetDateTime;
 use tokio::io;
-use winnow::character::multispace0;
+use winnow::ascii::multispace0;
 use winnow::combinator::opt;
-use winnow::error::{ErrMode, Needed};
-use winnow::IResult;
+use winnow::error::{ErrMode};
+use winnow::PResult;
+use winnow::stream::{AsBytes};
+use winnow::stream::Stream as _;
 
 #[derive(Error, Debug)]
 pub enum EntryError {
@@ -75,6 +73,7 @@ impl Display for CodecExpect {
 #[derive(Debug, Default)]
 struct EntryContext {
     expects: CodecExpect,
+    headers: HeaderLines,
     time: Option<DateTime>,
     user: Option<SessionLine>,
     stats: Option<StatsLine>,
@@ -128,65 +127,56 @@ impl EntryCodec {
             ..Default::default()
         }
     }
-    fn parse_next<'b>(&mut self, i: &'b [u8]) -> IResult<Stream<'b>, Option<Entry>> {
-        let mut i = Stream::new(i);
-
-        let (rem, entry) = match self.context.expects {
+    fn parse_next<'b>(&mut self, i: &mut Stream<'b>) -> PResult<Option<Entry>> {
+        let entry = match self.context.expects {
             CodecExpect::Header => {
-                let (i, _) = multispace0(i)?;
+                let _ = multispace0(i)?;
 
-                let res = opt(log_header)(i)?;
+                let res = opt(log_header).parse_next(i)?;
                 self.context.expects = CodecExpect::Time;
-                (res.0, None)
+                self.context.headers = res.unwrap_or_default();
+
+                None
             }
             CodecExpect::Time => {
-                // the date parser can parse partials as complete, so overfill buffer slightly
-                if i.len() < 40 {
-                    Err(ErrMode::Incomplete(Needed::Size(
-                        NonZeroUsize::try_from(40usize - i.len()).unwrap(),
-                    )))?;
-                }
+                let _ = multispace0(i)?;
 
-                let (i, _) = multispace0(i)?;
-
-                let res = parse_entry_time(i)?;
-                self.context.time = Some(res.1);
+                let dt = parse_entry_time(i)?;
+                self.context.time = Some(dt);
                 self.context.expects = CodecExpect::User;
-                (res.0, None)
+                None
             }
             CodecExpect::User => {
-                let (i, _) = multispace0(i)?;
-                let res = entry_user(i)?;
-                self.context.user = Some(res.1);
+                let sl = entry_user(i)?;
+                self.context.user = Some(sl);
                 self.context.expects = CodecExpect::Stats;
-                (res.0, None)
+                None
             }
             CodecExpect::Stats => {
-                let (i, _) = multispace0(i)?;
-                let res = parse_entry_stats(i)?;
-                self.context.stats = Some(res.1);
+                let _ = multispace0(i)?;
+                let st = parse_entry_stats(i)?;
+                self.context.stats = Some(st);
                 self.context.expects = CodecExpect::UseDatabase;
-                (res.0, None)
+                None
             }
             CodecExpect::UseDatabase => {
-                let (i, _) = multispace0(i)?;
-                let res = opt(use_database)(i)?;
+                let _ = multispace0(i)?;
+                let _ = opt(use_database).parse_next(i)?;
 
                 self.context.expects = CodecExpect::StartTimeStamp;
-                (res.0, None)
+                None
             }
             CodecExpect::StartTimeStamp => {
-                let (i, _) = multispace0(i)?;
-                let res = start_timestamp_command(i)?;
-                self.context.set_timestamp = Some(res.1);
+                let _ = multispace0(i)?;
+                let st = start_timestamp_command(i)?;
+                self.context.set_timestamp = Some(st.into());
                 self.context.expects = CodecExpect::Sql;
-                (res.0, None)
+                None
             }
             CodecExpect::Sql => {
-                let (mut i, _) = multispace0(i)?;
+                let _ = multispace0(i)?;
 
-                if let Ok((rem, c)) = admin_command(i) {
-                    i = rem;
+                if let Ok(c) = admin_command(i) {
                     self.context.attributes = Some(EntrySqlAttributes {
                         sql: (c.command.clone()),
                         statement: EntryStatement::AdminCommand(c),
@@ -194,13 +184,11 @@ impl EntryCodec {
                 } else {
                     let mut details = None;
 
-                    if let Ok((rem, Some(d))) = opt(details_comment)(i) {
-                        i = rem;
+                    if let Ok(Some(d)) = opt(details_comment).parse_next(i) {
                         details = Some(d);
                     }
 
-                    let (rem, mut sql_lines) = sql_lines(i)?;
-                    i = rem;
+                    let mut sql_lines = sql_lines(i)?;
 
                     let s = if let Ok(s) =
                         parse_sql(&String::from_utf8_lossy(&sql_lines), &self.config.masking)
@@ -242,18 +230,16 @@ impl EntryCodec {
                 }
 
                 let e = self.context.complete().unwrap();
-                (i, Some(e))
+                Some(e)
             }
         };
-
-        i = rem;
 
         return if let Some(e) = entry {
             self.processed.add_assign(1);
 
-            Ok((i, Some(e)))
+            Ok(Some(e))
         } else {
-            Ok((i, None))
+            Ok(None)
         };
     }
 }
@@ -262,37 +248,61 @@ impl Decoder for EntryCodec {
     type Item = Entry;
     type Error = CodecError;
 
-    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        let mut i = &buf.split()[..];
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        // Check that the length is not too large to avoid a denial of
+        // service attack where the server runs out of memory.
+        //if length > LENGTH_MAX {
+        //    return Err(std::io::Error::new(
+        //        std::io::ErrorKind::InvalidData,
+        //        format!("Frame of length {} is too large.", length)
+        //    ).into());
+       // }
+       // let mut i = Stream::new(src.deref());
+       let b = &src.split()[..];
+        let mut i = Stream::new(&b);
 
-        if i.len() == 0 {
-            return Ok(None);
-        };
+        let mut start = i.checkpoint();
 
         loop {
-            match self.parse_next(i) {
-                Ok((rem, e)) => {
-                    if let Some(e) = e {
-                        buf.extend_from_slice(*rem);
 
+            if i.len() == 0 {
+                return Ok(None);
+            };
+
+
+            match self.parse_next(&mut i) {
+                Ok(e) => {
+                    if let Some(e) = e {
                         self.context = EntryContext::default();
+
+                        src.extend_from_slice(i.as_bytes());
 
                         return Ok(Some(e));
                     } else {
                         debug!("preparing input for next parser\n");
-                        i = *rem;
+
+                        start = i.checkpoint();
+
                         continue;
                     }
                 }
-                Err(ErrMode::Incomplete(e)) => {
-                    debug!("asking for more data {:?}", e);
-                    buf.extend_from_slice(i);
+                Err(ErrMode::Incomplete(_)) => {
+                    i.reset(&start);
+                    src.extend_from_slice(i.as_bytes());
+
                     return Ok(None);
                 }
-                Err(ErrMode::Backtrack(e)) | Err(ErrMode::Cut(e)) => {
+                Err(ErrMode::Backtrack(e)) => {
                     panic!(
-                        "unhandled parser error after {:#?} processed: {}",
-                        std::str::from_utf8(*e.input).unwrap(),
+                        "unhandled parser backtrack error after {:#?} processed: {}",
+                        e.to_string(),
+                        self.processed
+                    );
+                }
+                Err(ErrMode::Cut(e)) => {
+                    panic!(
+                        "unhandled parser cut error after {:#?} processed: {}",
+                        e.to_string(),
                         self.processed
                     );
                 }
@@ -342,8 +352,8 @@ mod tests {
 
     #[tokio::test]
     async fn parses_select_entry() {
-        let sql_comment = "-- request_id: apLo5wdqkmKw4W7vGfiBc5 file: src/endpoints/original/mod\
-        .rs method: notifications() line: 38";
+        let sql_comment = "-- request_id: apLo5wdqkmKw4W7vGfiBc5, file: src/endpoints/original/mod\
+        .rs, method: notifications(), line: 38";
         let sql = "SELECT film.film_id AS FID, film.title AS title, film.description AS \
         description, category.name AS category, film.rental_rate AS price FROM category LEFT JOIN \
          film_category ON category.category_id = film_category.category_id LEFT JOIN film ON \
@@ -446,20 +456,20 @@ SET timestamp=1517798807;
 # User@Host: msandbox[msandbox] @ localhost []  Id:    10
 # Query_time: 0.000352  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
 SET timestamp=1517798807;
--- ID: 123 caller: hello_world()
+-- ID: 123, caller: hello_world()
 SELECT film.film_id AS FID, film.title AS title, film.description AS description, category.name AS category, film.rental_rate AS price
 FROM category LEFT JOIN film_category ON category.category_id = film_category.category_id LEFT JOIN film ON film_category.film_id = film.film_id
 GROUP BY film.film_id, category.name;
-# Time: 2018-02-05T02:46:47.273786Z
+# Time: 2018-02-05T02:46:47.273787Z
 # User@Host: msandbox[msandbox] @ localhost []  Id:    10
 # Query_time: 0.000352  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
-SET timestamp=1517798807;
+SET timestamp=1517798808;
 /*!40101 SET NAMES utf8 */;
-# Time: 2018-02-05T02:46:47.273786Z
+# Time: 2018-02-05T02:46:47.273788Z
 # User@Host: msandbox[msandbox] @ localhost []  Id:    10
 # Query_time: 0.000352  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
-SET timestamp=1517798807;
--- ID: 456 caller: hello_world()
+SET timestamp=1517798809;
+-- ID: 456, caller: hello_world()
 SELECT film2.film_id AS FID, film2.title AS title, film2.description AS description, category.name
 AS category, film2.rental_rate AS price
 FROM category LEFT JOIN film_category ON category.category_id = film_category.category_id LEFT
