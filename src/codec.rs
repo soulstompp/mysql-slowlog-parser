@@ -1,26 +1,29 @@
-use std::default::Default;
-use std::fmt::{Display, Formatter};
-use std::ops::{AddAssign};
-use thiserror::Error;
-use time::format_description::well_known::Iso8601;
-use tokio_util::codec::Decoder;
-use winnow::Parser;
 use crate::codec::EntryError::MissingField;
-use crate::parser::{admin_command, details_comment, entry_user, log_header, parse_entry_stats, parse_entry_time, parse_sql, sql_lines, start_timestamp_command, use_database, HeaderLines, Stream};
+use crate::parser::{
+    admin_command, details_comment, entry_user, log_header, parse_entry_stats, parse_entry_time,
+    parse_sql, sql_lines, start_timestamp_command, use_database, HeaderLines, Stream,
+};
 use crate::types::EntryStatement::SqlStatement;
 use crate::types::{Entry, EntryCall, EntrySqlAttributes, EntrySqlStatement, EntryStatement};
 use crate::{CodecConfig, SessionLine, SqlStatementContext, StatsLine};
 use bytes::{Bytes, BytesMut};
-use winnow_iso8601::DateTime;
 use log::debug;
+use std::default::Default;
+use std::fmt::{Display, Formatter};
+use std::ops::AddAssign;
+use thiserror::Error;
+use time::format_description::well_known::Iso8601;
 use time::OffsetDateTime;
 use tokio::io;
+use tokio_util::codec::Decoder;
 use winnow::ascii::multispace0;
 use winnow::combinator::opt;
-use winnow::error::{ErrMode};
-use winnow::PResult;
-use winnow::stream::{AsBytes};
+use winnow::error::ErrMode;
+use winnow::stream::AsBytes;
 use winnow::stream::Stream as _;
+use winnow::PResult;
+use winnow::Parser;
+use winnow_iso8601::DateTime;
 
 #[derive(Error, Debug)]
 pub enum EntryError {
@@ -256,19 +259,17 @@ impl Decoder for EntryCodec {
         //        std::io::ErrorKind::InvalidData,
         //        format!("Frame of length {} is too large.", length)
         //    ).into());
-       // }
-       // let mut i = Stream::new(src.deref());
-       let b = &src.split()[..];
+        // }
+        // let mut i = Stream::new(src.deref());
+        let b = &src.split()[..];
         let mut i = Stream::new(&b);
 
         let mut start = i.checkpoint();
 
         loop {
-
             if i.len() == 0 {
                 return Ok(None);
             };
-
 
             match self.parse_next(&mut i) {
                 Ok(e) => {

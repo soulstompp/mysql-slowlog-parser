@@ -1,6 +1,5 @@
+use crate::EntryMasking;
 use bytes::{BufMut, Bytes, BytesMut};
-use winnow_iso8601::parsers::parse_datetime;
-use winnow_iso8601::DateTime;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::{Parser as SQLParser, ParserError};
@@ -10,15 +9,19 @@ use std::collections::HashMap;
 use std::ops::Not;
 use std::str;
 use std::str::FromStr;
-use winnow::ascii::{alpha1, alphanumeric1, digit1, float, line_ending, multispace0, multispace1, till_line_ending, Caseless};
-use winnow::combinator::{alt, trace};
+use winnow::ascii::{
+    alpha1, alphanumeric1, digit1, float, line_ending, multispace0, multispace1, till_line_ending,
+    Caseless,
+};
 use winnow::combinator::repeat;
+use winnow::combinator::{alt, trace};
 use winnow::combinator::{not, opt};
 use winnow::combinator::{preceded, terminated};
 use winnow::error::{ContextError, ErrMode, InputError};
 use winnow::token::{any, literal, take, take_till, take_until};
 use winnow::{seq, PResult, Parser, Partial};
-use crate::EntryMasking;
+use winnow_iso8601::parsers::parse_datetime;
+use winnow_iso8601::DateTime;
 
 pub type Stream<'i> = Partial<&'i [u8]>;
 
@@ -32,17 +35,20 @@ impl TimeLine {
     }
 }
 
-
 // "# Time: 2015-06-26T16:43:23+0200";
 /// parses "# Time: ...." entry line
 pub fn parse_entry_time(i: &mut Stream<'_>) -> PResult<DateTime> {
     trace("parse_entry_time", move |input: &mut Stream<'_>| {
-        let _ = literal("# Time:").parse_next(input)?;
-        let _ = multispace1(input)?;
-        let dt = parse_datetime(input)?;
+        let dt = seq!(
+            _: literal("# Time:"),
+            _: multispace1,
+            parse_datetime,
+        )
+        .parse_next(input)?;
 
-        Ok(dt)
-    }).parse_next(i)
+        Ok(dt.0)
+    })
+    .parse_next(i)
 }
 
 /// values from the user entry line
@@ -87,30 +93,28 @@ pub struct HeaderLines {
 pub fn log_header<'a>(i: &mut Stream<'_>) -> PResult<HeaderLines> {
     trace("log_header", move |input: &mut Stream<'_>| {
         // check for the '#' since the last parser in the set is greedy
-        let _ = not(literal("#")).parse_next(input)?;
-        let _ = take_until(1.., ", Version: ").parse_next(input)?;
-        let _ =  (", Version: ").parse_next(input)?;
-        let version = take_until(1.., " started with:").parse_next(input)?;
-        let _ = literal(" started with:").parse_next(input)?;
-        let _ = multispace1(input)?;
-        let _ = literal("Tcp port:").parse_next(input)?;
-        let _ = multispace1(input)?;
-        let tcp_port = opt(digit1).parse_next(input)?;
-        let _ = multispace1(input)?;
-        let _ = literal("Unix socket: ").parse_next(input)?;
-        let socket = opt(take_till(1.., "\n".as_bytes())).parse_next(input)?;
-        let _ = till_line_ending(input)?;
-        let _ = line_ending(input)?;
-        let _ = till_line_ending(input)?;
-        let _ = line_ending(input)?;
-
-        Ok(
+        let head = seq!{
             HeaderLines {
-                version: version.to_owned().into(),
-                tcp_port: tcp_port.and_then(|v| Some(str::from_utf8(v).unwrap().parse().unwrap())),
-                socket: socket.and_then(|v| Some(v.to_owned().into())),
-            },
-        )
+                _: not(literal("#")),
+                _: take_until(1.., ", Version: "),
+                _:  (", Version: "),
+                version: take_until(1.., " started with:").map(|v: &[u8]| v.to_owned().into()),
+                _: literal(" started with:"),
+                _: multispace1,
+                _: literal("Tcp port:"),
+                _: multispace1,
+                tcp_port: opt(digit1).map(|v: Option<&[u8]>| v.and_then(|d| Some(str::from_utf8(d).unwrap().parse().unwrap()))),
+                _: multispace1,
+                _: literal("Unix socket: "),
+                socket: opt(take_till(1.., "\n".as_bytes())).map(|v: Option<&[u8]>| v.and_then(|d| Some(d.to_owned().into()))),
+                _: till_line_ending,
+                _: line_ending,
+                _: till_line_ending,
+                _: line_ending,
+            }
+        }.parse_next(input)?;
+
+        Ok(head)
     }).parse_next(i)
 }
 
@@ -148,7 +152,8 @@ pub fn sql_lines<'a>(i: &mut Stream<'_>) -> PResult<Bytes> {
                 return Ok(acc.freeze());
             }
         }
-    }).parse_next(i)
+    })
+    .parse_next(i)
 }
 
 pub fn alphanumerichyphen1<'a>(i: &mut Stream<'a>) -> PResult<&'a [u8]> {
@@ -158,9 +163,13 @@ pub fn alphanumerichyphen1<'a>(i: &mut Stream<'a>) -> PResult<&'a [u8]> {
 pub fn host_name<'a>(i: &mut Stream<'_>) -> PResult<Bytes> {
     trace("host_name", move |input: &mut Stream<'_>| {
         let (mut first, second): (Vec<&[u8]>, &[u8]) = alt((
-            ((repeat(1..,terminated(alphanumerichyphen1, literal("."))), alpha1)),
+            ((
+                repeat(1.., terminated(alphanumerichyphen1, literal("."))),
+                alpha1,
+            )),
             ((repeat(1, alphanumerichyphen1), take(0 as usize))),
-        )).parse_next(input)?;
+        ))
+        .parse_next(input)?;
 
         if !second.is_empty() {
             first.push(second);
@@ -179,18 +188,22 @@ pub fn host_name<'a>(i: &mut Stream<'_>) -> PResult<Bytes> {
             });
 
         Ok(b.freeze())
-    }).parse_next(i)
+    })
+    .parse_next(i)
 }
 
 /// ip address handler that only handles IP4
 pub fn ip_address<'a>(i: &mut Stream<'_>) -> PResult<Bytes> {
     trace("ip_address", move |input: &mut Stream<'_>| {
-        let p0 = digit1(input)?;
-        let p1 = preceded(literal("."), digit1).parse_next(input)?;
-        let p2 = preceded(literal("."), digit1).parse_next(input)?;
-        let p3 = preceded(literal("."), digit1).parse_next(input)?;
+        let p = seq!(
+            digit1,
+            preceded(literal("."), digit1),
+            preceded(literal("."), digit1),
+            preceded(literal("."), digit1),
+        )
+        .parse_next(input)?;
 
-        let b = [p0, p1, p2, p3]
+        let b = [p.0, p.1, p.2, p.3]
             .iter()
             .enumerate()
             .fold(BytesMut::new(), |mut acc, (c, p)| {
@@ -203,21 +216,29 @@ pub fn ip_address<'a>(i: &mut Stream<'_>) -> PResult<Bytes> {
             });
 
         Ok(b.freeze())
-    }).parse_next(i)
+    })
+    .parse_next(i)
 }
 
 /// thread id parser for 'Id: [\d+]'
 pub fn entry_user_thread_id<'a>(i: &mut Stream<'_>) -> PResult<u32> {
     trace("entry_user_thread_id", move |input: &mut Stream<'_>| {
-        let (_, _, id) = seq!((literal("Id:"), multispace1, digit1)).parse_next(input)?;
+        let id = seq!(
+            _: literal("Id:"),
+            _: multispace1,
+            digit1
+        )
+        .parse_next(input)?;
 
-        Ok(u32::from_str(str::from_utf8(id).unwrap()).unwrap())
-    }).parse_next(i)
+        Ok(u32::from_str(str::from_utf8(id.0).unwrap()).unwrap())
+    })
+    .parse_next(i)
 }
 
 pub fn user_name(i: &mut Stream) -> PResult<Bytes> {
     trace("user_name", move |input: &mut Stream<'_>| {
-        let parts: Vec<&[u8]> = repeat(1.., alt((alphanumeric1, literal("_")))).parse_next(input)?;
+        let parts: Vec<&[u8]> =
+            repeat(1.., alt((alphanumeric1, literal("_")))).parse_next(input)?;
 
         let b = parts.iter().fold(BytesMut::new(), |mut acc, p| {
             acc.put_slice(p);
@@ -225,42 +246,39 @@ pub fn user_name(i: &mut Stream) -> PResult<Bytes> {
         });
 
         Ok(b.freeze())
-    }).parse_next(i)
+    })
+    .parse_next(i)
 }
 
 /// user line parser
 pub fn entry_user(i: &mut Stream) -> PResult<SessionLine> {
     trace("entry_user", move |input: &mut Stream<'_>| {
-        let _ = multispace0(input)?;
-        let _ = literal("# User@Host:").parse_next(input)?;
-        let _ = multispace1(input)?;
-        let user = user_name(input)?;
-        let _ = literal("[").parse_next(input)?;
-        let sys_user= user_name(input)?;
-        let _ = literal("]").parse_next(input)?;
-        let _ = multispace1(input)?;
-        let _ = literal("@").parse_next(input)?;
-        let _ = multispace1(input)?;
-        let host = opt(host_name).parse_next(input)?;
-        let _ = multispace0(input)?;
-        let _ = literal("[").parse_next(input)?;
-        let _ = multispace0(input)?;
-        let ip_address = opt(ip_address).parse_next(input)?;
-        let _ = multispace0(input)?;
-        let _ = literal("]").parse_next(input)?;
-        let _ = multispace1(input)?;
-        let thread_id = entry_user_thread_id(input)?;
+        let s = seq! { SessionLine {
+            _: multispace0,
+            _: literal("# User@Host:"),
+            _: multispace1,
+            user: user_name,
+            _: literal("["),
+            sys_user: user_name,
+            _: literal("]"),
+            _: multispace1,
+            _: literal("@"),
+            _: multispace1,
+            host: opt(host_name),
+            _: multispace0,
+            _: literal("["),
+            _: multispace0,
+            ip_address: opt(ip_address),
+            _: multispace0,
+            _: literal("]"),
+            _: multispace1,
+            thread_id: entry_user_thread_id,
+        }}
+        .parse_next(input)?;
 
-        Ok(
-            SessionLine {
-                user,
-                sys_user,
-                host,
-                ip_address,
-                thread_id,
-            },
-        )
-    }).parse_next(i)
+        Ok(s)
+    })
+    .parse_next(i)
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -349,19 +367,24 @@ pub fn details_comment<'a>(i: &mut Stream) -> PResult<HashMap<Bytes, Bytes>> {
         }
 
         Ok(res.into_iter().map(|(k, v)| (k, v.freeze())).collect())
-    }).parse_next(i)
+    })
+    .parse_next(i)
 }
 
 pub fn details_tag<'a>(i: &mut Stream) -> PResult<Bytes> {
     trace("details_tag", move |input: &mut Stream<'_>| {
-        let _ = multispace0(input)?;
-        let name = user_name(input)?;
-        let _ = multispace0(input)?;
-        let _ = alt((literal(":"), literal("="))).parse_next(input)?;
-        let _ = multispace0(input)?;
+        let name = seq!(
+            _: multispace0,
+            user_name,
+            _: multispace0,
+            _: alt((literal(":"), literal("="))),
+            _: multispace0,
+        )
+        .parse_next(input)?;
 
-        Ok(name.into())
-    }).parse_next(i)
+        Ok(name.0.into())
+    })
+    .parse_next(i)
 }
 
 /// values parsed from stats entry line
@@ -392,33 +415,30 @@ impl StatsLine {
 /// parse '# Query_time:...' entry line
 pub fn parse_entry_stats(i: &mut Stream<'_>) -> PResult<StatsLine> {
     trace("parse_entry_stats", move |input: &mut Stream<'_>| {
-        let _ = literal("#").parse_next(input)?;
-        let _ = multispace1(input)?;
-        let _ = literal("Query_time:").parse_next(input)?;
-        let _ = multispace1(input)?;
-        let query_time = float(input)?;
-        let _ = multispace1(input)?;
-        let _ = literal("Lock_time:").parse_next(input)?;
-        let _ = multispace1(input)?;
-        let lock_time = float(input)?;
-        let _ = multispace1(input)?;
-        let _ = literal("Rows_sent:").parse_next(input)?;
-        let _ = multispace1(input)?;
-        let rows_sent = digit1(input)?;
-        let _ = multispace1(input)?;
-        let _ = literal("Rows_examined:").parse_next(input)?;
-        let _ = multispace1(input)?;
-        let rows_examined = digit1(input)?;
+        let stats = seq! {StatsLine {
+            _: literal("#"),
+            _: multispace1,
+            _: literal("Query_time:"),
+            _: multispace1,
+            query_time: float,
+            _: multispace1,
+            _: literal("Lock_time:"),
+            _: multispace1,
+            lock_time: float,
+            _: multispace1,
+            _: literal("Rows_sent:"),
+            _: multispace1,
+            rows_sent: digit1.map(|d| str::from_utf8(d).unwrap().parse().unwrap()),
+            _: multispace1,
+            _: literal("Rows_examined:"),
+            _: multispace1,
+            rows_examined: digit1.map(|d| str::from_utf8(d).unwrap().parse().unwrap()),
+        }}
+        .parse_next(input)?;
 
-        Ok(
-            StatsLine {
-                query_time,
-                lock_time,
-                rows_sent: u32::from_str(str::from_utf8(rows_sent).unwrap()).unwrap(),
-                rows_examined: u32::from_str(str::from_utf8(rows_examined).unwrap()).unwrap(),
-            },
-        )
-    }).parse_next(i)
+        Ok(stats)
+    })
+    .parse_next(i)
 }
 
 /// admin command values parsed from sql lines of an entry
@@ -430,45 +450,55 @@ pub struct EntryAdminCommand {
 /// parse "# administrator command: " entry line
 pub fn admin_command<'a>(i: &mut Stream) -> PResult<EntryAdminCommand> {
     trace("admin_command", move |input: &mut Stream<'_>| {
-        let _ = literal("# administrator command:").parse_next(input)?;
-        let _ = multispace1(input)?;
-        let command = alphanumerichyphen1(input)?;
-        let _ = literal(";").parse_next(input)?;
-
-        Ok(
-            EntryAdminCommand {
-                command: command.to_owned().into(),
-            },
+        let command = seq!(
+            _: literal("# administrator command:"),
+            _: multispace1,
+            alphanumerichyphen1,
+            _: literal(";"),
         )
-    }).parse_next(i)
+        .parse_next(input)?;
+
+        Ok(EntryAdminCommand {
+            command: command.0.to_owned().into(),
+        })
+    })
+    .parse_next(i)
 }
 
 /// parses 'USE database=\w+;' command which shows up at the start of some entry sql
 pub fn use_database(i: &mut Stream) -> PResult<Bytes> {
     trace("use_database", move |input: &mut Stream<'_>| {
-        let _ = literal(Caseless("USE")).parse_next(input)?;
-        let _ = multispace1(input)?;
-        let db_name = user_name(input)?;
-        let _ = multispace0(input)?;
-        let _ = literal(";").parse_next(input)?;
+        let db_name = seq!(
+            _: literal(Caseless("USE")),
+            _: multispace1,
+            user_name,
+            _: multispace0,
+            _: literal(";"),
+        )
+        .parse_next(input)?;
 
-        Ok(db_name.into())
-    }).parse_next(i)
+        Ok(db_name.0.into())
+    })
+    .parse_next(i)
 }
 
 /// parses 'SET timestamp=\d{10};' command which starts
 pub fn start_timestamp_command(i: &mut Stream) -> PResult<u32> {
     trace("start_timestamp_command", move |input: &mut Stream<'_>| {
-        let _ = literal("SET timestamp").parse_next(input)?;
-        let _ = multispace0(input)?;
-        let _ = literal("=").parse_next(input)?;
-        let _ = multispace0(input)?;
-        let time = digit1(input)?;
-        let _ = multispace0(input)?;
-        let _ = literal(";").parse_next(input)?;
+        let time = seq!(
+            _: literal("SET timestamp"),
+            _: multispace0,
+            _: literal("="),
+            _: multispace0,
+            digit1,
+            _: multispace0,
+            _: literal(";"),
+        )
+        .parse_next(input)?;
 
-        Ok(u32::from_str(str::from_utf8(time).unwrap()).unwrap())
-    }).parse_next(i)
+        Ok(u32::from_str(str::from_utf8(time.0).unwrap()).unwrap())
+    })
+    .parse_next(i)
 }
 
 /// Parses one or more sql statements using `sqlparser::parse_statements`. This uses the
@@ -531,9 +561,9 @@ mod tests {
     };
     use crate::EntryMasking;
     use bytes::Bytes;
-    use winnow_iso8601::{Date, DateTime, Time};
     use std::assert_eq;
     use std::collections::HashMap;
+    use winnow_iso8601::{Date, DateTime, Time};
 
     #[test]
     fn parses_time_line() {
@@ -552,7 +582,7 @@ mod tests {
                 millisecond: 0,
                 tz_offset_hours: 2,
                 tz_offset_minutes: 0,
-            }
+            },
         };
 
         let mut s = Stream::new(i.as_bytes());
@@ -568,7 +598,10 @@ mod tests {
         let mut s = Stream::new(i.as_bytes());
 
         let res = use_database(&mut s).unwrap();
-        assert_eq!((s, res), (Stream::new("".as_bytes()), "mysql".trim().into()));
+        assert_eq!(
+            (s, res),
+            (Stream::new("".as_bytes()), "mysql".trim().into())
+        );
     }
 
     #[test]
@@ -588,10 +621,7 @@ mod tests {
         let mut s = Stream::new(i.as_bytes());
         let res = host_name(&mut s).unwrap();
 
-        assert_eq!(
-            res,
-            Bytes::from("local.tests.rs".trim())
-        );
+        assert_eq!(res, Bytes::from("local.tests.rs".trim()));
     }
 
     #[test]
@@ -689,7 +719,6 @@ mod tests {
         //TODO: Stream ToString and ToStr
         assert_eq!((s, res), expected);
 
-
         let mut s = Stream::new(s1.as_bytes());
         let res = details_comment(&mut s).unwrap();
         assert_eq!((s, res), expected);
@@ -737,7 +766,7 @@ mod tests {
     #[test]
     fn parses_start_timestamp() {
         let l = "SET timestamp=1517798807;";
-        let mut s =Stream::new(l.as_bytes());
+        let mut s = Stream::new(l.as_bytes());
         let res = start_timestamp_command(&mut s).unwrap();
 
         let expected = (Stream::new("".as_bytes()), 1517798807);
@@ -770,12 +799,10 @@ mod tests {
            WHERE a > b AND b < 100 \
            ORDER BY a DESC, b;";
 
-        let mut s= Stream::new(sql.as_bytes());
+        let mut s = Stream::new(sql.as_bytes());
         let res = sql_lines(&mut s).unwrap();
 
-        assert_eq!(
-            res, sql
-        );
+        assert_eq!(res, sql);
     }
 
     #[test]
@@ -810,7 +837,7 @@ AS film_info
 FROM sakila.actor a;
 ";
 
-        let mut s =Stream::new(sql.as_bytes());
+        let mut s = Stream::new(sql.as_bytes());
         let res = sql_lines(&mut s).unwrap();
 
         assert_eq!((s, res), (Stream::new("\n".as_bytes()), sql.trim().into()));
