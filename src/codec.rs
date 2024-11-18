@@ -1,39 +1,48 @@
-use std::default::Default;
-use std::fmt::{Display, Formatter};
-use std::ops::{AddAssign};
-use thiserror::Error;
-use time::format_description::well_known::Iso8601;
-use tokio_util::codec::Decoder;
-use winnow::Parser;
 use crate::codec::EntryError::MissingField;
-use crate::parser::{admin_command, details_comment, entry_user, log_header, parse_entry_stats, parse_entry_time, parse_sql, sql_lines, start_timestamp_command, use_database, HeaderLines, Stream};
+use crate::parser::{
+    admin_command, details_comment, entry_user, log_header, parse_entry_stats, parse_entry_time,
+    parse_sql, sql_lines, start_timestamp_command, use_database, HeaderLines, Stream,
+};
 use crate::types::EntryStatement::SqlStatement;
 use crate::types::{Entry, EntryCall, EntrySqlAttributes, EntrySqlStatement, EntryStatement};
 use crate::{CodecConfig, SessionLine, SqlStatementContext, StatsLine};
 use bytes::{Bytes, BytesMut};
-use winnow_iso8601::DateTime;
 use log::debug;
+use std::default::Default;
+use std::fmt::{Display, Formatter};
+use std::ops::AddAssign;
+use thiserror::Error;
+use time::format_description::well_known::Iso8601;
 use time::OffsetDateTime;
 use tokio::io;
+use tokio_util::codec::Decoder;
 use winnow::ascii::multispace0;
 use winnow::combinator::opt;
-use winnow::error::{ErrMode};
-use winnow::PResult;
-use winnow::stream::{AsBytes};
+use winnow::error::ErrMode;
+use winnow::stream::AsBytes;
 use winnow::stream::Stream as _;
+use winnow::PResult;
+use winnow::Parser;
+use winnow_iso8601::DateTime;
 
+/// Error when building an entry
 #[derive(Error, Debug)]
 pub enum EntryError {
-    #[error("entry is missing: {0}")]
+    /// a field is missing from the entry
+    #[error("entry field is missing: {0}")]
     MissingField(String),
+    /// an entry contains a duplicate id
     #[error("duplicate id: {0}")]
     DuplicateId(String),
 }
 
+/// Errors for problems when reading frames from the source
 #[derive(Debug, Error)]
 pub enum CodecError {
+    /// a problem from the IO layer below caused the error
     #[error("file read error: {0}")]
-    IO(#[from] tokio::io::Error),
+    IO(#[from] io::Error),
+    /// a new entry started before the previous one was completed
     #[error("found start of new entry before entry completed at line: {0}")]
     IncompleteEntry(EntryError),
 }
@@ -113,6 +122,7 @@ impl EntryContext {
     }
 }
 
+/// struct holding contextual information used while decoding
 #[derive(Debug, Default)]
 pub struct EntryCodec {
     processed: usize,
@@ -121,12 +131,14 @@ pub struct EntryCodec {
 }
 
 impl EntryCodec {
+    /// create a new `EntryCodec` with the specified configuration
     pub fn new(c: CodecConfig) -> Self {
         Self {
             config: c,
             ..Default::default()
         }
     }
+    /// calls the appropriate parser based on the current state held in the Codec context
     fn parse_next<'b>(&mut self, i: &mut Stream<'b>) -> PResult<Option<Entry>> {
         let entry = match self.context.expects {
             CodecExpect::Header => {
@@ -248,6 +260,7 @@ impl Decoder for EntryCodec {
     type Item = Entry;
     type Error = CodecError;
 
+    /// calls `parse_next` and manages state changes and buffer fill
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         // Check that the length is not too large to avoid a denial of
         // service attack where the server runs out of memory.
@@ -256,19 +269,17 @@ impl Decoder for EntryCodec {
         //        std::io::ErrorKind::InvalidData,
         //        format!("Frame of length {} is too large.", length)
         //    ).into());
-       // }
-       // let mut i = Stream::new(src.deref());
-       let b = &src.split()[..];
+        // }
+        // let mut i = Stream::new(src.deref());
+        let b = &src.split()[..];
         let mut i = Stream::new(&b);
 
         let mut start = i.checkpoint();
 
         loop {
-
             if i.len() == 0 {
                 return Ok(None);
             };
-
 
             match self.parse_next(&mut i) {
                 Ok(e) => {
@@ -310,6 +321,9 @@ impl Decoder for EntryCodec {
         }
     }
 
+    /// decodes end of file and ensures that there are no unprocessed bytes on the stream.
+    ///
+    /// and `io::Error` of type io::ErrorKind::Other is thrown in the case of remaining data.
     fn decode_eof(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         match self.decode(buf)? {
             Some(frame) => Ok(Some(frame)),
@@ -422,7 +436,7 @@ SET timestamp=1517798807;
         let expected_entry = Entry {
             call: EntryCall::new(
                 OffsetDateTime::parse(time, &Iso8601::DEFAULT).unwrap(),
-                OffsetDateTime::from_unix_timestamp(1517798807 as i64).unwrap(),
+                OffsetDateTime::from_unix_timestamp(1517798807).unwrap(),
                 0.000352,
                 0.0,
             ),
@@ -552,7 +566,7 @@ GROUP BY film2.film_id, category.name;
 
     #[tokio::test]
     async fn parse_log_file() {
-        let f = File::open("data/slow-test-queries.log").await.unwrap();
+        let f = File::open("assets/slow-test-queries.log").await.unwrap();
         let mut ff = Framed::new(f, EntryCodec::default());
 
         let mut i = 0;
@@ -567,7 +581,7 @@ GROUP BY film2.film_id, category.name;
 
     #[tokio::test]
     async fn parse_mysql8_log_file() {
-        let f = File::open("data/lobsters8-mysql-slow.log").await.unwrap();
+        let f = File::open("assets/lobsters8-mysql-slow.log").await.unwrap();
         let mut ff = Framed::new(f, EntryCodec::default());
 
         let mut i = 0;
