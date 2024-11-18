@@ -563,7 +563,7 @@ mod tests {
     use bytes::Bytes;
     use std::assert_eq;
     use std::collections::HashMap;
-    use winnow_iso8601::{Date, DateTime, Time};
+    use winnow_iso8601::{Date, DateTime, Time, Timezone};
 
     #[test]
     fn parses_time_line() {
@@ -580,8 +580,10 @@ mod tests {
                 minute: 43,
                 second: 23,
                 millisecond: 0,
-                tz_offset_hours: 2,
-                tz_offset_minutes: 0,
+                timezone: Timezone {
+                    offset_hours: 2,
+                    offset_minutes: 0,
+                }
             },
         };
 
