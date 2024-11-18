@@ -10,7 +10,7 @@ async fn main() {
     let start = Instant::now();
 
     let fr = FramedRead::with_capacity(
-        File::open("/home/soulstompp/dev/mysql8-stresser/data/mysql-slow-lobsters-normal.log")
+        File::open("")
             .await
             .unwrap(),
         EntryCodec::default(),

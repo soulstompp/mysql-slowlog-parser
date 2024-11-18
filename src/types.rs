@@ -7,12 +7,16 @@ use std::fmt::{Display, Formatter};
 use std::ops::ControlFlow;
 use time::{Duration, OffsetDateTime};
 
-/// a struct representing the values parsed from the log entry
+/// a struct representing a single log entry
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
+    /// holds information about the call made to mysqld
     pub call: EntryCall,
+    /// holds information about the connection that made the call
     pub session: EntrySession,
+    /// stats about how long it took for the query to run
     pub stats: EntryStats,
+    /// information obtained while parsing the SQL query
     pub sql_attributes: EntrySqlAttributes,
 }
 
@@ -22,10 +26,9 @@ impl Entry {
         self.call.log_time
     }
 
-    pub fn query_start_time(&self) -> OffsetDateTime {
-        self.call.start_time()
-    }
-
+    /// returns the time the query started
+    pub fn query_start_time(&self) -> OffsetDateTime { self.call.start_time() }
+    /// returns the time the query started
     pub fn query_lock_end_time(&self) -> OffsetDateTime {
         self.call.lock_end_time()
     }
@@ -106,7 +109,9 @@ impl Entry {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+///
 pub struct EntrySqlStatement {
+    /// Holds the Statement
     pub statement: Statement,
     pub context: Option<SqlStatementContext>,
 }
@@ -188,9 +193,12 @@ impl From<Statement> for EntrySqlStatement {
     }
 }
 
+/// Database objects called from within a query
 #[derive(Clone, Debug, Ord, PartialOrd, PartialEq, Eq)]
 pub struct EntrySqlStatementObject {
+    /// optional schema name
     pub schema_name: Option<Bytes>,
+    /// object name (i.e. table name)
     pub object_name: Bytes,
 }
 
@@ -219,6 +227,7 @@ impl EntrySqlStatementObject {
         self.object_name.clone()
     }
 
+    /// full object name \[schema.\]object in Bytes
     pub fn full_object_name_bytes(&self) -> Bytes {
         let mut s = if let Some(n) = self.schema_name.clone() {
             let mut s = BytesMut::from(n.as_ref());
@@ -232,6 +241,7 @@ impl EntrySqlStatementObject {
         s.freeze()
     }
 
+    /// full object name \[schema.\]object as a CoW
     pub fn full_object_name(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(self.full_object_name_bytes().as_ref())
             .to_string()
@@ -245,12 +255,16 @@ impl EntrySqlStatementObject {
 /// * InvalidStatement: statement which isn't currently parseable as plain-text
 #[derive(Clone, Debug, PartialEq)]
 pub enum EntryStatement {
+    /// AdminCommand: commands passed from the mysql cli/admin tools
     AdminCommand(EntryAdminCommand),
+    /// SqlStatement: parseable statement with a proper SQL AST
     SqlStatement(EntrySqlStatement),
+    /// InvalidStatement: statement which isn't currently parseable by `sql-parser` crate
     InvalidStatement(String),
 }
 
 impl EntryStatement {
+    /// returns the `EntrySqlStatement` objects associated with this statement, if known
     pub fn objects(&self) -> Option<Vec<EntrySqlStatementObject>> {
         match self {
             Self::SqlStatement(s) => Some(s.objects().clone()),
@@ -258,6 +272,7 @@ impl EntryStatement {
         }
     }
 
+    /// returns the `EntrySqlType` associated with this statement if known
     pub fn sql_type(&self) -> Option<EntrySqlType> {
         match self {
             Self::SqlStatement(s) => Some(s.sql_type().clone()),
@@ -265,6 +280,7 @@ impl EntryStatement {
         }
     }
 
+    /// returns the `SqlStatementContext` associated with this statement
     pub fn sql_context(&self) -> Option<SqlStatementContext> {
         match self {
             Self::SqlStatement(s) => s.sql_context().clone(),
@@ -277,7 +293,7 @@ impl EntryStatement {
 ///
 /// NOTE: this is a MySQL specific sub-set of the entries in `sql_parser::ast::Statement`. This is
 /// a simpler enum to match against and displays as the start of the SQL command.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum EntrySqlType {
     /// SELECT
     Query,
@@ -389,12 +405,18 @@ impl Display for EntrySqlType {
     }
 }
 
+/// struct containing information about the connection where the query originated
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntrySession {
+    /// user name of the connected user who ran the query
     pub user_name: Bytes,
+    /// system user name of the connected user who ran the query
     pub sys_user_name: Bytes,
+    /// hostname of the connected user who ran the query
     pub host_name: Option<Bytes>,
+    /// ip address of the connected user who ran the query
     pub ip_address: Option<Bytes>,
+    /// the thread id that the session was conntected on
     pub thread_id: u32,
 }
 
@@ -465,9 +487,12 @@ impl EntrySession {
     }
 }
 
+/// struct with information about the Entry's SQL query
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntrySqlAttributes {
+    /// the sql for this entry, possibly with values replaced by parameters
     pub sql: Bytes,
+    /// the `EntryStatement for this entry
     pub statement: EntryStatement,
 }
 
@@ -492,20 +517,29 @@ impl EntrySqlAttributes {
         self.statement.objects()
     }
 
+    /// returns the entry's `EntryStatement`
     pub fn statement(&self) -> &EntryStatement {
         &self.statement
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+/// struct containing details of how long the query took
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EntryCall {
+    /// time recorded for the log entry
     pub log_time: OffsetDateTime,
+    /// effective time of NOW() during the query run
     pub set_timestamp: OffsetDateTime,
+    /// what time the query started
     pub start_time: OffsetDateTime,
+    //TODO: missing end_time
+    //TODO: missing lock_start_time
+    /// what time locks were released
     pub lock_end_time: OffsetDateTime,
 }
 
 impl EntryCall {
+    /// create a new instance of EntryCall
     pub fn new(
         log_time: OffsetDateTime,
         set_timestamp: OffsetDateTime,
@@ -532,20 +566,27 @@ impl EntryCall {
         self.set_timestamp
     }
 
+    /// what time the query started
     pub fn start_time(&self) -> OffsetDateTime {
         self.start_time
     }
 
+    /// what time locks were let go of
     pub fn lock_end_time(&self) -> OffsetDateTime {
         self.lock_end_time
     }
 }
 
-#[derive(Clone, Debug, PartialEq, PartialOrd)]
+/// struct with stats on how long a query took and number of rows examined
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub struct EntryStats {
+    /// how long the query took
     pub query_time: f64,
+    /// how long the query held locks
     pub lock_time: f64,
+    /// how many rows were returned to the client
     pub rows_sent: u32,
+    /// how many rows were scanned to find result
     pub rows_examined: u32,
 }
 
@@ -582,11 +623,16 @@ impl From<StatsLine> for EntryStats {
     }
 }
 
+/// Values parsed from a query comment, these values are currently overly-specific
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntryContext {
+    /// optional request id, such as an SSRID
     pub request_id: Option<Bytes>,
+    /// optional caller
     pub caller: Option<Bytes>,
+    /// optional function/method
     pub function: Option<Bytes>,
+    /// optional line number
     pub line: Option<u32>,
 }
 

@@ -25,20 +25,24 @@ use winnow_iso8601::DateTime;
 
 pub type Stream<'i> = Partial<&'i [u8]>;
 
+/// A struct holding a `DateTime` parsed from the Time: line of the entry
+/// ex: `# Time: 2018-02-05T02:46:43.015898Z`
+#[derive(Clone, Copy)]
 pub struct TimeLine {
     time: DateTime,
 }
 
 impl TimeLine {
+    /// returns a clone of the DateTime parsed from the Time: line
     pub fn time(&self) -> DateTime {
         self.time.clone()
     }
 }
 
-// "# Time: 2015-06-26T16:43:23+0200";
-/// parses "# Time: ...." entry line
-pub fn parse_entry_time(i: &mut Stream<'_>) -> PResult<DateTime> {
-    trace("parse_entry_time", move |input: &mut Stream<'_>| {
+/// parses "# Time: .... entry line and returns a `DateTime`
+// # Time: 2015-06-26T16:43:23+0200";
+pub fn parse_entry_time(i: &mut Stream) -> PResult<DateTime> {
+    trace("parse_entry_time", move |input: &mut Stream| {
         let dt = seq!(
             _: literal("# Time:"),
             _: multispace1,
@@ -51,7 +55,8 @@ pub fn parse_entry_time(i: &mut Stream<'_>) -> PResult<DateTime> {
     .parse_next(i)
 }
 
-/// values from the user entry line
+/// values from the User: entry line
+/// ex. # User@Host: msandbox[msandbox] @ localhost []  Id:     3
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionLine {
     pub(crate) user: Bytes,
@@ -62,22 +67,27 @@ pub struct SessionLine {
 }
 
 impl SessionLine {
+    /// returns user as`Bytes`
     pub fn user(&self) -> Bytes {
         self.user.clone()
     }
 
+    /// returns sys_user as`Bytes`
     pub fn sys_user(&self) -> Bytes {
         self.sys_user.clone()
     }
 
+    /// returns possible host as`Option<Bytes>`
     pub fn host(&self) -> Option<Bytes> {
         self.host.clone()
     }
 
+    /// returns possible ip_address as `Option<Bytes>`
     pub fn ip_address(&self) -> Option<Bytes> {
         self.ip_address.clone()
     }
 
+    /// returns thread_id as `Bytes`
     pub fn thread_id(&self) -> u32 {
         self.thread_id
     }
@@ -281,15 +291,21 @@ pub fn entry_user(i: &mut Stream) -> PResult<SessionLine> {
     .parse_next(i)
 }
 
+/// Struct containing information parsed from the initial comment in a SQL query
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SqlStatementContext {
+    /// example field, should just be part of a HashMap
     pub request_id: Option<Bytes>,
+    /// example field, should just be part of a HashMap
     pub caller: Option<Bytes>,
+    /// example field, should just be part of a HashMap
     pub function: Option<Bytes>,
+    /// example field, should just be part of a HashMap
     pub line: Option<u32>,
 }
 
 impl SqlStatementContext {
+    /// example method, should be replaced by generic key lookup
     pub fn request_id(&self) -> Option<Cow<str>> {
         if let Some(i) = &self.request_id {
             Some(String::from_utf8_lossy(i.as_ref()))
@@ -298,6 +314,7 @@ impl SqlStatementContext {
         }
     }
 
+    /// example method, should be replaced by generic key lookup
     pub fn caller(&self) -> Option<Cow<str>> {
         if let Some(c) = &self.caller {
             Some(String::from_utf8_lossy(c.as_ref()))
@@ -306,6 +323,7 @@ impl SqlStatementContext {
         }
     }
 
+    /// example method, should be replaced by generic key lookup
     pub fn function(&self) -> Option<Cow<str>> {
         if let Some(f) = &self.function {
             Some(String::from_utf8_lossy(f.as_ref()))
@@ -314,6 +332,7 @@ impl SqlStatementContext {
         }
     }
 
+    /// example method, should be replaced by generic key lookup
     pub fn line(&self) -> Option<u32> {
         self.line
     }
@@ -388,25 +407,33 @@ pub fn details_tag<'a>(i: &mut Stream) -> PResult<Bytes> {
 }
 
 /// values parsed from stats entry line
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StatsLine {
+    /// how long the overall query took
     pub(crate) query_time: f64,
+    /// how long the query held locks
     pub(crate) lock_time: f64,
+    /// how many rows were sent
     pub(crate) rows_sent: u32,
+    /// how many rows were scanned
     pub(crate) rows_examined: u32,
 }
 
 impl StatsLine {
+    /// how long the overall query took
     pub fn query_time(&self) -> f64 {
         self.query_time.clone()
     }
+    /// how long the query held locks
     pub fn lock_time(&self) -> f64 {
         self.lock_time.clone()
     }
 
+    /// how many rows were sent
     pub fn rows_sent(&self) -> u32 {
         self.rows_sent.clone()
     }
+    /// how many rows were scanned
     pub fn rows_examined(&self) -> u32 {
         self.rows_examined.clone()
     }
@@ -444,6 +471,7 @@ pub fn parse_entry_stats(i: &mut Stream<'_>) -> PResult<StatsLine> {
 /// admin command values parsed from sql lines of an entry
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntryAdminCommand {
+    /// the admin command sent
     pub command: Bytes,
 }
 

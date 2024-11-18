@@ -1,0 +1,123 @@
+/home/karl/mysql/my-5.7/bin/mysqld, Version: 5.7.20-log (MySQL Community Server (GPL)). started with:
+Tcp port: 12345  Unix socket: /tmp/12345/mysql_sandbox12345.sock
+Time                 Id Command    Argument
+# Time: 2018-02-05T02:46:43.015898Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:     3
+# Query_time: 0.000016  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1517798803;
+# administrator command: Ping;
+# Time: 2018-02-05T02:46:43.015994Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:     3
+# Query_time: 0.000014  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1517798803;
+# administrator command: Quit;
+# Time: 2018-02-05T02:46:43.025041Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:     4
+# Query_time: 0.000162  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 0
+SET timestamp=1517798803;
+select @@version_comment limit 1;
+# Time: 2018-02-05T02:46:43.025552Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:     4
+# Query_time: 0.000323  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1517798803;
+SHOW /*!40100 ENGINE*/ INNODB STATUS;
+# Time: 2018-02-05T02:46:43.025966Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:     4
+# Query_time: 0.000025  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1517798803;
+# administrator command: Quit;
+# Time: 2018-02-05T02:46:43.034549Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:     5
+# Query_time: 0.000052  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 0
+SET timestamp=1517798803;
+select @@version_comment limit 1;
+# Time: 2018-02-05T02:46:43.034661Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:     5
+# Query_time: 0.000038  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 0
+SET timestamp=1517798803;
+SELECT DATABASE();
+# Time: 2018-02-05T02:46:43.034711Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:     5
+# Query_time: 0.000035  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 0
+use mysql;
+SET timestamp=1517798803;
+# administrator command: Init DB;
+# Time: 2018-02-05T02:46:43.034819Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:     5
+# Query_time: 0.000035  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1517798803;
+/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;
+# Time: 2018-02-05T02:46:43.034850Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:     5
+# Query_time: 0.000017  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1517798803;
+/*!40101 SET @OLD_CHARACTER_SET_RESULTS=@@CHARACTER_SET_RESULTS */;
+# Time: 2018-02-05T02:46:43.034874Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:     5
+# Query_time: 0.000014  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1517798803;
+/*!40101 SET @OLD_COLLATION_CONNECTION=@@COLLATION_CONNECTION */;
+# Time: 2018-02-05T02:46:43.034900Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:     5
+# Query_time: 0.000017  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1517798803;
+/*!40101 SET NAMES utf8 */;
+# Time: 2018-02-05T02:46:43.034923Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:     5
+# Query_time: 0.000014  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1517798803;
+/*!40103 SET @OLD_TIME_ZONE=@@TIME_ZONE */;
+# Time: 2018-02-05T02:46:43.034955Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:     5
+# Query_time: 0.000023  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1517798803;
+/*!40103 SET TIME_ZONE='+00:00' */;
+# Time: 2018-02-05T02:46:43.034984Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:     5
+# Query_time: 0.000019  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1517798803;
+/*!40014 SET @OLD_UNIQUE_CHECKS=@@UNIQUE_CHECKS, UNIQUE_CHECKS=0 */;
+# Time: 2018-02-05T02:46:43.035008Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:     5
+# Query_time: 0.000015  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1517798803;
+/*!40014 SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0 */;
+# Time: 2018-02-05T02:46:43.035038Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:     5
+# Query_time: 0.000021  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1517798803;
+/*!40101 SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO' */;
+# Time: 2018-02-05T02:46:43.035066Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:     5
+# Query_time: 0.000015  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1517798803;
+/*!40111 SET @OLD_SQL_NOTES=@@SQL_NOTES, SQL_NOTES=0 */;
+# Time: 2018-02-05T02:46:43.035218Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:     5
+# Query_time: 0.000143  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1517798803;
+DROP TABLE IF EXISTS `columns_priv`;
+# Time: 2018-02-05T02:46:43.035248Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:     5
+# Query_time: 0.000018  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1517798803;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+# Time: 2018-02-05T02:46:43.035276Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:     5
+# Query_time: 0.000019  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1517798803;
+/*!40101 SET character_set_client = utf8 */;
+# Time: 2018-02-05T02:46:43.035578Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:     5
+# Query_time: 0.000236  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1517798803;
+CREATE TABLE `columns_priv` (
+  `Host` char(60) COLLATE utf8_bin NOT NULL DEFAULT '',
+  `Db` char(64) COLLATE utf8_bin NOT NULL DEFAULT '',
+  `User` char(32) COLLATE utf8_bin NOT NULL DEFAULT '',
+  `Table_name` char(64) COLLATE utf8_bin NOT NULL DEFAULT '',
+  `Column_name` char(64) COLLATE utf8_bin NOT NULL DEFAULT '',
+  `Timestamp` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  `Column_priv` set('Select','Insert','Update','References') CHARACTER SET utf8 NOT NULL DEFAULT '',
+  PRIMARY KEY (`Host`,`Db`,`User`,`Table_name`,`Column_name`)
+) ENGINE=MyISAM DEFAULT CHARSET=utf8 COLLATE=utf8_bin COMMENT='Column privileges';
