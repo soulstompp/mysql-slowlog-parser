@@ -580,9 +580,9 @@ GROUP BY film2.film_id, category.name;
     }
 
     #[tokio::test]
-    async fn parse_mysql8_log_file() {
-        let f = File::open("assets/lobsters8-mysql-slow.log").await.unwrap();
-        let mut ff = Framed::new(f, EntryCodec::default());
+    async fn parse_mysql_log_file_small_capacity() {
+        let f = File::open("assets/slow-test-queries.log").await.unwrap();
+        let mut ff = Framed::with_capacity(f, EntryCodec::default(), 4);
 
         let mut i = 0;
 
@@ -591,6 +591,6 @@ GROUP BY film2.film_id, category.name;
             i.add_assign(1);
         }
 
-        assert_eq!(i, 104160);
+        assert_eq!(i, 310);
     }
 }
