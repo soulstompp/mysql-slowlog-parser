@@ -179,6 +179,9 @@ impl EntrySqlStatement {
             Statement::ExplainTable { .. } => EntrySqlType::ExplainTable,
             Statement::Explain { .. } => EntrySqlType::Explain,
             Statement::Savepoint { .. } => EntrySqlType::Savepoint,
+            Statement::LockTables { .. } => EntrySqlType::LockTables,
+            Statement::UnlockTables { .. } => EntrySqlType::LockTables,
+            Statement::Flush { .. } => EntrySqlType::Flush,
             _ => panic!("sql types for MySQL should be exhaustive"),
         }
     }
@@ -361,6 +364,12 @@ pub enum EntrySqlType {
     Explain,
     /// SAVEPOINT
     Savepoint,
+    /// LOCK TABLES
+    LockTables,
+    /// UNLOCK TABLES
+    UnlockTables,
+    /// FLUSH
+    Flush,
 }
 
 impl Display for EntrySqlType {
@@ -399,6 +408,9 @@ impl Display for EntrySqlType {
             Self::ExplainTable => "EXPLAIN TABLE",
             Self::Explain => "EXPLAIN",
             Self::Savepoint => "SAVEPOINT",
+            Self::LockTables => "LOCK TABLES",
+            Self::UnlockTables => "UNLOCK TABLES",
+            Self::Flush => "FLUSH",
         };
 
         write!(f, "{}", out)

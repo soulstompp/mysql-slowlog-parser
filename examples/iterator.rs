@@ -1,30 +1,34 @@
 use futures::StreamExt;
 use mysql_slowlog_parser::{CodecError, Entry, EntryCodec};
-use std::ops::AddAssign;
-use std::time::Instant;
 use tokio::fs::File;
 use tokio_util::codec::FramedRead;
 
 #[tokio::main]
 async fn main() {
-    let start = Instant::now();
-
     let fr = FramedRead::with_capacity(
-        File::open("")
+        File::open("assets/slow-test-queries.log")
             .await
             .unwrap(),
         EntryCodec::default(),
         400000,
     );
 
-    let mut i = 0;
-
     let future = fr.for_each(|re: Result<Entry, CodecError>| async move {
-        let _ = re.unwrap();
+        let entry = re.unwrap();
 
-        i.add_assign(1);
+        let sql_type = entry.sql_attributes.sql_type();
+        
+        if sql_type.is_none() {
+            return;
+        }
+        
+        let sql_type = match entry.sql_attributes.sql_type() {
+            Some(sql_type) => sql_type.to_string(),
+            None => String::from("NULL"),
+        };
+        
+        println!("{}: {}", entry.query_start_time(), sql_type);
     });
 
     future.await;
-    println!("parsed {} entries in: {}", i, start.elapsed().as_secs_f64());
 }
