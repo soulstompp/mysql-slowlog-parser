@@ -25,6 +25,8 @@ use winnow::PResult;
 use winnow::Parser;
 use winnow_iso8601::DateTime;
 
+const LENGTH_MAX: usize = 10000000000;
+
 /// Error when building an entry
 #[derive(Error, Debug)]
 pub enum EntryError {
@@ -262,15 +264,25 @@ impl Decoder for EntryCodec {
 
     /// calls `parse_next` and manages state changes and buffer fill
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if src.len() < 4 {
+            // Not enough data to read length marker.
+            return Ok(None);
+        }
+
+        // Read length marker.
+        let mut length_bytes = [0u8; 4];
+        length_bytes.copy_from_slice(&src[..4]);
+        let length = u32::from_le_bytes(length_bytes) as usize;
+
         // Check that the length is not too large to avoid a denial of
         // service attack where the server runs out of memory.
-        //if length > LENGTH_MAX {
-        //    return Err(std::io::Error::new(
-        //        std::io::ErrorKind::InvalidData,
-        //        format!("Frame of length {} is too large.", length)
-        //    ).into());
-        // }
-        // let mut i = Stream::new(src.deref());
+        if length > LENGTH_MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Frame of length {} is too large.", length)
+            ).into());
+         }
+
         let b = &src.split()[..];
         let mut i = Stream::new(&b);
 
