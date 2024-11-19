@@ -611,7 +611,7 @@ mod tests {
                 timezone: Timezone {
                     offset_hours: 2,
                     offset_minutes: 0,
-                }
+                },
             },
         };
 

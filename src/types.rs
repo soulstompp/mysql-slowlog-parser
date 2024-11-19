@@ -27,7 +27,9 @@ impl Entry {
     }
 
     /// returns the time the query started
-    pub fn query_start_time(&self) -> OffsetDateTime { self.call.start_time() }
+    pub fn query_start_time(&self) -> OffsetDateTime {
+        self.call.start_time()
+    }
     /// returns the time the query started
     pub fn query_lock_end_time(&self) -> OffsetDateTime {
         self.call.lock_end_time()
