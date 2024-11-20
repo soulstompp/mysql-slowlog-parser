@@ -1,30 +1,34 @@
+use std::collections::HashMap;
 use futures::StreamExt;
-use mysql_slowlog_parser::{CodecError, Entry, EntryCodec};
-use std::ops::AddAssign;
-use std::time::Instant;
+use mysql_slowlog_parser::{EntryCodec, EntrySqlType};
 use tokio::fs::File;
 use tokio_util::codec::FramedRead;
 
 #[tokio::main]
 async fn main() {
-    let start = Instant::now();
-
-    let fr = FramedRead::with_capacity(
-        File::open("")
-            .await
-            .unwrap(),
+    let fr = FramedRead::new(
+        File::open("assets/slow-test-queries.log").await.unwrap(),
         EntryCodec::default(),
-        400000,
     );
 
-    let mut i = 0;
+    let future = fr.fold(HashMap::new(), |mut acc, re| async move {
+        let entry = re.unwrap();
 
-    let future = fr.for_each(|re: Result<Entry, CodecError>| async move {
-        let _ = re.unwrap();
-
-        i.add_assign(1);
+        match entry.sql_attributes.sql_type() {
+            Some(st) => {
+                acc.insert(st, acc.get(&st).unwrap_or(&0) + 1);
+            },
+            None => {
+               acc.insert(EntrySqlType::Unknown,acc.get(&EntrySqlType::Unknown).unwrap_or(&0) + 1);
+            }
+        }
+        
+        acc
     });
 
-    future.await;
-    println!("parsed {} entries in: {}", i, start.elapsed().as_secs_f64());
+    let type_counts = future.await;
+    
+    for (k, v) in type_counts {
+        println!("{}: {}", k, v);
+    }
 }

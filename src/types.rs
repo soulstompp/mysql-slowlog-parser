@@ -27,7 +27,9 @@ impl Entry {
     }
 
     /// returns the time the query started
-    pub fn query_start_time(&self) -> OffsetDateTime { self.call.start_time() }
+    pub fn query_start_time(&self) -> OffsetDateTime {
+        self.call.start_time()
+    }
     /// returns the time the query started
     pub fn query_lock_end_time(&self) -> OffsetDateTime {
         self.call.lock_end_time()
@@ -179,7 +181,10 @@ impl EntrySqlStatement {
             Statement::ExplainTable { .. } => EntrySqlType::ExplainTable,
             Statement::Explain { .. } => EntrySqlType::Explain,
             Statement::Savepoint { .. } => EntrySqlType::Savepoint,
-            _ => panic!("sql types for MySQL should be exhaustive"),
+            Statement::LockTables { .. } => EntrySqlType::LockTables,
+            Statement::UnlockTables { .. } => EntrySqlType::LockTables,
+            Statement::Flush { .. } => EntrySqlType::Flush,
+            _ => EntrySqlType::Unknown,
         }
     }
 }
@@ -293,7 +298,7 @@ impl EntryStatement {
 ///
 /// NOTE: this is a MySQL specific sub-set of the entries in `sql_parser::ast::Statement`. This is
 /// a simpler enum to match against and displays as the start of the SQL command.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub enum EntrySqlType {
     /// SELECT
     Query,
@@ -361,6 +366,14 @@ pub enum EntrySqlType {
     Explain,
     /// SAVEPOINT
     Savepoint,
+    /// LOCK TABLES
+    LockTables,
+    /// UNLOCK TABLES
+    UnlockTables,
+    /// FLUSH
+    Flush,
+    /// Unable to identy if the type of statement
+    Unknown,
 }
 
 impl Display for EntrySqlType {
@@ -399,6 +412,10 @@ impl Display for EntrySqlType {
             Self::ExplainTable => "EXPLAIN TABLE",
             Self::Explain => "EXPLAIN",
             Self::Savepoint => "SAVEPOINT",
+            Self::LockTables => "LOCK TABLES",
+            Self::UnlockTables => "UNLOCK TABLES",
+            Self::Flush => "FLUSH",
+            Self::Unknown => "NULL",
         };
 
         write!(f, "{}", out)

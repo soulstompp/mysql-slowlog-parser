@@ -279,9 +279,10 @@ impl Decoder for EntryCodec {
         if length > LENGTH_MAX {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Frame of length {} is too large.", length)
-            ).into());
-         }
+                format!("Frame of length {} is too large.", length),
+            )
+            .into());
+        }
 
         let b = &src.split()[..];
         let mut i = Stream::new(&b);
