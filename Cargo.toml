@@ -1,8 +1,12 @@
 [package]
 name = "mysql-slowlog-parser"
 version = "0.1.0"
+description = "Streaming parser for MySQL slowlogs"
 edition = "2021"
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/soulstompp/mysql-slowlog-parser"
+documentation = "https://docs.rs/mysql-slowlog-parser/"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
