@@ -184,7 +184,7 @@ impl EntrySqlStatement {
             Statement::LockTables { .. } => EntrySqlType::LockTables,
             Statement::UnlockTables { .. } => EntrySqlType::LockTables,
             Statement::Flush { .. } => EntrySqlType::Flush,
-            _ => panic!("sql types for MySQL should be exhaustive"),
+            _ => EntrySqlType::Unknown,
         }
     }
 }
@@ -298,7 +298,7 @@ impl EntryStatement {
 ///
 /// NOTE: this is a MySQL specific sub-set of the entries in `sql_parser::ast::Statement`. This is
 /// a simpler enum to match against and displays as the start of the SQL command.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub enum EntrySqlType {
     /// SELECT
     Query,
@@ -372,6 +372,8 @@ pub enum EntrySqlType {
     UnlockTables,
     /// FLUSH
     Flush,
+    /// Unable to identy if the type of statement
+    Unknown,
 }
 
 impl Display for EntrySqlType {
@@ -413,6 +415,7 @@ impl Display for EntrySqlType {
             Self::LockTables => "LOCK TABLES",
             Self::UnlockTables => "UNLOCK TABLES",
             Self::Flush => "FLUSH",
+            Self::Unknown => "NULL",
         };
 
         write!(f, "{}", out)
