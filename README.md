@@ -1,23 +1,34 @@
 # mysql-slowlog-parser - streaming slow query log parser
 
 [![crates.io](https://img.shields.io/crates/v/mysql-slowlog-parser?style=flat-square)](https://crates.io/crates/mysql-slowlog-parser)
-[![docs.rs docs](https://img.shields.io/badge/docs-latest-blue.svg?style=flat-square)](https://docs.rs/winnow-iso8601)
+[![docs.rs docs](https://img.shields.io/badge/docs-latest-blue.svg?style=flat-square)](https://docs.rs/mysql-slowlog-parser)
 
 ## About
 
-While certainly not the first slowlog parser written, this one attempts to extract a great deal more information than
-its predecessors. The parsers extract nearly all the information about each line in an
-`Entry` and with plans to extract eventually collect anything missed along the way.
+This library parsers [MySQL slow query logs](https://dev.mysql.com/doc/refman/8.0/en/slow-query-log.html). While
+certainly not the first slowlog parser written, this one attempts to extract a great deal more information than its
+predecessors. The parsers extract nearly all the information about each line in an `Entry` with plans to extract any
+remaining values in the near future.
 
 The query found within an entry is also parsed to extract query meta-information about the query (such as which tables
 and databases are accessed), what type of query and masking of parameters, primarily to normalize repeated calls of the
 same query.
 
 Since it is a fairly common practice to include important information in the comment of a query. So, each of
-these comments are parsed to find key-value pairs and include as a Hashmap.
+these comments are parsed to find key-value pairs and include values you can map to specific context about the software
+that ran the query.
 
-This library is able to read from streams of slow logs from a variety of sources and can handle large logs without
-memory issues.
+This library is able to read streaming data from the slow logs from a variety of sources and can handle large logs
+without memory issues.
+
+### Limitations
+* Currently, does not parse slow query logs generated when logged with the
+[log-slow-extra](https://dev.mysql.com/doc/refman/8.4/en/server-system-variables.html#sysvar_log_slow_extra) set. This
+contains additional fields that aren't accounted for in the current parser and will likely cause parsing errors.
+* Comment values that can't be mapped to one of the predetermined keys are lost, this can eventually be saved in a
+different Hashmap to ensure this information is never lost.
+* Masked values are lost when masking parsed queries. The masked values are lost when the query is parsed. These should
+be saved in a `Vec<Bytes>` to ensure the values are accessible.
 
 ### Usage
 The parser is built as a [tokio codec](https://docs.rs/tokio-util/latest/tokio_util/codec/index.html) and so can accept
@@ -43,7 +54,7 @@ anything that [FramedRead]() supports.
 
 ### Entries
 The parsers or codec will return an Entry struct for each object found which contains the following information.
-The struct offers several methods to get to this information.
+Most of the following information below can be accessed via functions on this struct.
 
 #### Call Information
 Information about the start and end time of the query run including the time period it held locks `EntryCall`
@@ -64,11 +75,11 @@ stored in `EntrySqlAttributes` are lost. This problem will be fixed in an upcomi
 * An AST of the query if it was parseable by [sql parser](https://crates.io/crates/sqlparser).
 * Objects referred to in a parseable query.
 * Database schema referred to in a parseable query.
-* Key/value pairs from the comment of the query
+* Mapped key-value pairs from the comment of the query.
 
 ### Additional Information
-In order to understand the data streaming back to you, see [Entry][] which holds information returned from individual
-[parsers][`crate::parsers`] in the [docs][docs]
+In order to understand the data streaming back to you, see docs for the `Entry` struct, which holds information returned from individual
+ in the [docs][docs]
 
 # License
 

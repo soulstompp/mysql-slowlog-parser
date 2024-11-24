@@ -105,16 +105,15 @@ impl Default for EntryMasking {
 }
 
 /// Struct to pass along configuration values to codec
-#[derive(Default)]
-pub struct CodecConfig {
+#[derive(Copy, Clone, Default)]
+pub struct EntryCodecConfig {
     /// type of masking to use when parsing SQL
     pub masking: EntryMasking,
     /// mapping function in order to find specific key entries
-    pub map_comment_context:
-        Option<Box<dyn Fn(HashMap<Bytes, Bytes>) -> Option<SqlStatementContext>>>,
+    pub map_comment_context: Option<fn(HashMap<Bytes, Bytes>) -> Option<SqlStatementContext>>,
 }
 
-impl Debug for CodecConfig {
+impl Debug for EntryCodecConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.masking)?;
         write!(f, "map_comment_context: fn")

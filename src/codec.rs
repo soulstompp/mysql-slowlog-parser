@@ -5,15 +5,13 @@ use crate::parser::{
 };
 use crate::types::EntryStatement::SqlStatement;
 use crate::types::{Entry, EntryCall, EntrySqlAttributes, EntrySqlStatement, EntryStatement};
-use crate::{CodecConfig, SessionLine, SqlStatementContext, StatsLine};
+use crate::{EntryCodecConfig, SessionLine, SqlStatementContext, StatsLine};
 use bytes::{Bytes, BytesMut};
 use log::debug;
 use std::default::Default;
 use std::fmt::{Display, Formatter};
 use std::ops::AddAssign;
 use thiserror::Error;
-use time::format_description::well_known::Iso8601;
-use time::OffsetDateTime;
 use tokio::io;
 use tokio_util::codec::Decoder;
 use winnow::ascii::multispace0;
@@ -103,12 +101,7 @@ impl EntryContext {
             .ok_or(MissingField("set timestamp".into()))?;
         let attributes = self.attributes.clone().ok_or(MissingField("sql".into()))?;
         let e = Entry {
-            call: EntryCall::new(
-                OffsetDateTime::parse(&time.to_string(), &Iso8601::DEFAULT).unwrap(),
-                OffsetDateTime::from_unix_timestamp(set_timestamp as i64).unwrap(),
-                stats.query_time,
-                stats.lock_time,
-            ),
+            call: EntryCall::new(time, set_timestamp),
             session: session.into(),
             stats: stats.into(),
             sql_attributes: attributes,
@@ -129,12 +122,12 @@ impl EntryContext {
 pub struct EntryCodec {
     processed: usize,
     context: EntryContext,
-    config: CodecConfig,
+    config: EntryCodecConfig,
 }
 
 impl EntryCodec {
     /// create a new `EntryCodec` with the specified configuration
-    pub fn new(c: CodecConfig) -> Self {
+    pub fn new(c: EntryCodecConfig) -> Self {
         Self {
             config: c,
             ..Default::default()
@@ -210,6 +203,7 @@ impl EntryCodec {
                         if s.len() == 1 {
                             let context: Option<SqlStatementContext> = if let Some(d) = details {
                                 if let Some(f) = &self.config.map_comment_context {
+                                    //TODO: map these keys
                                     f(d)
                                 } else {
                                     None
@@ -366,16 +360,16 @@ mod tests {
         Entry, EntryCall, EntrySession, EntrySqlAttributes, EntrySqlStatement,
         EntrySqlStatementObject, EntryStatement, EntryStats,
     };
-    use crate::{CodecConfig, EntryMasking, SqlStatementContext};
+    use crate::{EntryCodecConfig, EntryMasking, SqlStatementContext};
     use bytes::{Bytes, BytesMut};
     use futures::StreamExt;
     use std::default::Default;
     use std::io::Cursor;
     use std::ops::AddAssign;
-    use time::format_description::well_known::Iso8601;
-    use time::OffsetDateTime;
+    use std::str::FromStr;
     use tokio::fs::File;
     use tokio_util::codec::Framed;
+    use winnow_iso8601::DateTime;
 
     #[tokio::test]
     async fn parses_select_entry() {
@@ -387,7 +381,6 @@ mod tests {
          film_category.film_id = film.film_id GROUP BY film.film_id, category.name;";
         //NOTE: decimal places were shortened by parser, so this time is shortened
         let time = "2018-02-05T02:46:47.273Z";
-        let set_timestamp = 1517798807;
 
         let entry = format!(
             "# Time: {}
@@ -403,9 +396,9 @@ SET timestamp=1517798807;
 
         let mut eb = entry.as_bytes().to_vec();
 
-        let config = CodecConfig {
+        let config = EntryCodecConfig {
             masking: Default::default(),
-            map_comment_context: Some(Box::new(|d| {
+            map_comment_context: Some(|d| {
                 let acc = SqlStatementContext {
                     request_id: d
                         .get(&*BytesMut::from("request_id"))
@@ -426,7 +419,7 @@ SET timestamp=1517798807;
                 } else {
                     Some(acc)
                 }
-            })),
+            }),
         };
 
         let mut ff = Framed::new(Cursor::new(&mut eb), EntryCodec::new(config));
@@ -448,10 +441,9 @@ SET timestamp=1517798807;
 
         let expected_entry = Entry {
             call: EntryCall::new(
-                OffsetDateTime::parse(time, &Iso8601::DEFAULT).unwrap(),
-                OffsetDateTime::from_unix_timestamp(1517798807).unwrap(),
-                0.000352,
-                0.0,
+                //TODO: handle error
+                DateTime::from_str(time).unwrap(),
+                1517798807,
             ),
             session: EntrySession {
                 user_name: Bytes::from("msandbox"),
@@ -473,8 +465,6 @@ SET timestamp=1517798807;
         };
 
         assert_eq!(e, expected_entry);
-
-        assert_eq!(e.query_start_time().unix_timestamp(), set_timestamp);
     }
 
     #[tokio::test]

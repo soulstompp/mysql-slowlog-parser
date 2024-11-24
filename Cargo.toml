@@ -1,6 +1,6 @@
 [package]
 name = "mysql-slowlog-parser"
-version = "0.1.0"
+version = "0.2.0"
 description = "Streaming parser for MySQL slowlogs"
 edition = "2021"
 license = "MIT"
@@ -15,13 +15,16 @@ bytes = "1.4.0"
 env_logger = "0.11.5"
 futures = "0.3.26"
 winnow = {  version = "0.6.20", features = ["default"] }
-winnow_iso8601 = {  version = "0.2.0"}
+winnow_iso8601 = {  version = "0.2.0", features = ["default"]}
 sqlparser = {version = "0.52.0", features = ["visitor"]}
 thiserror = "2.0.3"
 log = "0.4.17"
 time = {version = "0.3.36", features=["parsing"]}
 tokio = {version = "1.25.0", features = ["bytes", "fs", "io-std", "io-util", "rt", "rt-multi-thread", "macros"]}
 tokio-util = {version = "0.7.1", features = ["codec"]}
+
+[features]
+chrono = ["winnow_iso8601/chrono"]
 
 [[example]]
 name = "iterator"

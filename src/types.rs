@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
 use std::ops::ControlFlow;
-use time::{Duration, OffsetDateTime};
+use winnow_iso8601::DateTime;
 
 /// a struct representing a single log entry
 #[derive(Clone, Debug, PartialEq)]
@@ -22,17 +22,8 @@ pub struct Entry {
 
 impl Entry {
     /// returns the time the entry was recorded
-    pub fn log_time(&self) -> OffsetDateTime {
+    pub fn log_time(&self) -> DateTime {
         self.call.log_time
-    }
-
-    /// returns the time the query started
-    pub fn query_start_time(&self) -> OffsetDateTime {
-        self.call.start_time()
-    }
-    /// returns the time the query started
-    pub fn query_lock_end_time(&self) -> OffsetDateTime {
-        self.call.lock_end_time()
     }
 
     /// returns the mysql user name that requested the command
@@ -544,53 +535,28 @@ impl EntrySqlAttributes {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EntryCall {
     /// time recorded for the log entry
-    pub log_time: OffsetDateTime,
+    pub log_time: DateTime,
     /// effective time of NOW() during the query run
-    pub set_timestamp: OffsetDateTime,
-    /// what time the query started
-    pub start_time: OffsetDateTime,
-    //TODO: missing end_time
-    //TODO: missing lock_start_time
-    /// what time locks were released
-    pub lock_end_time: OffsetDateTime,
+    pub set_timestamp: u32,
 }
 
 impl EntryCall {
     /// create a new instance of EntryCall
-    pub fn new(
-        log_time: OffsetDateTime,
-        set_timestamp: OffsetDateTime,
-        query_time: f64,
-        lock_time: f64,
-    ) -> Self {
+    pub fn new(log_time: DateTime, set_timestamp: u32) -> Self {
         Self {
             log_time,
             set_timestamp,
-            start_time: log_time
-                - Duration::microseconds(((lock_time + query_time) * 1_000_000.0).round() as i64),
-            lock_end_time: log_time
-                - Duration::microseconds((query_time * 1_000_000.0).round() as i64),
         }
     }
 
-    /// returns the entry time as an `time::OffsetDateTime`
-    pub fn log_time(&self) -> OffsetDateTime {
+    /// returns the entry time as an `DateTime`
+    pub fn log_time(&self) -> DateTime {
         self.log_time
     }
 
     /// returns the time stamp set at the beginning of each entry
-    pub fn set_timestamp(&self) -> OffsetDateTime {
+    pub fn set_timestamp(&self) -> u32 {
         self.set_timestamp
-    }
-
-    /// what time the query started
-    pub fn start_time(&self) -> OffsetDateTime {
-        self.start_time
-    }
-
-    /// what time locks were let go of
-    pub fn lock_end_time(&self) -> OffsetDateTime {
-        self.lock_end_time
     }
 }
 
