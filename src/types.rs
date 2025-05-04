@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
 use std::ops::ControlFlow;
-use winnow_iso8601::DateTime;
+use winnow_datetime::DateTime;
 
 /// a struct representing a single log entry
 #[derive(Clone, Debug, PartialEq)]

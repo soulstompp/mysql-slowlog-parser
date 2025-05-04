@@ -31,8 +31,8 @@ different Hashmap to ensure this information is never lost.
 be saved in a `Vec<Bytes>` to ensure the values are accessible.
 
 ### Usage
-The parser is built as a [tokio codec](https://docs.rs/tokio-util/latest/tokio_util/codec/index.html) and so can accept
-anything that [FramedRead]() supports.
+#### Parsing
+The parser is built as a [tokio codec](https://docs.rs/tokio-util/latest/tokio_util/codec/index.html) and so can accept anything that [FramedRead]() supports.
 
 ```rust, ignore
     let fr = FramedRead::with_capacity(
@@ -51,6 +51,10 @@ anything that [FramedRead]() supports.
 
     future.await;
 ```
+
+#### Handling Dates
+As of 0.3.0, the parsers return the AST objects from ['winnow-datetime'](https://crates.io/crates/winnow_datetime), for
+information on how to convert dates to your preferred date library see the documentation for that library.
 
 ### Entries
 The parsers or codec will return an Entry struct for each object found which contains the following information.
@@ -72,7 +76,7 @@ information about a query:
 
 * The query, with values (depending on settings). At the moment, the values that are masked aren't properly
 stored in `EntrySqlAttributes` are lost. This problem will be fixed in an upcoming release.
-* An AST of the query if it was parseable by [sql parser](https://crates.io/crates/sqlparser).
+* An AST of the query if it was parseable by [sqlparser](https://crates.io/crates/sqlparser).
 * Objects referred to in a parseable query.
 * Database schema referred to in a parseable query.
 * Mapped key-value pairs from the comment of the query.

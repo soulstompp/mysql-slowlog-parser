@@ -1,6 +1,6 @@
 [package]
 name = "mysql-slowlog-parser"
-version = "0.2.0"
+version = "0.3.0"
 description = "Streaming parser for MySQL slowlogs"
 edition = "2021"
 license = "MIT"
@@ -14,8 +14,9 @@ documentation = "https://docs.rs/mysql-slowlog-parser/"
 bytes = "1.4.0"
 env_logger = "0.11.5"
 futures = "0.3.26"
-winnow = {  version = "0.6.20", features = ["default"] }
-winnow_iso8601 = {  version = "0.2.0", features = ["default"]}
+winnow = {  version = "0.7.9", features = ["default"] }
+winnow_iso8601 = {  version = "0.5.0", features = ["default"]}
+winnow_datetime = { version = "0.2.0" }
 sqlparser = {version = "0.52.0", features = ["visitor"]}
 thiserror = "2.0.3"
 log = "0.4.17"
