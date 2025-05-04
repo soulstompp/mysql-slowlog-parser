@@ -19,9 +19,9 @@ use winnow::combinator::opt;
 use winnow::error::ErrMode;
 use winnow::stream::AsBytes;
 use winnow::stream::Stream as _;
-use winnow::PResult;
+use winnow::ModalResult;
 use winnow::Parser;
-use winnow_iso8601::DateTime;
+use winnow_datetime::DateTime;
 
 const LENGTH_MAX: usize = 10000000000;
 
@@ -134,7 +134,7 @@ impl EntryCodec {
         }
     }
     /// calls the appropriate parser based on the current state held in the Codec context
-    fn parse_next<'b>(&mut self, i: &mut Stream<'b>) -> PResult<Option<Entry>> {
+    fn parse_next<'b>(&mut self, i: &mut Stream<'b>) -> ModalResult<Option<Entry>> {
         let entry = match self.context.expects {
             CodecExpect::Header => {
                 let _ = multispace0(i)?;
@@ -366,10 +366,11 @@ mod tests {
     use std::default::Default;
     use std::io::Cursor;
     use std::ops::AddAssign;
-    use std::str::FromStr;
+
     use tokio::fs::File;
     use tokio_util::codec::Framed;
-    use winnow_iso8601::DateTime;
+    use winnow::error::InputError;
+    use winnow_iso8601::datetime::datetime;
 
     #[tokio::test]
     async fn parses_select_entry() {
@@ -380,7 +381,7 @@ mod tests {
          film_category ON category.category_id = film_category.category_id LEFT JOIN film ON \
          film_category.film_id = film.film_id GROUP BY film.film_id, category.name;";
         //NOTE: decimal places were shortened by parser, so this time is shortened
-        let time = "2018-02-05T02:46:47.273Z";
+        let mut time = "2018-02-05T02:46:47.273Z";
 
         let entry = format!(
             "# Time: {}
@@ -442,7 +443,7 @@ SET timestamp=1517798807;
         let expected_entry = Entry {
             call: EntryCall::new(
                 //TODO: handle error
-                DateTime::from_str(time).unwrap(),
+                datetime::<_, InputError<_>>(&mut time).unwrap(),
                 1517798807,
             ),
             session: EntrySession {

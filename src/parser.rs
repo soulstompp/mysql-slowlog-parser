@@ -19,9 +19,9 @@ use winnow::combinator::{not, opt};
 use winnow::combinator::{preceded, terminated};
 use winnow::error::{ContextError, ErrMode, InputError};
 use winnow::token::{any, literal, take, take_till, take_until};
-use winnow::{seq, PResult, Parser, Partial};
-use winnow_iso8601::parsers::parse_datetime;
-use winnow_iso8601::DateTime;
+use winnow::{seq, ModalResult, Parser, Partial};
+use winnow_datetime::DateTime;
+use winnow_iso8601::datetime::datetime;
 
 pub type Stream<'i> = Partial<&'i [u8]>;
 
@@ -41,12 +41,12 @@ impl TimeLine {
 
 /// parses "# Time: .... entry line and returns a `DateTime`
 // # Time: 2015-06-26T16:43:23+0200";
-pub fn parse_entry_time(i: &mut Stream) -> PResult<DateTime> {
+pub fn parse_entry_time(i: &mut Stream) -> ModalResult<DateTime> {
     trace("parse_entry_time", move |input: &mut Stream| {
         let dt = seq!(
             _: literal("# Time:"),
             _: multispace1,
-            parse_datetime,
+            datetime,
         )
         .parse_next(input)?;
 
@@ -56,7 +56,7 @@ pub fn parse_entry_time(i: &mut Stream) -> PResult<DateTime> {
 }
 
 /// values from the User: entry line
-/// ex. # User@Host: msandbox[msandbox] @ localhost []  Id:     3
+/// ex. # User@Host: msandbox\[msandbox\] @ localhost []  Id:     3
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionLine {
     pub(crate) user: Bytes,
@@ -100,7 +100,7 @@ pub struct HeaderLines {
     socket: Option<Bytes>,
 }
 
-pub fn log_header<'a>(i: &mut Stream<'_>) -> PResult<HeaderLines> {
+pub fn log_header<'a>(i: &mut Stream<'_>) -> ModalResult<HeaderLines> {
     trace("log_header", move |input: &mut Stream<'_>| {
         // check for the '#' since the last parser in the set is greedy
         let head = seq!{
@@ -128,7 +128,7 @@ pub fn log_header<'a>(i: &mut Stream<'_>) -> PResult<HeaderLines> {
     }).parse_next(i)
 }
 
-pub fn sql_lines<'a>(i: &mut Stream<'_>) -> PResult<Bytes> {
+pub fn sql_lines<'a>(i: &mut Stream<'_>) -> ModalResult<Bytes> {
     trace("sql_lines", move |input: &mut Stream<'_>| {
         let mut acc = BytesMut::new();
 
@@ -166,11 +166,11 @@ pub fn sql_lines<'a>(i: &mut Stream<'_>) -> PResult<Bytes> {
     .parse_next(i)
 }
 
-pub fn alphanumerichyphen1<'a>(i: &mut Stream<'a>) -> PResult<&'a [u8]> {
+pub fn alphanumerichyphen1<'a>(i: &mut Stream<'a>) -> ModalResult<&'a [u8]> {
     alt((alphanumeric1, literal("_"), literal("-"))).parse_next(i)
 }
 
-pub fn host_name<'a>(i: &mut Stream<'_>) -> PResult<Bytes> {
+pub fn host_name<'a>(i: &mut Stream<'_>) -> ModalResult<Bytes> {
     trace("host_name", move |input: &mut Stream<'_>| {
         let (mut first, second): (Vec<&[u8]>, &[u8]) = alt((
             ((
@@ -203,7 +203,7 @@ pub fn host_name<'a>(i: &mut Stream<'_>) -> PResult<Bytes> {
 }
 
 /// ip address handler that only handles IP4
-pub fn ip_address<'a>(i: &mut Stream<'_>) -> PResult<Bytes> {
+pub fn ip_address<'a>(i: &mut Stream<'_>) -> ModalResult<Bytes> {
     trace("ip_address", move |input: &mut Stream<'_>| {
         let p = seq!(
             digit1,
@@ -231,7 +231,7 @@ pub fn ip_address<'a>(i: &mut Stream<'_>) -> PResult<Bytes> {
 }
 
 /// thread id parser for 'Id: [\d+]'
-pub fn entry_user_thread_id<'a>(i: &mut Stream<'_>) -> PResult<u32> {
+pub fn entry_user_thread_id<'a>(i: &mut Stream<'_>) -> ModalResult<u32> {
     trace("entry_user_thread_id", move |input: &mut Stream<'_>| {
         let id = seq!(
             _: literal("Id:"),
@@ -245,7 +245,7 @@ pub fn entry_user_thread_id<'a>(i: &mut Stream<'_>) -> PResult<u32> {
     .parse_next(i)
 }
 
-pub fn user_name(i: &mut Stream) -> PResult<Bytes> {
+pub fn user_name(i: &mut Stream) -> ModalResult<Bytes> {
     trace("user_name", move |input: &mut Stream<'_>| {
         let parts: Vec<&[u8]> =
             repeat(1.., alt((alphanumeric1, literal("_")))).parse_next(input)?;
@@ -261,7 +261,7 @@ pub fn user_name(i: &mut Stream) -> PResult<Bytes> {
 }
 
 /// user line parser
-pub fn entry_user(i: &mut Stream) -> PResult<SessionLine> {
+pub fn entry_user(i: &mut Stream) -> ModalResult<SessionLine> {
     trace("entry_user", move |input: &mut Stream<'_>| {
         let s = seq! { SessionLine {
             _: multispace0,
@@ -338,7 +338,7 @@ impl SqlStatementContext {
     }
 }
 
-pub fn details_comment<'a>(i: &mut Stream) -> PResult<HashMap<Bytes, Bytes>> {
+pub fn details_comment<'a>(i: &mut Stream) -> ModalResult<HashMap<Bytes, Bytes>> {
     trace("details_comment", move |input: &mut Stream<'_>| {
         let mut name: Option<Bytes> = None;
 
@@ -390,7 +390,7 @@ pub fn details_comment<'a>(i: &mut Stream) -> PResult<HashMap<Bytes, Bytes>> {
     .parse_next(i)
 }
 
-pub fn details_tag<'a>(i: &mut Stream) -> PResult<Bytes> {
+pub fn details_tag<'a>(i: &mut Stream) -> ModalResult<Bytes> {
     trace("details_tag", move |input: &mut Stream<'_>| {
         let name = seq!(
             _: multispace0,
@@ -440,7 +440,7 @@ impl StatsLine {
 }
 
 /// parse '# Query_time:...' entry line
-pub fn parse_entry_stats(i: &mut Stream<'_>) -> PResult<StatsLine> {
+pub fn parse_entry_stats(i: &mut Stream<'_>) -> ModalResult<StatsLine> {
     trace("parse_entry_stats", move |input: &mut Stream<'_>| {
         let stats = seq! {StatsLine {
             _: literal("#"),
@@ -476,7 +476,7 @@ pub struct EntryAdminCommand {
 }
 
 /// parse "# administrator command: " entry line
-pub fn admin_command<'a>(i: &mut Stream) -> PResult<EntryAdminCommand> {
+pub fn admin_command<'a>(i: &mut Stream) -> ModalResult<EntryAdminCommand> {
     trace("admin_command", move |input: &mut Stream<'_>| {
         let command = seq!(
             _: literal("# administrator command:"),
@@ -494,7 +494,7 @@ pub fn admin_command<'a>(i: &mut Stream) -> PResult<EntryAdminCommand> {
 }
 
 /// parses 'USE database=\w+;' command which shows up at the start of some entry sql
-pub fn use_database(i: &mut Stream) -> PResult<Bytes> {
+pub fn use_database(i: &mut Stream) -> ModalResult<Bytes> {
     trace("use_database", move |input: &mut Stream<'_>| {
         let db_name = seq!(
             _: literal(Caseless("USE")),
@@ -511,7 +511,7 @@ pub fn use_database(i: &mut Stream) -> PResult<Bytes> {
 }
 
 /// parses 'SET timestamp=\d{10};' command which starts
-pub fn start_timestamp_command(i: &mut Stream) -> PResult<u32> {
+pub fn start_timestamp_command(i: &mut Stream) -> ModalResult<u32> {
     trace("start_timestamp_command", move |input: &mut Stream<'_>| {
         let time = seq!(
             _: literal("SET timestamp"),
@@ -591,7 +591,7 @@ mod tests {
     use bytes::Bytes;
     use std::assert_eq;
     use std::collections::HashMap;
-    use winnow_iso8601::{Date, DateTime, Time, Timezone};
+    use winnow_datetime::{Date, DateTime, Offset, Time};
 
     #[test]
     fn parses_time_line() {
@@ -608,10 +608,10 @@ mod tests {
                 minute: 43,
                 second: 23,
                 millisecond: 0,
-                timezone: Timezone {
+                offset: Some(Offset {
                     offset_hours: 2,
                     offset_minutes: 0,
-                },
+                }),
             },
         };
 
