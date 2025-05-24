@@ -1,6 +1,6 @@
 use crate::{EntryAdminCommand, SessionLine, SqlStatementContext, StatsLine};
 use bytes::{BufMut, Bytes, BytesMut};
-use sqlparser::ast::{visit_relations, Statement};
+use sqlparser::ast::{Statement, visit_relations};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
@@ -117,18 +117,18 @@ impl EntrySqlStatement {
     pub fn objects(&self) -> Vec<EntrySqlStatementObject> {
         let mut visited = BTreeSet::new();
 
-        visit_relations(&self.statement, |relation| {
+        let _ = visit_relations(&self.statement, |relation| {
             let ident = &relation.0;
 
             let _ = visited.insert(if ident.len() == 2 {
                 EntrySqlStatementObject {
-                    schema_name: Some(ident[0].value.to_owned().into()),
-                    object_name: ident[1].value.to_owned().into(),
+                    schema_name: Some(Bytes::from(ident[0].to_string())),
+                    object_name: Bytes::from(ident[1].to_string()),
                 }
             } else {
                 EntrySqlStatementObject {
                     schema_name: None,
-                    object_name: ident.last().unwrap().value.to_owned().into(),
+                    object_name: ident.last().unwrap().to_string().to_owned().into(),
                 }
             });
 
@@ -150,9 +150,7 @@ impl EntrySqlStatement {
             Statement::AlterIndex { .. } => EntrySqlType::AlterIndex,
             Statement::Drop { .. } => EntrySqlType::Drop,
             Statement::DropFunction { .. } => EntrySqlType::DropFunction,
-            Statement::SetVariable { .. } => EntrySqlType::SetVariable,
-            Statement::SetNames { .. } => EntrySqlType::SetNames,
-            Statement::SetNamesDefault { .. } => EntrySqlType::SetNamesDefault,
+            Statement::Set { .. } => EntrySqlType::Set,
             Statement::ShowVariable { .. } => EntrySqlType::ShowVariable,
             Statement::ShowVariables { .. } => EntrySqlType::ShowVariables,
             Statement::ShowCreate { .. } => EntrySqlType::ShowCreate,
@@ -161,7 +159,6 @@ impl EntrySqlStatement {
             Statement::ShowCollation { .. } => EntrySqlType::ShowCollation,
             Statement::Use { .. } => EntrySqlType::Use,
             Statement::StartTransaction { .. } => EntrySqlType::StartTransaction,
-            Statement::SetTransaction { .. } => EntrySqlType::SetTransaction,
             Statement::Commit { .. } => EntrySqlType::Commit,
             Statement::Rollback { .. } => EntrySqlType::Rollback,
             Statement::CreateSchema { .. } => EntrySqlType::CreateSchema,
@@ -313,12 +310,8 @@ pub enum EntrySqlType {
     Drop,
     /// DROP FUNCTION
     DropFunction,
-    /// SET VARIABLE
-    SetVariable,
-    /// SET NAMES
-    SetNames,
-    /// SET NAMES DEFAULT
-    SetNamesDefault,
+    /// SET
+    Set,
     /// SHOW VARIABLE
     ShowVariable,
     /// SHOW VARIABLES
@@ -381,9 +374,7 @@ impl Display for EntrySqlType {
             Self::AlterIndex => "ALTER INDEX",
             Self::Drop => "DROP TABLE",
             Self::DropFunction => "DROP FUNCTION",
-            Self::SetVariable => "SET VARIABLE",
-            Self::SetNames => "SET NAMES",
-            Self::SetNamesDefault => "SET NAMES DEFAULT",
+            Self::Set => "SET",
             Self::ShowVariable => "SHOW VARIABLE",
             Self::ShowVariables => "SHOW VARIABLES",
             Self::ShowCreate => "SHOW CREATE TABLE",

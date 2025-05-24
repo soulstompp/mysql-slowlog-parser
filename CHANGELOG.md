@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0 - 2025-05-24
+* upgrade to rust edition 2024
+* fixed a warning introduced in previous release
+* Update EntrySqlType to match new sqlparser AST
+* upgrade bytes to 1.10.0
+* upgrade futures to 0.3.31
+* upgrade winnow to 0.7.10
+* upgrade winnow_datetime to 0.2.3
+* upgrade sqlparser to 0.56.0
+* upgrade thiserror to 2.0.12
+* upgrade log to 0.4.27
+* upgrade tokio to 1.45.1
+* upgrade tokio-util to 0.7.15
+
 ## 0.3.1 - 2025-05-13
 * Upgrade of winnow-datetime crates, since older version had a bug
 * Removed unused dependencies

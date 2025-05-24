@@ -1,7 +1,7 @@
 use crate::codec::EntryError::MissingField;
 use crate::parser::{
-    admin_command, details_comment, entry_user, log_header, parse_entry_stats, parse_entry_time,
-    parse_sql, sql_lines, start_timestamp_command, use_database, HeaderLines, Stream,
+    HeaderLines, Stream, admin_command, details_comment, entry_user, log_header, parse_entry_stats,
+    parse_entry_time, parse_sql, sql_lines, start_timestamp_command, use_database,
 };
 use crate::types::EntryStatement::SqlStatement;
 use crate::types::{Entry, EntryCall, EntrySqlAttributes, EntrySqlStatement, EntryStatement};
@@ -14,13 +14,13 @@ use std::ops::AddAssign;
 use thiserror::Error;
 use tokio::io;
 use tokio_util::codec::Decoder;
+use winnow::ModalResult;
+use winnow::Parser;
 use winnow::ascii::multispace0;
 use winnow::combinator::opt;
 use winnow::error::ErrMode;
 use winnow::stream::AsBytes;
 use winnow::stream::Stream as _;
-use winnow::ModalResult;
-use winnow::Parser;
 use winnow_datetime::DateTime;
 
 const LENGTH_MAX: usize = 10000000000;
