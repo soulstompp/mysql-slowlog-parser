@@ -10,8 +10,8 @@ use std::ops::Not;
 use std::str;
 use std::str::FromStr;
 use winnow::ascii::{
-    alpha1, alphanumeric1, digit1, float, line_ending, multispace0, multispace1, till_line_ending,
-    Caseless,
+    Caseless, alpha1, alphanumeric1, digit1, float, line_ending, multispace0, multispace1,
+    till_line_ending,
 };
 use winnow::combinator::repeat;
 use winnow::combinator::{alt, trace};
@@ -19,7 +19,7 @@ use winnow::combinator::{not, opt};
 use winnow::combinator::{preceded, terminated};
 use winnow::error::{ContextError, ErrMode, InputError};
 use winnow::token::{any, literal, take, take_till, take_until};
-use winnow::{seq, ModalResult, Parser, Partial};
+use winnow::{ModalResult, Parser, Partial, seq};
 use winnow_datetime::DateTime;
 use winnow_iso8601::datetime::datetime;
 
@@ -582,12 +582,12 @@ pub fn mask_tokens(tokens: Vec<Token>, mask: &EntryMasking) -> Vec<Token> {
 
 #[cfg(test)]
 mod tests {
-    use crate::parser::{
-        admin_command, details_comment, entry_user, host_name, ip_address, log_header,
-        parse_entry_stats, parse_entry_time, parse_sql, sql_lines, start_timestamp_command,
-        use_database, EntryAdminCommand, HeaderLines, SessionLine, StatsLine, Stream,
-    };
     use crate::EntryMasking;
+    use crate::parser::{
+        EntryAdminCommand, HeaderLines, SessionLine, StatsLine, Stream, admin_command,
+        details_comment, entry_user, host_name, ip_address, log_header, parse_entry_stats,
+        parse_entry_time, parse_sql, sql_lines, start_timestamp_command, use_database,
+    };
     use bytes::Bytes;
     use std::assert_eq;
     use std::collections::HashMap;
