@@ -27,7 +27,7 @@ pub type Stream<'i> = Partial<&'i [u8]>;
 
 /// A struct holding a `DateTime` parsed from the Time: line of the entry
 /// ex: `# Time: 2018-02-05T02:46:43.015898Z`
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct TimeLine {
     time: DateTime,
 }
@@ -608,10 +608,13 @@ mod tests {
                 minute: 43,
                 second: 23,
                 millisecond: 0,
-                offset: Some(Offset {
-                    offset_hours: 2,
-                    offset_minutes: 0,
+                offset: Some(Offset::Fixed {
+                    hours: 2,
+                    minutes: 0,
+                    critical: false,
                 }),
+                time_zone: None,
+                calendar: None,
             },
         };
 

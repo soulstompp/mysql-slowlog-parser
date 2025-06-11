@@ -23,7 +23,7 @@ pub struct Entry {
 impl Entry {
     /// returns the time the entry was recorded
     pub fn log_time(&self) -> DateTime {
-        self.call.log_time
+        self.call.log_time.clone()
     }
 
     /// returns the mysql user name that requested the command
@@ -523,7 +523,7 @@ impl EntrySqlAttributes {
 }
 
 /// struct containing details of how long the query took
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct EntryCall {
     /// time recorded for the log entry
     pub log_time: DateTime,
@@ -542,7 +542,7 @@ impl EntryCall {
 
     /// returns the entry time as an `DateTime`
     pub fn log_time(&self) -> DateTime {
-        self.log_time
+        self.log_time.clone()
     }
 
     /// returns the time stamp set at the beginning of each entry
