@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0 - 2025-06-11
+* upgrade to winnow-datetime 0.3.0 objects
+* Removed Copy trait from TimeLine and EntryCall since underlying winnow-datetime 0.3.0 objects are no longer Copy
+* This is a small set of changes but it is a breaking change since the `TimeLine` and `EntryCall` objects are no longer
+  Copy and the DateTime objects exposed from winnow-datetime 0.3.0 have changed. Most use-cases should not be affected.
+* Allow for latest 0.7.x versions of winnow since they adhere well to semver.
+
 ## 0.4.0 - 2025-05-24
 * upgrade to rust edition 2024
 * fixed a warning introduced in previous release
