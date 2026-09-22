@@ -1,3 +1,4 @@
+use crate::graph::StatementGraph;
 use crate::{EntryAdminCommand, SessionLine, SqlStatementContext, StatsLine};
 use bytes::{BufMut, Bytes, BytesMut};
 use sqlparser::ast::{Statement, visit_relations};
@@ -101,19 +102,35 @@ impl Entry {
     }
 }
 
+/// A statement the SQL parser accepted, with whatever the log's comment said about it.
 #[derive(Clone, Debug, PartialEq)]
-///
 pub struct EntrySqlStatement {
     /// Holds the Statement
     pub statement: Statement,
+    /// the key/value pairs of the comment preceding the statement, where there was one
     pub context: Option<SqlStatementContext>,
 }
 
 impl EntrySqlStatement {
+    /// returns the key/value pairs parsed from the statement's preceding comment
     pub fn sql_context(&self) -> Option<SqlStatementContext> {
         self.context.clone()
     }
 
+    /// The statement's relation graph: every relation it names, where each one sits, and every
+    /// relationship between them that the statement wrote down.
+    ///
+    /// ⭐ THIS IS WHAT [`Self::objects`] DISCARDS. That accessor folds the parse into a set of
+    /// names, losing multiplicity, position, nesting depth and every edge at once. See
+    /// [`StatementGraph`].
+    pub fn relation_graph(&self) -> StatementGraph {
+        StatementGraph::of(&self.statement)
+    }
+
+    /// returns the relations this statement names, deduplicated and sorted
+    ///
+    /// ⚠️ A SET, so multiplicity, position, nesting depth and every relationship between the
+    /// relations are gone. [`Self::relation_graph`] is the same parse without those losses.
     pub fn objects(&self) -> Vec<EntrySqlStatementObject> {
         let mut visited = BTreeSet::new();
 
@@ -137,6 +154,7 @@ impl EntrySqlStatement {
         visited.into_iter().collect()
     }
 
+    /// returns the MySQL-facing kind of this statement
     pub fn sql_type(&self) -> EntrySqlType {
         match self.statement {
             Statement::Query(_) => EntrySqlType::Query,
@@ -265,6 +283,18 @@ impl EntryStatement {
         }
     }
 
+    /// returns the relation graph of this statement, where it has one
+    ///
+    /// ⛔ `None` exactly where [`Self::objects`] is `None`, and for the same reason: an admin
+    /// command and an unparseable statement have no AST to walk. The two remain distinct in the
+    /// enum itself; this accessor says only that neither has a graph.
+    pub fn relation_graph(&self) -> Option<StatementGraph> {
+        match self {
+            Self::SqlStatement(s) => Some(s.relation_graph()),
+            _ => None,
+        }
+    }
+
     /// returns the `EntrySqlType` associated with this statement if known
     pub fn sql_type(&self) -> Option<EntrySqlType> {
         match self {
@@ -274,6 +304,7 @@ impl EntryStatement {
     }
 
     /// returns the `SqlStatementContext` associated with this statement
+    /// returns the key/value pairs parsed from the statement's preceding comment
     pub fn sql_context(&self) -> Option<SqlStatementContext> {
         match self {
             Self::SqlStatement(s) => s.sql_context().clone(),

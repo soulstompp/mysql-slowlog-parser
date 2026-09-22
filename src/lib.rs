@@ -59,12 +59,18 @@ use bytes::Bytes;
 pub use crate::codec::{CodecError, EntryCodec, EntryError};
 
 mod codec;
+mod graph;
 mod parser;
 mod types;
 
+pub use graph::{
+    ConstraintKind, Edge, GraphMeasures, JoinOp, RelationOccurrence, RelationRole, Scope,
+    ScopeKind, StatementGraph,
+};
+
 pub use types::{
-    Entry, EntryCall, EntrySession, EntrySqlAttributes, EntrySqlStatementObject,
-    EntrySqlType, EntryStatement, EntryStats,
+    Entry, EntryCall, EntrySession, EntrySqlAttributes, EntrySqlStatement,
+    EntrySqlStatementObject, EntrySqlType, EntryStatement, EntryStats,
 };
 
 /// Error covering problems reading or parsing a log

@@ -674,3 +674,135 @@ SELECT 1;
         );
     }
 }
+
+/// The relation graph, measured over every statement in the shipped log rather than over
+/// hand-written SQL.
+///
+/// ⭐ THIS IS THE REGRESSION CORPUS AND NOT MUCH ELSE. The log is a sandbox startup and a
+/// `mysqldump` restore, so its structural content and its performance content are disjoint: every
+/// statement that names more than one relation is a `CREATE VIEW` that ran once, examined no rows
+/// and took no locks. What it can prove is that the walk over 163 real parses loses nothing
+/// `objects()` held, and that the one interesting shape in it is found.
+#[cfg(test)]
+mod graph_census {
+    use crate::codec::EntryCodec;
+    use crate::{EntryStatement, RelationRole, ScopeKind};
+    use std::ops::Not;
+    use futures::StreamExt;
+    use std::ops::AddAssign;
+    use tokio::fs::File;
+    use tokio_util::codec::Framed;
+
+    #[tokio::test]
+    async fn the_graph_census_of_the_shipped_log() {
+        let f = File::open("assets/slow-test-queries.log").await.unwrap();
+        let mut ff = Framed::new(f, EntryCodec::default());
+
+        let (mut parsed, mut with_graph, mut occurrences, mut edges) = (0, 0, 0usize, 0usize);
+        let (mut named_only, mut non_tree, mut view_bodies) = (0usize, 0usize, 0usize);
+        let mut quoted = 0usize;
+        let mut missed: Vec<String> = Vec::new();
+        let mut view_targets = 0usize;
+
+        while let Some(res) = ff.next().await {
+            let e = res.unwrap();
+            parsed.add_assign(1);
+            let EntryStatement::SqlStatement(s) = &e.sql_attributes.statement else {
+                continue;
+            };
+            with_graph += 1;
+            let g = s.relation_graph();
+            occurrences += g.occurrences.len();
+            edges += g.edges.len();
+            if g.measures().cycle_space > 0 {
+                non_tree += 1;
+            }
+            if g.scopes.iter().any(|sc| sc.kind == ScopeKind::ViewBody) {
+                view_bodies += 1;
+                named_only += g
+                    .occurrences
+                    .iter()
+                    .filter(|o| g.in_view_body(o.occ))
+                    .count();
+            }
+            // ⛔ Nothing `objects()` found may be missing from the graph. The reverse is
+            // allowed and is the point: the graph finds the view being created, which
+            // `objects()` cannot.
+            //
+            // ⛔⛔ AND THE COMPARISON HAS TO STRIP BACKTICKS, WHICH IS ITSELF A DEFECT.
+            // `ObjectNamePart`'s `Display` renders the quote style and `objects()` builds its
+            // names with `to_string()`, so `` `actor` `` and `actor` come out as two different
+            // relations. `PLAN-2026-09-22-02-fusion.md:161` records exactly that as measured
+            // data -- ``actor -> ['`actor`', 'actor', 'sakila.actor']`` -- and files all three
+            // under a reader's mapping of spellings onto tables. One of the three is not a
+            // spelling difference at all. The parse has carried the unquoted value the whole
+            // time; only the accessor threw it away.
+            for o in s.objects() {
+                let raw = o.object_name();
+                let bare = raw.trim_matches('`');
+                if raw != bare {
+                    quoted.add_assign(1);
+                }
+                if !g
+                    .occurrences
+                    .iter()
+                    .any(|r| r.object_name.as_deref() == Some(bare.as_bytes()))
+                {
+                    missed.push(format!("{bare} <- {:?}", s.sql_type()));
+                }
+            }
+            view_targets += g
+                .occurrences
+                .iter()
+                .filter(|r| r.role == RelationRole::CreateTarget && g.in_view_body(r.occ).not())
+                .filter(|_| g.scopes.iter().any(|sc| sc.kind == ScopeKind::ViewBody))
+                .count();
+        }
+
+        missed.sort();
+        missed.dedup();
+        // ⛔ ONE MISS IN 163 STATEMENTS, AND IT IS NOT A RELATION. `SHOW TABLES FROM mysql` names
+        // a SCHEMA, and `ShowStatementIn.parent_name` carries a `visit_relation` annotation, so
+        // `objects()` files the schema `mysql` as though it were a table. The graph declines to,
+        // which is why this is an exception with an argument rather than a gap to close.
+        assert_eq!(
+            missed,
+            vec!["mysql <- ShowTables".to_string()],
+            "the graph may hold more than objects(), and may lose nothing that is a relation"
+        );
+
+        assert_eq!(parsed, 310);
+        assert_eq!(with_graph, 163, "statements with an AST to walk");
+
+        // ⭐ The seven `CREATE VIEW`s are the whole of this log's structure, and all 39 relations
+        // they mention sit in a view body -- NAMED, never read. `PLAN-2026-09-22-02-fusion.md`
+        // measures an elimination of 1.80% against `query_time` over exactly these statements and
+        // says at :128 that "every k >= 2 statement in this fixture is a CREATE VIEW". The flat
+        // `objects` set cannot tell a table scanned from a table named in a DDL body, so that
+        // 1.80% is drawn entirely from statements that touched none of the tables it weights.
+        assert_eq!(view_bodies, 7, "every multi-relation statement is a view");
+        assert_eq!(named_only, 39, "relations named in a body, not scanned");
+
+        // ⭐⭐ ONE non-tree descent in 163 statements, and it is `actor_info`: its correlated
+        // subquery rebinds `fa` and `fc`, and the two correlation edges close a cycle.
+        // `rank/composition_closure.sqlc` computes a kernel two ways and says they "agree
+        // exactly where the descent is a tree"; every layer graph in that corpus is a forest, so
+        // the disagreeing case has never had a witness. This is one. A population of one is thin
+        // and it is not zero, which is the difference between a law that is suspended and a law
+        // that is vacuous.
+        assert_eq!(non_tree, 1, "actor_info, and nothing else");
+
+        assert_eq!(occurrences, 121);
+        assert_eq!(edges, 33);
+
+        // ⛔ The seven views this log creates are invisible to `objects()` -- `CreateView.name`
+        // carries no `visit_relation` annotation while `CreateTable.name` does -- so a reader
+        // asking which relations a `CREATE VIEW` statement concerns gets its sources and never
+        // the thing it defines.
+        assert_eq!(view_targets, 7);
+
+        // ⭐ And the quoting defect, sized: 46 names `objects()` reports wrapped in backticks and
+        // the graph reports bare.
+        assert_eq!(quoted, 46, "names objects() spells with backticks");
+    }
+}
