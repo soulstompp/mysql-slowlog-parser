@@ -1,9 +1,10 @@
 use crate::EntryMasking;
+use std::ops::ControlFlow;
 use bytes::{BufMut, Bytes, BytesMut};
-use sqlparser::ast::Statement;
+use sqlparser::ast::{Expr, Statement, Value, visit_expressions_mut};
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::{Parser as SQLParser, ParserError};
-use sqlparser::tokenizer::{Token, Tokenizer};
+use sqlparser::tokenizer::Tokenizer;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Not;
@@ -555,58 +556,57 @@ pub fn start_timestamp_command(i: &mut Stream) -> ModalResult<u32> {
     .parse_next(i)
 }
 
-/// Parses one or more sql statements using `sqlparser::parse_statements`. This uses the
-/// `sqlparser::Tokenizer` to first tokenize the SQL and replace tokenized values with an
-/// masked value determined by the `&EntryMasking` value passed as an argument. In the case of
-/// `EntryMasking::None` this call is identical to calling `sqlparse::parse_statements`.
-/// command: " entry line
+/// Parses one or more SQL statements, optionally replacing every literal **value** with a `?`.
+///
+/// With `EntryMasking::None` this is `sqlparser::parse_statements` and nothing else.
 pub fn parse_sql(sql: &str, mask: &EntryMasking) -> Result<Vec<Statement>, ParserError> {
     let mut tokenizer = Tokenizer::new(&MySqlDialect {}, sql);
-    let mut tokens = tokenizer.tokenize()?;
-
-    tokens = mask_tokens(tokens, mask);
+    let tokens = tokenizer.tokenize()?;
 
     let mut parser = SQLParser::new(&MySqlDialect {}).with_tokens(tokens);
+    let mut statements = parser.parse_statements()?;
 
-    parser.parse_statements()
-}
-
-/// Replaces numbers, strings and literal tokenized by `sql_parser::Tokenizer` and replaces them
-/// with a masking values. Passing a value of `EntryMasking::None` will simply return the
-/// `Vec<Token>` passed in.
-pub fn mask_tokens(tokens: Vec<Token>, mask: &EntryMasking) -> Vec<Token> {
-    let mut acc = vec![];
-
-    if mask == &EntryMasking::None {
-        return tokens;
+    // ⛔⛔ MASKED AFTER THE PARSE AND NEVER BEFORE IT. Replacing tokens first destroys
+    // statements that are perfectly well formed: a number inside a type declaration is not a
+    // value, and `CHAR(?)`, `DECIMAL(?,?)` and `INT(?)` are not SQL. On the log this crate is
+    // tested against that cost **35 of 163 parses** -- `CREATE TABLE` and `ALTER TABLE`, every
+    // one of them -- and the consumer's default is to mask, so the default was the lossy one.
+    //
+    // ⭐ After the parse the question does not arise, because the tokenizer's ambiguity is gone:
+    // a type parameter is not an `Expr` and a value is, so masking expressions cannot reach one.
+    if mask == &EntryMasking::PlaceHolder {
+        for s in statements.iter_mut() {
+            mask_values(s);
+        }
     }
 
-    for t in tokens {
-        // ⚠️ `Token::Number` appeared twice here, identically. Harmless -- both arms yield a
-        // placeholder -- but `ifs_same_cond` is deny-by-default, so it broke a downstream
-        // `-D warnings` build, and a duplicated arm usually means one of them was meant to
-        // name a different token.
-        let mt = if let Token::Number(_, _) = t {
-            Token::Placeholder("?".into())
-        } else if let Token::SingleQuotedString(_) = t {
-            Token::Placeholder("?".into())
-        } else if let Token::DoubleQuotedString(_) = t {
-            Token::Placeholder("?".into())
-        } else if let Token::NationalStringLiteral(_) = t {
-            Token::Placeholder("?".into())
-        } else if let Token::EscapedStringLiteral(_) = t {
-            Token::Placeholder("?".into())
-        } else if let Token::HexStringLiteral(_) = t {
-            Token::Placeholder("?".into())
-        } else {
-            t
-        };
-
-        acc.push(mt);
-    }
-
-    acc
+    Ok(statements)
 }
+
+/// Replaces every literal **value** in a parsed statement with a `?` placeholder.
+///
+/// ⚠️ Values only. A type's length, a precision and a scale are numbers the grammar requires and
+/// are not values; they are untouched because they are not expressions.
+fn mask_values(statement: &mut Statement) {
+    let _ = visit_expressions_mut(statement, |e| {
+        if let Expr::Value(v) = e {
+            let literal = matches!(
+                v.value,
+                Value::Number(..)
+                    | Value::SingleQuotedString(_)
+                    | Value::DoubleQuotedString(_)
+                    | Value::NationalStringLiteral(_)
+                    | Value::EscapedStringLiteral(_)
+                    | Value::HexStringLiteral(_)
+            );
+            if literal {
+                *e = Expr::value(Value::Placeholder("?".to_string()));
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -979,5 +979,72 @@ Time                 Id Command    Argument\n";
                 }
             )
         );
+    }
+}
+
+
+/// ⛔⛔ MASKING USED TO DESTROY STATEMENTS, AND THE CONSUMER'S DEFAULT WAS TO MASK.
+///
+/// `mask_tokens` runs before the parser, and a tokenizer cannot tell a value from a number the
+/// grammar requires. So `CHAR(60)` became `CHAR(?)` and the whole `CREATE TABLE` stopped
+/// parsing -- not misparsed, *refused*, and filed as an unparseable statement with its raw bytes
+/// as its SQL. On `assets/slow-test-queries.log` that was **35 of 163 parses**.
+///
+/// ⭐ Nothing counted it, because nothing ever recorded the parse population under both settings
+/// at once. It surfaced from the consumer side, where a fold reported 163 members unmasked and
+/// 128 masked over the same file.
+#[cfg(test)]
+mod masking_is_not_destructive {
+    use crate::EntryMasking::{None as NoMask, PlaceHolder};
+    use crate::parser::parse_sql;
+
+    /// A number the grammar requires is not a value, and masking must not reach it.
+    #[test]
+    fn a_type_parameter_survives_masking() {
+        for sql in [
+            "CREATE TABLE t (c CHAR(60) NOT NULL)",
+            "CREATE TABLE t (c VARCHAR(255) DEFAULT '')",
+            "CREATE TABLE t (c DECIMAL(10,2))",
+            "ALTER TABLE t ADD COLUMN c INT(11)",
+        ] {
+            assert!(parse_sql(sql, &NoMask).is_ok(), "{sql}");
+            assert!(
+                parse_sql(sql, &PlaceHolder).is_ok(),
+                "masking refused a statement that parses: {sql}"
+            );
+        }
+    }
+
+    /// ⭐ And a value still masks, or the flag would be doing nothing.
+    #[test]
+    fn a_value_is_still_replaced() {
+        let one = parse_sql("SELECT * FROM t WHERE id = 1 AND name = 'a'", &PlaceHolder).unwrap();
+        let two = parse_sql("SELECT * FROM t WHERE id = 2 AND name = 'b'", &PlaceHolder).unwrap();
+        assert_eq!(one[0].to_string(), two[0].to_string());
+        assert!(one[0].to_string().contains('?'), "{}", one[0]);
+
+        // ⛔ NOT VACUOUS: unmasked, the same two statements differ. A masker that replaced
+        // nothing would pass the first assertion on two identical inputs.
+        let a = parse_sql("SELECT * FROM t WHERE id = 1", &NoMask).unwrap();
+        let b = parse_sql("SELECT * FROM t WHERE id = 2", &NoMask).unwrap();
+        assert_ne!(a[0].to_string(), b[0].to_string());
+    }
+
+    /// ⚠️ Masking must not change WHICH statements parse at all, in either direction.
+    #[test]
+    fn masking_changes_no_statements_parseability() {
+        for sql in [
+            "CREATE TABLE t (id INT(11), amount DECIMAL(10,2), name VARCHAR(255))",
+            "INSERT INTO t VALUES (1, 2.5, 'x')",
+            "SELECT * FROM t LIMIT 10 OFFSET 5",
+            "UPDATE t SET amount = 1.5 WHERE id = 3",
+            "SELECT SUBSTR(name, 1, 3) FROM t",
+        ] {
+            assert_eq!(
+                parse_sql(sql, &NoMask).is_ok(),
+                parse_sql(sql, &PlaceHolder).is_ok(),
+                "{sql}"
+            );
+        }
     }
 }
