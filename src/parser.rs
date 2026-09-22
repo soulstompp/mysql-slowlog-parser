@@ -291,50 +291,64 @@ pub fn entry_user(i: &mut Stream) -> ModalResult<SessionLine> {
     .parse_next(i)
 }
 
-/// Struct containing information parsed from the initial comment in a SQL query
+/// The key/value pairs parsed from the comment preceding a SQL statement.
+///
+/// ⭐ WHATEVER THE COMMENT SAID, UNDER THE NAMES IT USED. This carried four named fields --
+/// `request_id`, `caller`, `function`, `line` -- and their own doc comments called them
+/// "example field, should just be part of a HashMap". They were worse than a placeholder:
+/// applications annotate with whatever keys they like, and four names admitted four of them.
+///
+/// ⛔ AND THE NAMES WERE NOT EVEN THE COMMENT'S. The reference mapper put the comment key
+/// `file` into a field called `caller` and `method` into one called `function`. That is a
+/// READER'S VOCABULARY compiled into the parser, and a reader who disagreed had no way to say
+/// so. A parser's job here is to report what the document wrote; deciding that `file` names
+/// the same thing as some other log's `caller` is a judgement that belongs to whoever is
+/// comparing them, where it can be seen and disagreed with.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SqlStatementContext {
-    /// example field, should just be part of a HashMap
-    pub request_id: Option<Bytes>,
-    /// example field, should just be part of a HashMap
-    pub caller: Option<Bytes>,
-    /// example field, should just be part of a HashMap
-    pub function: Option<Bytes>,
-    /// example field, should just be part of a HashMap
-    pub line: Option<u32>,
+    /// Every pair the comment carried, keys and values exactly as written.
+    pub entries: HashMap<Bytes, Bytes>,
 }
 
 impl SqlStatementContext {
-    /// example method, should be replaced by generic key lookup
-    pub fn request_id(&self) -> Option<Cow<str>> {
-        if let Some(i) = &self.request_id {
-            Some(String::from_utf8_lossy(i.as_ref()))
-        } else {
+    /// Builds a context from the pairs a comment parsed into. `None` where there were none,
+    /// so an empty comment and an absent one stay distinguishable.
+    pub fn new(entries: HashMap<Bytes, Bytes>) -> Option<Self> {
+        if entries.is_empty() {
             None
+        } else {
+            Some(Self { entries })
         }
     }
 
-    /// example method, should be replaced by generic key lookup
-    pub fn caller(&self) -> Option<Cow<str>> {
-        if let Some(c) = &self.caller {
-            Some(String::from_utf8_lossy(c.as_ref()))
-        } else {
-            None
-        }
+    /// The value written under `key`, lossily decoded.
+    pub fn get(&self, key: &str) -> Option<Cow<'_, str>> {
+        self.entries
+            .get(key.as_bytes())
+            .map(|v| String::from_utf8_lossy(v.as_ref()))
     }
 
-    /// example method, should be replaced by generic key lookup
-    pub fn function(&self) -> Option<Cow<str>> {
-        if let Some(f) = &self.function {
-            Some(String::from_utf8_lossy(f.as_ref()))
-        } else {
-            None
-        }
+    /// The value written under `key`, as it arrived.
+    pub fn get_bytes(&self, key: &str) -> Option<Bytes> {
+        self.entries.get(key.as_bytes()).cloned()
     }
 
-    /// example method, should be replaced by generic key lookup
-    pub fn line(&self) -> Option<u32> {
-        self.line
+    /// The value under `key` parsed as `T`. `None` both where the key is absent and where it
+    /// will not parse -- a caller that needs to tell those apart uses `get` and parses itself.
+    pub fn get_parsed<T: FromStr>(&self, key: &str) -> Option<T> {
+        self.get(key).and_then(|v| v.trim().parse().ok())
+    }
+
+    /// The keys the comment used, in no particular order.
+    pub fn keys(&self) -> impl Iterator<Item = Cow<'_, str>> {
+        self.entries
+            .keys()
+            .map(|k| String::from_utf8_lossy(k.as_ref()))
+    }
+
+    /// Whether the comment carried no pairs at all.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 

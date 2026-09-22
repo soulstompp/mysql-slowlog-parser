@@ -208,16 +208,19 @@ impl EntryCodec {
                         parse_sql(&String::from_utf8_lossy(&sql_lines), &self.config.masking)
                     {
                         if s.len() == 1 {
-                            let context: Option<SqlStatementContext> = if let Some(d) = details {
-                                if let Some(f) = &self.config.map_comment_context {
-                                    //TODO: map these keys
-                                    f(d)
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
+                            // ⭐⭐ NO MAPPER NOW CARRIES THE COMMENT THROUGH, RATHER THAN
+                            // DISCARDING IT. `map_comment_context` defaults to `None`, and
+                            // while `None` meant "drop the context" every consumer taking the
+                            // default got four NULL columns and no way to tell that from an
+                            // application that annotates nothing. Parsing a comment and then
+                            // throwing it away because nobody registered a function is not a
+                            // default anybody wants; the hook survives for consumers that want
+                            // to filter or reject, and doing nothing yields what was written.
+                            let context: Option<SqlStatementContext> =
+                                details.and_then(|d| match &self.config.map_comment_context {
+                                    Some(f) => f(d),
+                                    None => SqlStatementContext::new(d),
+                                });
 
                             let s = EntrySqlStatement {
                                 statement: s[0].clone(),
@@ -368,10 +371,11 @@ mod tests {
         EntrySqlStatementObject, EntryStatement, EntryStats,
     };
     use crate::{EntryCodecConfig, EntryMasking, SqlStatementContext};
-    use bytes::{Bytes, BytesMut};
+    use bytes::Bytes;
     use futures::StreamExt;
     use std::default::Default;
     use std::io::Cursor;
+    use std::collections::HashMap;
     use std::ops::AddAssign;
 
     use tokio::fs::File;
@@ -404,31 +408,11 @@ SET timestamp=1517798807;
 
         let mut eb = entry.as_bytes().to_vec();
 
-        let config = EntryCodecConfig {
-            masking: Default::default(),
-            map_comment_context: Some(|d| {
-                let acc = SqlStatementContext {
-                    request_id: d
-                        .get(&*BytesMut::from("request_id"))
-                        .and_then(|b| Some(b.clone())),
-                    caller: d
-                        .get(&*BytesMut::from("file"))
-                        .and_then(|b| Some(b.clone())),
-                    function: d
-                        .get(&*BytesMut::from("method"))
-                        .and_then(|b| Some(b.clone())),
-                    line: d
-                        .get(&*BytesMut::from("line"))
-                        .and_then(|b| String::from_utf8_lossy(b).parse().ok()),
-                };
-
-                if acc == SqlStatementContext::default() {
-                    None
-                } else {
-                    Some(acc)
-                }
-            }),
-        };
+        // ⭐ NO MAPPER. This test used to register a `map_comment_context` that renamed the
+        // comment's keys -- `file` into a field called `caller`, `method` into `function` --
+        // and without one the context was dropped entirely. Both are gone: the default now
+        // carries the pairs through under the names the comment used.
+        let config = EntryCodecConfig::default();
 
         let mut ff = Framed::new(Cursor::new(&mut eb), EntryCodec::new(config));
         let e = ff.next().await.unwrap().unwrap();
@@ -437,12 +421,12 @@ SET timestamp=1517798807;
 
         let expected_stmt = EntrySqlStatement {
             statement: stmts.get(0).unwrap().clone(),
-            context: Some(SqlStatementContext {
-                request_id: Some("apLo5wdqkmKw4W7vGfiBc5".into()),
-                caller: Some("src/endpoints/original/mod.rs".into()),
-                function: Some("notifications()".into()),
-                line: Some(38),
-            }),
+            context: SqlStatementContext::new(HashMap::from([
+                (Bytes::from("request_id"), Bytes::from("apLo5wdqkmKw4W7vGfiBc5")),
+                (Bytes::from("file"), Bytes::from("src/endpoints/original/mod.rs")),
+                (Bytes::from("method"), Bytes::from("notifications()")),
+                (Bytes::from("line"), Bytes::from("38")),
+            ])),
         };
 
         let expected_sql = sql.trim().strip_suffix(";").unwrap();

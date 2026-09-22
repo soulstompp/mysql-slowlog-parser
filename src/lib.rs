@@ -63,7 +63,7 @@ mod parser;
 mod types;
 
 pub use types::{
-    Entry, EntryCall, EntryContext, EntrySession, EntrySqlAttributes, EntrySqlStatementObject,
+    Entry, EntryCall, EntrySession, EntrySqlAttributes, EntrySqlStatementObject,
     EntrySqlType, EntryStatement, EntryStats,
 };
 
