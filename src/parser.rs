@@ -481,13 +481,25 @@ pub fn admin_command<'a>(i: &mut Stream) -> ModalResult<EntryAdminCommand> {
         let command = seq!(
             _: literal("# administrator command:"),
             _: multispace1,
-            alphanumerichyphen1,
+            // ⭐ TO THE `;`, NOT ONE WORD. `alphanumerichyphen1` matches a single run of
+            // alphanumerics, so every administrator command whose name contains a space failed
+            // here and fell through to the SQL branch. MySQL has many: `Init DB`,
+            // `Register Slave`, `Binlog Dump`, `Table Dump`, `Change user`, `Close stmt`,
+            // `Reset stmt`, `Long Data`, `Set option`, `Field List`, `Create DB`, `Drop DB`,
+            // `Process info`, `Connect Out`, `Delayed insert`.
+            //
+            // ⛔ AND FAILING HERE WAS NOT FREE, WHICH IS WHY THE CALL SITE CHANGED TOO. See
+            // `codec.rs`: winnow does not rewind a parser that fails after consuming, so the
+            // stream resumed mid-line and the remainder -- `DB;`, `Slave;` -- was read as the
+            // statement's SQL. The command name was destroyed and a fragment filed in its place.
+            take_till(1.., (b';', b'\r', b'\n')),
             _: literal(";"),
         )
         .parse_next(input)?;
 
         Ok(EntryAdminCommand {
-            command: command.0.to_owned().into(),
+            // `multispace1` ate the leading run; trailing spaces before the `;` are ours.
+            command: command.0.trim_ascii_end().to_owned().into(),
         })
     })
     .parse_next(i)

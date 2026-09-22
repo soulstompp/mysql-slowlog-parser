@@ -183,7 +183,14 @@ impl EntryCodec {
             CodecExpect::Sql => {
                 let _ = multispace0(i)?;
 
-                if let Ok(c) = admin_command(i) {
+                // ⛔ `opt`, NOT A BARE CALL. winnow rewinds only where a combinator takes a
+                // checkpoint; a parser that fails after consuming leaves the stream where it
+                // stopped. `admin_command(i)` discarded on `Err` therefore resumed mid-line,
+                // and `sql_lines` below read the remainder as the statement -- filing
+                // `InvalidStatement("DB;")` for `# administrator command: Init DB;`. `opt`
+                // restores the checkpoint on a backtrack and still propagates `Incomplete`,
+                // which is what a partial stream needs.
+                if let Some(c) = opt(admin_command).parse_next(i)? {
                     self.context.attributes = Some(EntrySqlAttributes {
                         sql: (c.command.clone()),
                         statement: EntryStatement::AdminCommand(c),
@@ -596,5 +603,90 @@ GROUP BY film2.film_id, category.name;
         }
 
         assert_eq!(i, 310);
+    }
+}
+
+#[cfg(test)]
+mod admin_command_completeness {
+    use crate::parser::{Stream, admin_command};
+    use crate::{EntryCodec, EntryStatement};
+    use futures::StreamExt;
+    use std::collections::BTreeMap;
+    use tokio::fs::File;
+    use tokio_util::codec::FramedRead;
+    use winnow::combinator::opt;
+    use winnow::stream::AsBytes;
+    use winnow::{Parser, Partial};
+
+    /// ⭐ EVERY `# administrator command:` LINE IS AN `AdminCommand`, INCLUDING THE MULTI-WORD
+    /// ONES. `assets/slow-test-queries.log` holds sixteen; before this was fixed, thirteen
+    /// survived.
+    ///
+    /// The three that did not were `Init DB` twice and `Register Slave` once, and they were not
+    /// merely misclassified. `admin_command` read the command with `alphanumerichyphen1`, which
+    /// cannot match a space, and `codec.rs` called it bare -- winnow leaves the stream where a
+    /// failed parser stopped, so `sql_lines` read the remainder and filed
+    /// `InvalidStatement("DB;")` / `InvalidStatement("Slave;")`. The command name was destroyed
+    /// and a fragment of a comment line was filed as the statement's SQL.
+    #[tokio::test]
+    async fn multi_word_admin_commands_survive() {
+        let fr = FramedRead::with_capacity(
+            File::open("assets/slow-test-queries.log").await.unwrap(),
+            EntryCodec::default(),
+            30_000_000,
+        );
+
+        let mut commands: BTreeMap<String, usize> = BTreeMap::new();
+        for e in fr.collect::<Vec<_>>().await.into_iter().flatten() {
+            match &e.sql_attributes.statement {
+                EntryStatement::AdminCommand(c) => {
+                    *commands
+                        .entry(String::from_utf8_lossy(&c.command).into_owned())
+                        .or_default() += 1;
+                }
+                EntryStatement::InvalidStatement(s) => assert!(
+                    !matches!(s.trim(), "DB;" | "Slave;"),
+                    "a fragment of an admin command was filed as SQL: {s:?}"
+                ),
+                _ => {}
+            }
+        }
+
+        assert_eq!(commands.get("Quit"), Some(&12));
+        assert_eq!(commands.get("Ping"), Some(&1));
+        assert_eq!(commands.get("Init DB"), Some(&2), "two words");
+        assert_eq!(commands.get("Register Slave"), Some(&1), "two words");
+        assert_eq!(commands.values().sum::<usize>(), 16);
+    }
+
+    /// ⛔ AND THE OTHER HALF: A FAILED ATTEMPT MUST NOT CONSUME.
+    ///
+    /// This is the property that turned a classification gap into data corruption. winnow
+    /// rewinds only where a combinator takes a checkpoint, so `admin_command(i)` discarded on
+    /// `Err` left the stream mid-line. Here the command line has no terminating `;`, so the
+    /// parser matches its prefix and then fails -- exactly the shape that used to consume.
+    ///
+    /// ⚠️ WHAT THIS DOES NOT GUARD, SAID PLAINLY. It pins `opt`'s contract, not the codec's
+    /// use of it: revert `admin_command` to the single-word matcher and this still passes,
+    /// because the `opt` here restores either way. Only `multi_word_admin_commands_survive`
+    /// notices that. Nothing in this file currently fails if somebody drops the `opt` at the
+    /// call site while the command parser stays correct -- with both halves in place that
+    /// rewind is defence in depth, and the honest thing is to say so rather than claim a
+    /// guard that is not there.
+    #[test]
+    fn a_failed_admin_command_does_not_consume() {
+        let input = b"# administrator command: Init DB
+SELECT 1;
+";
+        let mut i: Stream = Partial::new(&input[..]);
+
+        let parsed = opt(admin_command).parse_next(&mut i).unwrap();
+
+        assert!(parsed.is_none(), "no `;`, so this is not a complete command");
+        assert_eq!(
+            i.as_bytes(),
+            &input[..],
+            "the stream must be exactly where it started"
+        );
     }
 }
