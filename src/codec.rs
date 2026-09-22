@@ -129,6 +129,8 @@ pub struct EntryCodec {
     processed: usize,
     /// ⭐ File-scoped, beside `processed`, because that is its scope. See `EntryContext::reset`.
     headers: Option<HeaderLines>,
+    /// ⭐⭐ How many header blocks the file carried. See [`EntryCodec::header_count`].
+    headers_seen: usize,
     context: EntryContext,
     config: EntryCodecConfig,
 }
@@ -141,6 +143,16 @@ impl EntryCodec {
     /// that has been rotated or concatenated begins mid-stream and states no regime at all.
     pub fn headers(&self) -> Option<&HeaderLines> {
         self.headers.as_ref()
+    }
+
+    /// ⭐⭐ How many header blocks the file carried, which is how many servers claimed it.
+    ///
+    /// ⛔ More than one means the file is a CONCATENATION and its regime is not one thing. The
+    /// entries before the second header were written by one server and those after it by
+    /// another, and nothing else in any artifact would distinguish them. [`EntryCodec::headers`]
+    /// returns the first; this says whether "the first" is also "the only".
+    pub fn header_count(&self) -> usize {
+        self.headers_seen
     }
 
     /// create a new `EntryCodec` with the specified configuration
@@ -162,7 +174,24 @@ impl EntryCodec {
                 // header carried an empty version were the same value, so the one thing that
                 // states the server's regime could not be told from its own absence — and a
                 // rotated or concatenated slow log genuinely has no header.
-                self.headers = res;
+                //
+                // ⛔⛔ AND IT MUST NOT BE AN ASSIGNMENT, WHICH IS WHAT IT WAS. `decode` resets
+                // the context after every completed entry, so `expects` returns to `Header` and
+                // this arm runs again between EVERY pair of entries. A plain `self.headers =
+                // res` therefore set the version once and then overwrote it with `None` 309
+                // times. It survived a test that read one entry and vanished on any real file.
+                //
+                // ⭐ That the arm runs repeatedly is not a defect: a slow log can be rotated and
+                // concatenated, and a second header block mid-file means the rest of the entries
+                // were written by a different server. The FIRST is kept and the COUNT is
+                // recorded, so a file that declares two regimes says so rather than quietly
+                // presenting one.
+                if let Some(h) = res {
+                    self.headers_seen += 1;
+                    if self.headers.is_none() {
+                        self.headers = Some(h);
+                    }
+                }
 
                 None
             }
@@ -783,6 +812,20 @@ mod graph_census {
         // `-MariaDB` elsewhere and `-percona` elsewhere again are three different grammars for
         // the same field. Whoever needs a comparison makes it, on the bytes the server wrote.
         assert!(h.version().as_ref().starts_with(b"5.7."));
+
+        // ⛔⛔ AND IT MUST SURVIVE THE WHOLE FILE, WHICH IT DID NOT. `decode` resets the context
+        // after every completed entry, so `expects` returns to `Header` and the header arm runs
+        // between EVERY pair of entries; a plain assignment set the version once and then
+        // overwrote it with `None` 309 times. A test that read one entry passed and every real
+        // file came out with no regime at all. Drain the stream and ask again.
+        while (ff.next().await).is_some() {}
+        let h = ff.codec().headers().expect("the regime is a fact about the FILE");
+        assert!(h.version().as_ref().starts_with(b"5.7."));
+
+        // ⭐ ONE HEADER, SO "THE FIRST" IS ALSO "THE ONLY". A rotated and concatenated log
+        // carries several, and its entries were then written by more than one server — which
+        // nothing else in any artifact would distinguish.
+        assert_eq!(ff.codec().header_count(), 1);
     }
 
     #[tokio::test]
