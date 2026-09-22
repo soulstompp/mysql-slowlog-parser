@@ -582,9 +582,11 @@ pub fn mask_tokens(tokens: Vec<Token>, mask: &EntryMasking) -> Vec<Token> {
     }
 
     for t in tokens {
+        // ⚠️ `Token::Number` appeared twice here, identically. Harmless -- both arms yield a
+        // placeholder -- but `ifs_same_cond` is deny-by-default, so it broke a downstream
+        // `-D warnings` build, and a duplicated arm usually means one of them was meant to
+        // name a different token.
         let mt = if let Token::Number(_, _) = t {
-            Token::Placeholder("?".into())
-        } else if let Token::Number(_, _) = t {
             Token::Placeholder("?".into())
         } else if let Token::SingleQuotedString(_) = t {
             Token::Placeholder("?".into())
@@ -619,6 +621,32 @@ mod tests {
     use std::collections::HashMap;
     use winnow_datetime::{Date, DateTime, Offset, Time};
 
+    /// ⭐⭐ THE MICROSECONDS A SLOW LOG WRITES NOW REACH THE CONSUMER.
+    ///
+    /// `# Time:` carries six fractional digits and `winnow_datetime::Time` held three, scaled
+    /// to milliseconds, so `.015898` arrived as `15` and everything below a millisecond was
+    /// gone before any consumer saw it. On `assets/slow-test-queries.log` that collapsed 310
+    /// distinct instants onto 80 -- and a downstream writer that truncated further took it to
+    /// 4.
+    ///
+    /// Requires winnow_datetime 0.4. This is the assertion the whole dependency bump is for.
+    #[test]
+    fn a_time_line_keeps_its_microseconds() {
+        let mut i = Stream::new("# Time: 2018-02-05T02:46:43.015898Z".as_bytes());
+        let dt = parse_entry_time(&mut i).unwrap();
+
+        assert_eq!(dt.time.second, 43);
+        assert_eq!(dt.time.nanosecond, 15_898_000, ".015898 is 15_898_000ns");
+
+        // and two instants a microsecond apart stay two instants
+        let mut a = Stream::new("# Time: 2018-02-05T02:46:43.015898Z".as_bytes());
+        let mut b = Stream::new("# Time: 2018-02-05T02:46:43.015899Z".as_bytes());
+        assert_ne!(
+            parse_entry_time(&mut a).unwrap().time.nanosecond,
+            parse_entry_time(&mut b).unwrap().time.nanosecond,
+        );
+    }
+
     #[test]
     fn parses_time_line() {
         let i = "# Time: 2015-06-26T16:43:23+0200";
@@ -633,7 +661,7 @@ mod tests {
                 hour: 16,
                 minute: 43,
                 second: 23,
-                millisecond: 0,
+                nanosecond: 0,
                 offset: Some(Offset::Fixed {
                     hours: 2,
                     minutes: 0,

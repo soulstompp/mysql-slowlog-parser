@@ -1,6 +1,6 @@
 [package]
 name = "mysql-slowlog-parser"
-version = "0.5.0"
+version = "0.6.0"
 description = "Streaming parser for MySQL slowlogs"
 edition = "2024"
 license = "MIT"
@@ -12,9 +12,9 @@ keywords = [ "mysql", "slowlog", "parser", "winnow" ]
 [dependencies]
 bytes = "1.10.0"
 futures = "0.3.31"
-winnow = {  version = "0.7", features = ["default"] }
-winnow_iso8601 = {  version = "0.6", features = ["default"]}
-winnow_datetime = { version = "0.3" }
+winnow = {  version = "1.0", features = ["default"] }
+winnow_iso8601 = {  version = "0.7", features = ["default"]}
+winnow_datetime = { version = "0.4" }
 sqlparser = { version = "0.56.0", features = ["visitor"] }
 thiserror = "2.0.12"
 log = "0.4.27"
