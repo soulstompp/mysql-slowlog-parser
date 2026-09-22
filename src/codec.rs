@@ -82,7 +82,6 @@ impl Display for CodecExpect {
 #[derive(Debug, Default)]
 struct EntryContext {
     expects: CodecExpect,
-    headers: HeaderLines,
     time: Option<DateTime>,
     user: Option<SessionLine>,
     stats: Option<StatsLine>,
@@ -113,6 +112,12 @@ impl EntryContext {
         Ok(e)
     }
 
+    /// ⛔⛔ `*self = default()` WIPES EVERY FIELD, AND ONE OF THEM WAS NOT AN ENTRY'S.
+    ///
+    /// The log header is a fact about the FILE — which server wrote it — and it lived in the
+    /// per-entry context, so the first completed entry destroyed it. That is a scope error and
+    /// not an oversight: a whole-of-file fact in a struct whose contract is "cleared between
+    /// entries" cannot survive by any amount of reading it. It lives on the codec now.
     fn reset(&mut self) {
         *self = EntryContext::default();
     }
@@ -122,11 +127,22 @@ impl EntryContext {
 #[derive(Debug, Default)]
 pub struct EntryCodec {
     processed: usize,
+    /// ⭐ File-scoped, beside `processed`, because that is its scope. See `EntryContext::reset`.
+    headers: Option<HeaderLines>,
     context: EntryContext,
     config: EntryCodecConfig,
 }
 
 impl EntryCodec {
+    /// ⭐ The header lines the file opened with, or `None` where it had none.
+    ///
+    /// Valid once the first entry has been decoded; a caller holding a `FramedRead` reaches it
+    /// through `decoder()`. ⛔ `None` is `unmeasured` and never "the default server": a slow log
+    /// that has been rotated or concatenated begins mid-stream and states no regime at all.
+    pub fn headers(&self) -> Option<&HeaderLines> {
+        self.headers.as_ref()
+    }
+
     /// create a new `EntryCodec` with the specified configuration
     pub fn new(c: EntryCodecConfig) -> Self {
         Self {
@@ -142,7 +158,11 @@ impl EntryCodec {
 
                 let res = opt(log_header).parse_next(i)?;
                 self.context.expects = CodecExpect::Time;
-                self.context.headers = res.unwrap_or_default();
+                // ⛔ `Option`, NOT `unwrap_or_default`. A log with no header and a log whose
+                // header carried an empty version were the same value, so the one thing that
+                // states the server's regime could not be told from its own absence — and a
+                // rotated or concatenated slow log genuinely has no header.
+                self.headers = res;
 
                 None
             }
@@ -731,6 +751,40 @@ mod graph_census {
     use tokio::fs::File;
     use tokio_util::codec::Framed;
 
+    /// ⭐⭐⭐ THE REGIME THE FILE DECLARES, WHICH NOTHING HAS EVER READ.
+    ///
+    /// Every claim a reader makes about MySQL's *behaviour* holds in a regime, and the first
+    /// line of a slow log is the only place the document names one. This corpus says **5.7.20**;
+    /// the structural fixture next door says 8.0.35. A filing that asserts one lock model across
+    /// both is asserting it across two servers that do not agree — online DDL, atomic DDL and
+    /// `ALGORITHM=INSTANT` all change which statements block which, for identical statement text.
+    ///
+    /// ⛔ And it must be an `Option`. `opt(log_header)` fed `unwrap_or_default()`, so a log with
+    /// no header at all — a rotated or concatenated one, which begins mid-stream — was
+    /// indistinguishable from a header whose version was empty. The regime and its own absence
+    /// were one value.
+    #[tokio::test]
+    async fn the_log_declares_the_server_that_wrote_it() {
+        let f = File::open("assets/slow-test-queries.log").await.unwrap();
+        let mut ff = Framed::new(f, EntryCodec::default());
+        assert!(
+            ff.codec().headers().is_none(),
+            "nothing is known before a line has been read"
+        );
+        let _ = ff.next().await.unwrap().unwrap();
+        let h = ff.codec().headers().expect("this file opens with a header");
+        assert_eq!(
+            h.version().as_ref(),
+            b"5.7.20-log (MySQL Community Server (GPL))."
+        );
+        assert_eq!(h.tcp_port(), Some(12345));
+
+        // ⚠️ UNPARSED ON PURPOSE. Splitting this into numbers is a reading, and `-log` here,
+        // `-MariaDB` elsewhere and `-percona` elsewhere again are three different grammars for
+        // the same field. Whoever needs a comparison makes it, on the bytes the server wrote.
+        assert!(h.version().as_ref().starts_with(b"5.7."));
+    }
+
     #[tokio::test]
     async fn the_graph_census_of_the_shipped_log() {
         let f = File::open("assets/slow-test-queries.log").await.unwrap();
@@ -739,6 +793,8 @@ mod graph_census {
         let (mut parsed, mut with_graph, mut occurrences, mut edges) = (0, 0, 0usize, 0usize);
         let (mut named_only, mut non_tree, mut view_bodies) = (0usize, 0usize, 0usize);
         let mut quoted = 0usize;
+        let (mut altered, mut dropped) = (0usize, 0usize);
+        let (mut lock_x, mut lock_s, mut analyzed) = (0usize, 0usize, 0usize);
         let mut missed: Vec<String> = Vec::new();
         let mut view_targets = 0usize;
 
@@ -752,6 +808,20 @@ mod graph_census {
             let g = s.relation_graph();
             occurrences += g.occurrences.len();
             edges += g.edges.len();
+            altered += g
+                .occurrences
+                .iter()
+                .filter(|o| o.role == RelationRole::AlterTarget)
+                .count();
+            dropped += g
+                .occurrences
+                .iter()
+                .filter(|o| o.role == RelationRole::DropTarget)
+                .count();
+            let n = |r: RelationRole| g.occurrences.iter().filter(|o| o.role == r).count();
+            lock_x += n(RelationRole::LockExclusiveTarget);
+            lock_s += n(RelationRole::LockSharedTarget);
+            analyzed += n(RelationRole::AnalyzeTarget);
             if g.measures().cycle_space > 0 {
                 non_tree += 1;
             }
@@ -830,7 +900,42 @@ mod graph_census {
         // that is vacuous.
         assert_eq!(non_tree, 1, "actor_info, and nothing else");
 
-        assert_eq!(occurrences, 121);
+        // ⛔⛔ TEN OF THESE DID NOT EXIST, AND THEY ARE THE ONLY DDL IN THIS LOG THAT CAN BLOCK
+        // A READER. `demand.parquet` separates `ddl` from `write` because a DDL takes
+        // `MDL_EXCLUSIVE`; until this walk the role was reachable only by `CREATE VIEW` and
+        // `CREATE TABLE`, which name a relation that did not exist and block nobody.
+        //
+        // ⚠️ AND THE ALTERS ARE ZERO, WHICH IS THE SHARPER HALF. This log holds 32
+        // `ALTER TABLE`s and every one of them says `DISABLE KEYS` or `ENABLE KEYS` — a MySQL
+        // form `sqlparser` refuses outright, so those entries are `invalid`, carry no AST and
+        // reach no graph at all. The statement that takes `MDL_EXCLUSIVE` on a live table is
+        // invisible here twice over, and filing the role does not change that. `AlterTarget`
+        // has its witness in the other corpus; the bound is stated rather than inferred.
+        //
+        // ⚠️ 10 drops against 11 `DROP` lines: `DROP DATABASE IF EXISTS sakila` names a schema
+        // and not a relation, and the walk declines it for the same reason the census's one
+        // permitted `objects()` miss is `SHOW TABLES FROM mysql`.
+        assert_eq!((altered, dropped), (0, 10), "the DDL that names an existing table");
+        // ⭐⭐⭐ AND SIXTEEN OF THEM ARE THE LOCK THIS LOG'S OWN `Lock_time` COLUMN MEASURES THE
+        // WAIT FOR. `mysqldump` writes `LOCK TABLES `t` WRITE` before each table's inserts, so a
+        // restore is a sequence of explicit table locks — and `LockTables.tables` carries no
+        // `visit_relation` annotation, so every one of them was absent from `objects()` and from
+        // every artifact downstream of it. The statement that TAKES the lock and the column that
+        // measures the WAIT have never been in the same record.
+        //
+        // ⛔⛔ AND ZERO ANALYZED, THOUGH THIS LOG RUNS AN `ANALYZE TABLE` OVER SIXTEEN TABLES.
+        // MySQL's `ANALYZE TABLE` takes a LIST; `sqlparser`'s `Analyze` carries a single
+        // `table_name`, so the multi-table form is refused outright and the entry is `invalid`.
+        //
+        // ⭐⭐ THAT IS A SECOND REGIME AND THIS FILING KEPT CONFLATING IT WITH THE FIRST. What
+        // the SERVER can do is one question — it ran the statement, that is why the line is in
+        // the log — and what this GRAMMAR can read is another. `ALTER TABLE … DISABLE KEYS`,
+        // `ANALYZE TABLE a, b`, `OPTIMIZE TABLE`, `DROP INDEX … ON t` and
+        // `LOCK TABLES shop.invoice WRITE` are all valid MySQL and all refused here. A role with
+        // no witness in a corpus may be a role the corpus never exercised OR a grammar that
+        // cannot read the corpus, and only naming both regimes tells them apart.
+        assert_eq!((lock_x, lock_s, analyzed), (16, 0, 0));
+        assert_eq!(occurrences, 147);
         assert_eq!(edges, 33);
 
         // ⛔ The seven views this log creates are invisible to `objects()` -- `CreateView.name`

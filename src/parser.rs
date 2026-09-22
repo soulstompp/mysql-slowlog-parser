@@ -94,11 +94,43 @@ impl SessionLine {
     }
 }
 
-#[derive(Debug, PartialEq, Default)]
+/// ⭐⭐⭐ THE REGIME THE FILE DECLARES, AND NOTHING HAS EVER READ IT.
+///
+/// The first line of a slow log names the server that wrote it. Every claim a downstream reader
+/// makes about MySQL's *behaviour* — which statements block which, whether a DDL takes readers
+/// down with it — holds in a **regime**, and this is the only place the document states which
+/// one. `slow-test-queries.log` says `5.7.20`; a log written by 8.0 obeys different rules for
+/// the same statement text.
+///
+/// ⛔ All three fields were parsed and bound into a struct nothing read, the same shape as the
+/// `USE` database being bound to `_`.
+#[derive(Debug, PartialEq, Default, Clone)]
 pub struct HeaderLines {
     version: Bytes,
     tcp_port: Option<usize>,
     socket: Option<Bytes>,
+}
+
+impl HeaderLines {
+    /// The server version string exactly as the file spelled it, e.g.
+    /// `5.7.20-log (MySQL Community Server (GPL)).`
+    ///
+    /// ⚠️ Unparsed on purpose. Turning it into a `(major, minor, patch)` is a *reading*, and one
+    /// that a distribution suffix (`-log`, `-MariaDB`, `-percona`) can break; whoever needs a
+    /// comparison makes it, on the bytes the server wrote.
+    pub fn version(&self) -> &Bytes {
+        &self.version
+    }
+
+    /// The TCP port the server was listening on, where the line carried one.
+    pub fn tcp_port(&self) -> Option<usize> {
+        self.tcp_port
+    }
+
+    /// The unix socket path, where the line carried one.
+    pub fn socket(&self) -> Option<&Bytes> {
+        self.socket.as_ref()
+    }
 }
 
 pub fn log_header<'a>(i: &mut Stream<'_>) -> ModalResult<HeaderLines> {

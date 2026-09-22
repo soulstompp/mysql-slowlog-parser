@@ -33,8 +33,8 @@
 use bytes::Bytes;
 use sqlparser::ast::{
     Cte, Delete, Expr, FromTable, Insert, JoinConstraint, JoinOperator, ObjectName,
-    ObjectNamePart, Query, Select, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
-    UpdateTableFromKind, visit_expressions,
+    LockTableType, ObjectNamePart, ObjectType, Query, Select, SetExpr, Statement, TableFactor,
+    TableObject, TableWithJoins, UpdateTableFromKind, visit_expressions,
 };
 use std::ops::ControlFlow;
 
@@ -57,6 +57,37 @@ pub enum RelationRole {
     DeleteTarget,
     /// the relation a `CREATE` statement brings into being
     CreateTarget,
+    /// the relation an `ALTER TABLE` changes the definition of
+    ///
+    /// ⭐⭐ NOT `CreateTarget`, AND THE DIFFERENCE IS THE WHOLE POINT OF FILING IT. A `CREATE`
+    /// names a relation that did not exist, so nothing was reading it and nothing could be
+    /// blocked. An `ALTER` names one that does exist and takes `MDL_EXCLUSIVE` on it, which
+    /// blocks every reader of it for the duration. Filing both as "a DDL target" would put the
+    /// one DDL that cannot block anybody under the same name as the one that blocks everybody.
+    AlterTarget,
+    /// the relation a `DROP` removes
+    DropTarget,
+    /// the relation a `TRUNCATE` empties
+    ///
+    /// ⚠️ Not a `DELETE`. InnoDB implements `TRUNCATE TABLE` by dropping and recreating the
+    /// tablespace, so it takes `MDL_EXCLUSIVE` where a `DELETE FROM t` takes row locks — the two
+    /// statements a reader would most expect to be alike are the two furthest apart here.
+    TruncateTarget,
+    /// a relation `LOCK TABLES … WRITE` holds
+    ///
+    /// ⭐⭐⭐ THE STATEMENT THAT TAKES THE LOCK THE LOG MEASURES THE WAIT FOR. `Lock_time` in a
+    /// slow log is table-level and metadata lock wait; `LOCK TABLES` is how a client asks for
+    /// exactly that, and `LockTables.tables` carries no `visit_relation` annotation, so the
+    /// tables it holds were absent from `objects()` and from every artifact downstream of it.
+    LockExclusiveTarget,
+    /// a relation `LOCK TABLES … READ` holds
+    ///
+    /// ⚠️ Filed apart from [`RelationRole::LockExclusiveTarget`] because the modes exclude
+    /// different things: a read lock admits other readers and shuts out writers, a write lock
+    /// shuts out both. One role for both would be the `ddl`/`write` fusion one statement over.
+    LockSharedTarget,
+    /// the relation an `ANALYZE TABLE` samples
+    AnalyzeTarget,
 }
 
 /// The kind of naming scope a relation occurrence was found in.
@@ -163,6 +194,18 @@ pub struct RelationOccurrence {
     /// parses as an ordinary table and `objects()` files it as a physical relation that does not
     /// exist.
     pub resolves_to_cte: Option<u32>,
+    /// ⛔⛔ THE OCCURRENCE THIS ONE REFERS TO, where it refers to one rather than naming a
+    /// relation of its own. MySQL's multi-table `DELETE o, p FROM orders o JOIN payments p`
+    /// names its targets **by alias**, and sqlparser hands that list over as `ObjectName`s — so
+    /// the graph filed two relations called `o` and `p` that do not exist, while the write on
+    /// `orders` and on `payments` was recorded nowhere at all.
+    ///
+    /// ⭐ The mention is kept rather than dropped, because the statement did write those words.
+    /// What is recorded beside it is what they point at, exactly as [`Self::resolves_to_cte`]
+    /// records it for a CTE reference. A consumer asking which physical tables a statement
+    /// touched skips an occurrence that resolves, and one asking what the statement WROTE
+    /// carries the role over to the referent.
+    pub resolves_to_occ: Option<u32>,
 }
 
 impl RelationOccurrence {
@@ -212,6 +255,7 @@ impl StatementGraph {
         let mut b = Builder::default();
         let root = b.push_scope(None, ScopeKind::Statement, None, false);
         b.walk_statement(statement, root);
+        b.resolve_references();
         b.graph
     }
 
@@ -353,7 +397,9 @@ impl StatementGraph {
 pub struct GraphMeasures {
     /// distinct node identities
     pub nodes: usize,
-    /// distinct unordered edges between distinct nodes
+    /// distinct unordered edges. ⚠️ **Loops are edges and are counted**, which is not an
+    /// oversight: under [`StatementGraph::measures_collapsed_by_name`] a self-join becomes one
+    /// node carrying an edge to itself, and dropping it would hide the cycle the mapping made.
     pub edges: usize,
     /// connected components
     pub components: usize,
@@ -421,8 +467,47 @@ impl Builder {
             alias,
             role,
             resolves_to_cte,
+            // Filled by `resolve_references` once the whole statement has been walked: a target
+            // list is written BEFORE the `FROM` it refers to, so nothing to resolve against
+            // exists yet at this point.
+            resolves_to_occ: None,
         });
         occ
+    }
+
+    /// ⛔⛔ A TARGET LIST NAMES RELATIONS THE STATEMENT ALREADY INTRODUCED, AND NAMES THEM BY
+    /// ALIAS. `DELETE o, p FROM orders o JOIN payments p ON ...` wrote four relation mentions
+    /// and opened two tables. Without this the graph said it opened four, two of them called
+    /// `o` and `p`, and the only two the server actually wrote to were filed as reads.
+    ///
+    /// ⚠️ MATCHED ON [`RelationOccurrence::identity`] AND NOT ON THE WRITTEN NAME, because that
+    /// is the rule MySQL itself enforces: a relation given an alias must be referred to by that
+    /// alias and may not be referred to by its table name. So `identity()` is exactly the set of
+    /// names a target list is allowed to use, and matching anything else would invent a
+    /// resolution the server would have rejected.
+    ///
+    /// ⚠️ Scope-local, and that is not a simplification: a target list and the `FROM` it refers
+    /// to are the same statement level by the grammar. A correlated name from an enclosing scope
+    /// cannot be a delete target.
+    fn resolve_references(&mut self) {
+        for i in 0..self.graph.occurrences.len() {
+            let o = &self.graph.occurrences[i];
+            if o.role != RelationRole::DeleteTarget || o.schema_name.is_some() {
+                continue;
+            }
+            let (Some(name), scope) = (o.object_name.clone(), o.scope) else {
+                continue;
+            };
+            let referent = self.graph.occurrences.iter().find(|c| {
+                c.occ != i as u32
+                    && c.scope == scope
+                    && matches!(c.role, RelationRole::From | RelationRole::Join)
+                    && c.identity().as_ref() == Some(&name)
+            });
+            if let Some(r) = referent.map(|r| r.occ) {
+                self.graph.occurrences[i].resolves_to_occ = Some(r);
+            }
+        }
     }
 
     fn cte_in_scope(&self, scope: u32, name: &Bytes) -> Option<u32> {
@@ -557,9 +642,97 @@ impl Builder {
                     self.walk_query(q, body);
                 }
             }
-            // ⚠️ Every other statement form contributes no relation graph. That is a narrower
-            // claim than "names no relation": `ALTER TABLE` and `DROP` name one, and they are
-            // left to `objects()` until a reader needs them as nodes.
+            // ⛔⛔ A READER NEEDS THEM AS NODES NOW, AND THIS ARM USED TO SAY SO AND LEAVE THEM.
+            // `demand.parquet` separates a `ddl` from a `write` because a DDL takes
+            // `MDL_EXCLUSIVE` and blocks every reader of its table while a row write does not —
+            // and the only two statements that reached that role were `CREATE VIEW` and
+            // `CREATE TABLE`, neither of which can block a reader of an existing table, because
+            // the table did not exist. The 32 `ALTER TABLE`s and 11 `DROP`s in the shipped log
+            // contributed no occurrence at all, so the strongest claim that artifact makes about
+            // MySQL applied to nothing in it.
+            //
+            // ⚠️ `AlterTable.name` carries `visit_relation`, so it was at least in `objects()`.
+            // `Drop.names` carries no annotation, so a dropped table was absent from every
+            // artifact in both crates.
+            // ⚠️ `ALTER VIEW` files the same way: it redefines a relation that already exists.
+            Statement::AlterTable { name, .. } | Statement::AlterView { name, .. } => {
+                self.push_occurrence(scope, Some(name), None, RelationRole::AlterTarget);
+            }
+            // ⭐ AN INDEX IS NOT A RELATION, AND THE TABLE IS THE ONE THAT GETS LOCKED.
+            // `CREATE INDEX idx ON invoice (year)` is filed as an alter of `invoice`; `idx` is
+            // named by the statement and is not a thing another statement can contend for, so
+            // it gets no occurrence and no role of its own.
+            Statement::CreateIndex(ci) => {
+                self.push_occurrence(scope, Some(&ci.table_name), None, RelationRole::AlterTarget);
+            }
+            Statement::Truncate { table_names, .. } => {
+                for t in table_names {
+                    self.push_occurrence(
+                        scope,
+                        Some(&t.name),
+                        None,
+                        RelationRole::TruncateTarget,
+                    );
+                }
+            }
+            // ⛔ A RENAME IS A DROP AND A CREATE, AND THAT IS A CLAIM THIS FILE MAKES ON PURPOSE.
+            // It is false about the data — MySQL moves the table rather than rebuilding it — and
+            // exact about the NAMES, which is what a relation graph is about: after
+            // `RENAME TABLE a TO b` nothing can open `a` and `b` is openable where it was not.
+            // Both ends take `MDL_EXCLUSIVE`, so both reach the same class downstream.
+            Statement::RenameTable(renames) => {
+                for r in renames {
+                    self.push_occurrence(scope, Some(&r.old_name), None, RelationRole::DropTarget);
+                    self.push_occurrence(scope, Some(&r.new_name), None, RelationRole::CreateTarget);
+                }
+            }
+            // ⭐⭐ `LockTables.tables` CARRIES NO `visit_relation` ANNOTATION, so a table a client
+            // locked explicitly was invisible to `objects()` and to everything built on it.
+            // ⚠️ The alias is the author's and is kept as the occurrence's identity, exactly as
+            // in a `FROM` clause: `LOCK TABLES invoice AS i READ` names `i`.
+            Statement::LockTables { tables } => {
+                for t in tables {
+                    let role = match t.lock_type {
+                        LockTableType::Write { .. } => RelationRole::LockExclusiveTarget,
+                        LockTableType::Read { .. } => RelationRole::LockSharedTarget,
+                    };
+                    let alias = t.alias.as_ref().map(ident_bytes);
+                    // ⛔ `LockTable.table` IS AN `Ident` AND NOT AN `ObjectName`, so this
+                    // grammar cannot express `LOCK TABLES shop.invoice WRITE` at all — MySQL
+                    // accepts it and `sqlparser` refuses it. The name is lifted into an
+                    // `ObjectName` of one part so it files like every other relation, and a
+                    // lock on a qualified table is a statement this reader files as `invalid`.
+                    let name = ObjectName(vec![ObjectNamePart::Identifier(t.table.clone())]);
+                    self.push_occurrence(scope, Some(&name), alias, role);
+                }
+            }
+            Statement::Analyze { table_name, .. } => {
+                self.push_occurrence(scope, Some(table_name), None, RelationRole::AnalyzeTarget);
+            }
+            Statement::Drop {
+                object_type: ObjectType::Table | ObjectType::View,
+                names,
+                ..
+            } => {
+                for name in names {
+                    self.push_occurrence(scope, Some(name), None, RelationRole::DropTarget);
+                }
+            }
+            // ⚠️ WHAT IS STILL NOT WALKED, AND WHY, because "every other form names nothing" was
+            // wrong twice already:
+            //
+            // | form | names a relation | state |
+            // |---|---|---|
+            // | `FLUSH TABLES t` | `Flush.tables`, **unannotated** | ⛔ not walked — takes a metadata lock and is invisible |
+            // | `SHOW CREATE TABLE t` | `ShowCreate.obj_name`, unannotated | ⛔ not walked — reads the dictionary, opens nothing |
+            // | `EXPLAIN t` / `DESCRIBE t` | `ExplainTable.table_name`, annotated | ⛔ not walked — reads the dictionary |
+            // | `OPTIMIZE` / `CHECK` / `REPAIR TABLE` | — | ⛔ `sqlparser` refuses them outright |
+            // | `DROP INDEX idx ON t` | — | ⛔ `sqlparser` refuses MySQL's form |
+            // | `LOAD DATA INFILE … INTO TABLE t` | — | ⛔ `sqlparser` refuses MySQL's form |
+            //
+            // ⛔ The annotated ones are held by a law rather than by this comment:
+            // `nothing objects() found may be missing from the graph` fires the moment one
+            // appears in a corpus, which is what makes the row above a decision and not a gap.
             _ => {}
         }
     }
@@ -1184,6 +1357,149 @@ mod tests {
         }
     }
 
+    /// ⛔⛔ THE DDL THAT BLOCKS A READER NAMED NOTHING. `demand.parquet` separates `ddl` from
+    /// `write` on the argument that a DDL takes `MDL_EXCLUSIVE` and blocks every reader of its
+    /// table — and the only statements that reached that role were `CREATE VIEW` and
+    /// `CREATE TABLE`, which name a relation that did not exist and so can block nobody. The
+    /// shipped log's 32 `ALTER TABLE`s and 11 `DROP`s contributed no occurrence.
+    ///
+    /// ⚠️ And they are three roles rather than one, because a `CREATE` names a relation that was
+    /// not there before and a `DROP` names one that is not there after.
+    #[test]
+    fn the_ddl_that_can_block_a_reader_names_the_table_it_locks() {
+        // ⚠️ `ALTER TABLE ... DISABLE KEYS`, which is what the shipped log's 32 alters actually
+        // say, is refused by `sqlparser` outright — so those rows are `invalid` and reach no
+        // graph at all. The role has a witness through the forms that do parse.
+        let g = graph("ALTER TABLE `actor` ADD COLUMN last_seen DATETIME");
+        let o = g
+            .occurrences
+            .iter()
+            .find(|o| o.role == RelationRole::AlterTarget)
+            .expect("⛔ ALTER TABLE reached `objects()` and no artifact that has roles");
+        assert_eq!(o.object_name.as_deref(), Some(b"actor".as_ref()));
+
+        let g = graph("DROP TABLE IF EXISTS sakila.film_text, sakila.staff_list");
+        let dropped: Vec<_> = g
+            .occurrences
+            .iter()
+            .filter(|o| o.role == RelationRole::DropTarget)
+            .filter_map(|o| o.object_name.clone())
+            .collect();
+        assert_eq!(dropped.len(), 2, "⛔ `Drop.names` is unannotated: {dropped:?}");
+        assert_eq!(dropped[0].as_ref(), b"film_text");
+
+        // ⚠️ And the schema survives, which is what lets a dropped table join a demand layer.
+        let schemas: Vec<_> = g
+            .occurrences
+            .iter()
+            .filter_map(|o| o.schema_name.clone())
+            .collect();
+        assert_eq!(schemas.len(), 2);
+    }
+
+    /// ⭐⭐⭐ THE LOCK THE LOG MEASURES THE WAIT FOR, AND THE STATEMENT THAT TAKES IT.
+    ///
+    /// `Lock_time` in a slow log is table-level and metadata lock wait. `LOCK TABLES` is how a
+    /// client asks for precisely that, `mysqldump` writes one before every table it restores,
+    /// and `LockTables.tables` carries no `visit_relation` annotation — so the sixteen explicit
+    /// write locks in the shipped corpus reached no artifact in either crate.
+    ///
+    /// ⚠️ The two modes are two roles because they exclude different things: a read lock admits
+    /// other readers and shuts out writers; a write lock shuts out both.
+    #[test]
+    fn an_explicit_table_lock_names_the_table_it_holds_and_in_which_mode() {
+        let g = graph("LOCK TABLES invoice WRITE, catalog AS c READ LOCAL");
+        let got: Vec<(RelationRole, String, Option<String>)> = g
+            .occurrences
+            .iter()
+            .map(|o| {
+                let name = String::from_utf8(o.object_name.clone().unwrap().to_vec()).unwrap();
+                let alias = o
+                    .alias
+                    .clone()
+                    .map(|a| String::from_utf8(a.to_vec()).unwrap());
+                (o.role, name, alias)
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (RelationRole::LockExclusiveTarget, "invoice".into(), None),
+                (
+                    RelationRole::LockSharedTarget,
+                    "catalog".into(),
+                    Some("c".into())
+                ),
+            ]
+        );
+
+        // ⛔ AND THE GRAMMAR CANNOT SAY IT ABOUT A QUALIFIED TABLE. `LockTable.table` is an
+        // `Ident`, so `LOCK TABLES shop.invoice WRITE` — valid MySQL — is refused outright and
+        // becomes an `invalid` entry with no graph. That is the grammar's regime and not the
+        // server's, and the two are different claims.
+        use sqlparser::dialect::MySqlDialect;
+        use sqlparser::parser::Parser as SqlParser;
+        assert!(SqlParser::parse_sql(&MySqlDialect {}, "LOCK TABLES shop.i WRITE").is_err());
+    }
+
+    /// ⭐ THE REST OF THE WALK, each form the reason it is here.
+    ///
+    /// | statement | files | because |
+    /// |---|---|---|
+    /// | `TRUNCATE t` | `TruncateTarget` | InnoDB drops and recreates the tablespace — `MDL_EXCLUSIVE`, not row locks |
+    /// | `CREATE INDEX i ON t` | `AlterTarget` on `t` | ⭐ the index is not a relation; the table is what gets locked |
+    /// | `RENAME TABLE a TO b` | `DropTarget` + `CreateTarget` | ⛔ false about the data, exact about the names |
+    /// | `ALTER VIEW v` | `AlterTarget` | it redefines a relation that already exists |
+    /// | `ANALYZE TABLE t` | `AnalyzeTarget` | ⚠️ single-table only — this grammar refuses MySQL's list form |
+    #[test]
+    fn the_rest_of_the_statements_that_name_a_relation_name_it() {
+        let roles = |sql: &str| -> Vec<(RelationRole, String)> {
+            graph(sql)
+                .occurrences
+                .iter()
+                .map(|o| {
+                    (
+                        o.role,
+                        String::from_utf8(o.object_name.clone().unwrap().to_vec()).unwrap(),
+                    )
+                })
+                .collect()
+        };
+        use RelationRole::*;
+        assert_eq!(
+            roles("TRUNCATE TABLE invoice, catalog"),
+            vec![
+                (TruncateTarget, "invoice".into()),
+                (TruncateTarget, "catalog".into())
+            ]
+        );
+        assert_eq!(
+            roles("CREATE INDEX idx_year ON shop.invoice (year)"),
+            vec![(AlterTarget, "invoice".into())],
+            "the index is not a relation and the table is the one that gets locked"
+        );
+        assert_eq!(
+            roles("RENAME TABLE invoice TO invoice_old"),
+            vec![
+                (DropTarget, "invoice".into()),
+                (CreateTarget, "invoice_old".into())
+            ]
+        );
+        assert_eq!(
+            roles("ALTER VIEW invoice_summary AS SELECT id FROM invoice")[0].0,
+            AlterTarget
+        );
+        assert_eq!(
+            roles("ANALYZE TABLE shop.invoice"),
+            vec![(AnalyzeTarget, "invoice".into())]
+        );
+
+        // ⛔ THE SCHEMA SURVIVES WHERE THE GRAMMAR CARRIES ONE, which is what lets these join a
+        // demand layer rather than degenerating to a bare name.
+        let g = graph("CREATE INDEX idx_year ON shop.invoice (year)");
+        assert_eq!(g.occurrences[0].schema_name.as_deref(), Some(b"shop".as_ref()));
+    }
+
     /// ⛔ `Delete.tables` carries no `visit_relation` annotation, so MySQL's multi-table delete
     /// target list is absent from `objects()` while the `FROM` side is present.
     #[test]
@@ -1195,6 +1511,57 @@ mod tests {
             .filter(|o| o.role == RelationRole::DeleteTarget)
             .count();
         assert_eq!(targets, 2);
+    }
+
+    /// ⛔⛔ AND THE TARGETS ARE NOT RELATIONS OF THEIR OWN, which is what the count above could
+    /// not see. MySQL names a multi-table delete's targets **by alias**, so
+    /// `DELETE o, p FROM orders o JOIN payments p` put two relations called `o` and `p` into the
+    /// graph — tables that do not exist — while recording no write against `orders` or
+    /// `payments` at all. Anything asking which physical tables a statement touched got two
+    /// phantoms and two reads where there were two reads and two writes.
+    #[test]
+    fn a_delete_target_written_as_an_alias_resolves_to_the_relation_it_names() {
+        let g = graph(
+            "DELETE o, p FROM orders o JOIN payments p ON p.order_id = o.id WHERE o.total > 5",
+        );
+        let by = |occ: u32| g.occurrences.iter().find(|o| o.occ == occ).unwrap();
+        let targets: Vec<&RelationOccurrence> = g
+            .occurrences
+            .iter()
+            .filter(|o| o.role == RelationRole::DeleteTarget)
+            .collect();
+        assert_eq!(targets.len(), 2);
+        for t in &targets {
+            let r = t
+                .resolves_to_occ
+                .unwrap_or_else(|| panic!("{:?} resolves to nothing", t.object_name));
+            // The referent is a real relation, and the alias the target used is its identity.
+            assert_eq!(by(r).identity(), t.object_name);
+            assert!(by(r).object_name.is_some());
+            assert_ne!(by(r).object_name, t.object_name);
+        }
+        let named: Vec<Option<Bytes>> = targets
+            .iter()
+            .map(|t| by(t.resolves_to_occ.unwrap()).object_name.clone())
+            .collect();
+        assert_eq!(
+            named,
+            vec![Some(Bytes::from("orders")), Some(Bytes::from("payments"))]
+        );
+
+        // ⭐ NON-VACUITY FROM THE OTHER SIDE: a target list written with the table names rather
+        // than aliases resolves too, because then the table name IS the identity.
+        let g2 = graph("DELETE t1, t2 FROM t1 JOIN t2 ON t1.id = t2.t1_id");
+        assert!(g2
+            .occurrences
+            .iter()
+            .filter(|o| o.role == RelationRole::DeleteTarget)
+            .all(|o| o.resolves_to_occ.is_some()));
+
+        // ⛔ AND A RELATION THAT NAMES ITSELF RESOLVES TO NOTHING, which is what stops this from
+        // marking every occurrence as a reference. A single-table delete has no target list.
+        let g3 = graph("DELETE FROM orders WHERE id = 1");
+        assert!(g3.occurrences.iter().all(|o| o.resolves_to_occ.is_none()));
     }
 
     #[test]
