@@ -87,6 +87,7 @@ struct EntryContext {
     user: Option<SessionLine>,
     stats: Option<StatsLine>,
     set_timestamp: Option<u32>,
+    use_database: Option<Bytes>,
     attributes: Option<EntrySqlAttributes>,
 }
 
@@ -168,7 +169,16 @@ impl EntryCodec {
             }
             CodecExpect::UseDatabase => {
                 let _ = multispace0(i)?;
-                let _ = opt(use_database).parse_next(i)?;
+                // ⛔⛔ THIS WAS `let _ =`. The author said which schema every unqualified
+                // relation in the entry belongs to, the parser read it, and the codec threw it
+                // on the floor -- so `film` filed with no schema while the log said
+                // `use sakila;` two lines earlier.
+                //
+                // ⚠️ AND IT IS FILED ONLY WHERE THE LOG SAID IT. `USE` is sticky per connection
+                // and MySQL writes it when the database CHANGES, so later entries on the same
+                // thread inherit a database this entry never mentions. Carrying it forward is a
+                // reader's inference over the thread, and it belongs to whoever draws it.
+                self.context.use_database = opt(use_database).parse_next(i)?;
 
                 self.context.expects = CodecExpect::StartTimeStamp;
                 None
@@ -193,6 +203,13 @@ impl EntryCodec {
                 if let Some(c) = opt(admin_command).parse_next(i)? {
                     self.context.attributes = Some(EntrySqlAttributes {
                         sql: (c.command.clone()),
+                        // ⚠️ `None`, because a different parser consumed the line and its
+                        // framing. `sql` above is still the log's own bytes here -- the command
+                        // word -- so nothing is lost; there is simply no *statement* text to
+                        // file. `statement_kind` says which rows these are.
+                        sql_raw: None,
+                        literals: Vec::new(),
+                        use_database: self.context.use_database.clone(),
                         statement: EntryStatement::AdminCommand(c),
                     });
                 } else {
@@ -204,9 +221,21 @@ impl EntryCodec {
 
                     let mut sql_lines = sql_lines(i)?;
 
-                    let s = if let Ok(s) =
+                    // ⭐⭐ THE AUTHOR'S OWN BYTES, KEPT. `Bytes` is refcounted, so this costs an
+                    // atomic increment and no copy -- and without it line ~230 below overwrites
+                    // the only surviving record of what the author wrote. That reassignment made
+                    // PARSE SUCCESS the thing that destroys the document: the 131 statements
+                    // nobody could read keep their text, and the 163 that parsed do not.
+                    //
+                    // ⭐ It also carries every literal as text even when masking is on, because
+                    // masking happens inside `parse_sql` and touches only the tree.
+                    let sql_raw = sql_lines.clone();
+                    let mut literals = Vec::new();
+
+                    let s = if let Ok((s, ls)) =
                         parse_sql(&String::from_utf8_lossy(&sql_lines), &self.config.masking)
                     {
+                        literals = ls;
                         if s.len() == 1 {
                             // ⭐⭐ NO MAPPER NOW CARRIES THE COMMENT THROUGH, RATHER THAN
                             // DISCARDING IT. `map_comment_context` defaults to `None`, and
@@ -242,6 +271,9 @@ impl EntryCodec {
 
                     self.context.attributes = Some(EntrySqlAttributes {
                         sql: sql_lines,
+                        sql_raw: Some(sql_raw),
+                        literals,
+                        use_database: self.context.use_database.clone(),
                         //-- TODO: pull this from the Entry Statement
                         statement: s,
                     });
@@ -420,7 +452,7 @@ SET timestamp=1517798807;
         let stmts = parse_sql(sql, &EntryMasking::None).unwrap();
 
         let expected_stmt = EntrySqlStatement {
-            statement: stmts.get(0).unwrap().clone(),
+            statement: stmts.0.first().unwrap().clone(),
             context: SqlStatementContext::new(HashMap::from([
                 (Bytes::from("request_id"), Bytes::from("apLo5wdqkmKw4W7vGfiBc5")),
                 (Bytes::from("file"), Bytes::from("src/endpoints/original/mod.rs")),
@@ -451,6 +483,12 @@ SET timestamp=1517798807;
                 rows_examined: 0,
             },
             sql_attributes: EntrySqlAttributes {
+                sql_raw: Some(sql.trim().into()),
+                literals: vec![],
+                // ⭐ The fixture entry is preceded by `use mysql;`, and until this commit the
+                // codec bound that to `_`. The author said which schema their unqualified
+                // relations live in and the record threw it away.
+                use_database: Some("mysql".into()),
                 sql: Bytes::from(expected_sql),
                 statement: SqlStatement(expected_stmt),
             },
@@ -804,5 +842,92 @@ mod graph_census {
         // ⭐ And the quoting defect, sized: 46 names `objects()` reports wrapped in backticks and
         // the graph reports bare.
         assert_eq!(quoted, 46, "names objects() spells with backticks");
+    }
+}
+
+/// ⭐⭐ WHAT THE AUTHOR WROTE, AGAINST WHAT THE READER MADE OF IT.
+///
+/// `EntrySqlAttributes::sql` is the AST rendered back to text on every statement that parsed, so
+/// until `sql_raw` existed **parse success was the thing that destroyed the document**: the 131
+/// statements nobody could read kept their bytes and the 163 that parsed did not.
+#[cfg(test)]
+mod the_author_and_the_reader {
+    use crate::codec::EntryCodec;
+    use crate::{EntryStatement, LiteralKind};
+    use futures::StreamExt;
+    use tokio::fs::File;
+    use tokio_util::codec::Framed;
+
+    #[tokio::test]
+    async fn the_render_is_not_the_document_and_now_both_are_kept() {
+        let f = File::open("assets/slow-test-queries.log").await.unwrap();
+        let mut ff = Framed::new(f, EntryCodec::default());
+
+        let (mut n, mut parsed, mut differs, mut newlines_lost, mut lowercase) = (0, 0, 0, 0, 0);
+        let (mut with_db, mut literals, mut entries_with_literals) = (0, 0usize, 0);
+        let mut kinds = std::collections::BTreeMap::new();
+
+        while let Some(r) = ff.next().await {
+            let e = r.unwrap();
+            n += 1;
+            let a = &e.sql_attributes;
+
+            if a.use_database.is_some() {
+                with_db += 1;
+            }
+            literals += a.literals.len();
+            if !a.literals.is_empty() {
+                entries_with_literals += 1;
+            }
+            for l in &a.literals {
+                *kinds.entry(l.kind).or_insert(0) += 1;
+            }
+
+            match &a.statement {
+                EntryStatement::SqlStatement(_) => {
+                    parsed += 1;
+                    let raw = String::from_utf8_lossy(
+                        a.sql_raw.as_ref().expect("a parsed statement has raw bytes"),
+                    )
+                    .to_string();
+                    let rendered = String::from_utf8_lossy(&a.sql).to_string();
+                    if raw.trim_end().trim_end_matches(';') != rendered {
+                        differs += 1;
+                    }
+                    if raw.contains('\n') && !rendered.contains('\n') {
+                        newlines_lost += 1;
+                    }
+                    if raw.contains("select ") || raw.contains("from ") {
+                        lowercase += 1;
+                    }
+                }
+                // ⚠️ An administrator command has no statement text: a different parser consumed
+                // the line and its framing. `sql` there is still the log's own bytes.
+                EntryStatement::AdminCommand(_) => assert!(a.sql_raw.is_none()),
+                // ⭐ And an unparseable statement kept its bytes all along -- which is the
+                // inversion this commit is about.
+                EntryStatement::InvalidStatement(_) => assert!(a.sql_raw.is_some()),
+            }
+        }
+
+        assert_eq!((n, parsed), (310, 163));
+
+        // ⭐⭐ SIXTY-ONE PER CENT OF THE PARSED STATEMENTS ARE NOT WHAT THE AUTHOR WROTE, and
+        // that column is what a consumer's coarsening ladder calls its byte-identity floor.
+        assert_eq!(differs, 99);
+        assert_eq!(newlines_lost, 59, "multi-line statements flattened to one");
+        assert_eq!(lowercase, 9, "keywords the author did not capitalise");
+
+        // ⭐ The author's subject, recovered -- and recovered whether or not masking is on,
+        // because the bytes carry it even when the tree does not.
+        assert_eq!(literals, 302);
+        assert_eq!(entries_with_literals, 80);
+        assert_eq!(kinds.get(&LiteralKind::Number), Some(&98));
+        assert_eq!(kinds.get(&LiteralKind::SingleQuotedString), Some(&204));
+
+        // ⚠️ Thin, and not zero. `USE` is written only when the database CHANGES, so two
+        // statements in this log carry one and 308 inherit it -- an inference this crate
+        // declines to draw. Before this commit the answer was 0, by `let _ =`.
+        assert_eq!(with_db, 2);
     }
 }

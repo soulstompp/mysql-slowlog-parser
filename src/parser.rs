@@ -1,7 +1,7 @@
 use crate::EntryMasking;
 use std::ops::ControlFlow;
 use bytes::{BufMut, Bytes, BytesMut};
-use sqlparser::ast::{Expr, Statement, Value, visit_expressions_mut};
+use sqlparser::ast::{Statement, Value, VisitMut, VisitorMut};
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::{Parser as SQLParser, ParserError};
 use sqlparser::tokenizer::Tokenizer;
@@ -556,55 +556,131 @@ pub fn start_timestamp_command(i: &mut Stream) -> ModalResult<u32> {
     .parse_next(i)
 }
 
-/// Parses one or more SQL statements, optionally replacing every literal **value** with a `?`.
+/// One literal value the author wrote.
 ///
-/// With `EntryMasking::None` this is `sqlparser::parse_statements` and nothing else.
-pub fn parse_sql(sql: &str, mask: &EntryMasking) -> Result<Vec<Statement>, ParserError> {
+/// ⭐⭐ THE AUTHOR'S SUBJECT, AND THE RECORD USED TO THROW IT AWAY. `WHERE tenant_id = 42` is a
+/// claim about which rows the statement was about. Masking replaces it with `?`, which is a
+/// READER's assertion that two authors' subjects are interchangeable. Filing the literal is what
+/// makes masking a grouping choice rather than an edit to somebody else's document.
+///
+/// ⚠️ NO SOURCE POSITION, and the reason is not an oversight. The span lives on
+/// `sqlparser::ast::ValueWithSpan`, which derives `Visit` but carries no `visit(with = ...)`
+/// annotation -- so no visitor hook ever sees it. [`EntryLiteral::ordinal`] is the position, and
+/// it is exact rather than approximate because ONE pass both records and masks, so the two can
+/// never fall out of step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntryLiteral {
+    /// Position in the statement's own value order, counting from zero.
+    ///
+    /// ⛔ Deterministic: the traversal is depth-first in field-declaration order, emitted by
+    /// `sqlparser_derive` and pinned by that crate's own doctests. ⚠️ It is stable *within* a
+    /// `sqlparser` version and nothing promises it across one.
+    pub ordinal: u32,
+    /// The literal as the author wrote it, quoting and all.
+    pub rendered: Bytes,
+    /// The payload without its quoting -- what a reader groups by.
+    pub value: Bytes,
+    /// Which kind of literal it is.
+    pub kind: LiteralKind,
+}
+
+/// What kind of literal an [`EntryLiteral`] is.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LiteralKind {
+    /// a numeric literal
+    Number,
+    /// `'...'`
+    SingleQuotedString,
+    /// `"..."`
+    DoubleQuotedString,
+    /// `N'...'`
+    NationalString,
+    /// `E'...'`
+    EscapedString,
+    /// `X'...'`
+    HexString,
+}
+
+/// Parses one or more SQL statements and returns them with every literal the author wrote.
+///
+/// With `EntryMasking::PlaceHolder` the returned statements carry `?` in place of each literal;
+/// the literals come back either way, so **the author's subject survives masking**.
+pub fn parse_sql(
+    sql: &str,
+    mask: &EntryMasking,
+) -> Result<(Vec<Statement>, Vec<EntryLiteral>), ParserError> {
     let mut tokenizer = Tokenizer::new(&MySqlDialect {}, sql);
     let tokens = tokenizer.tokenize()?;
 
     let mut parser = SQLParser::new(&MySqlDialect {}).with_tokens(tokens);
     let mut statements = parser.parse_statements()?;
 
-    // ⛔⛔ MASKED AFTER THE PARSE AND NEVER BEFORE IT. Replacing tokens first destroys
-    // statements that are perfectly well formed: a number inside a type declaration is not a
-    // value, and `CHAR(?)`, `DECIMAL(?,?)` and `INT(?)` are not SQL. On the log this crate is
-    // tested against that cost **35 of 163 parses** -- `CREATE TABLE` and `ALTER TABLE`, every
-    // one of them -- and the consumer's default is to mask, so the default was the lossy one.
-    //
-    // ⭐ After the parse the question does not arise, because the tokenizer's ambiguity is gone:
-    // a type parameter is not an `Expr` and a value is, so masking expressions cannot reach one.
-    if mask == &EntryMasking::PlaceHolder {
-        for s in statements.iter_mut() {
-            mask_values(s);
-        }
+    let mut pass = LiteralPass {
+        literals: Vec::new(),
+        mask: mask == &EntryMasking::PlaceHolder,
+    };
+    for s in statements.iter_mut() {
+        let _ = s.visit(&mut pass);
     }
 
-    Ok(statements)
+    Ok((statements, pass.literals))
 }
 
-/// Replaces every literal **value** in a parsed statement with a `?` placeholder.
+/// Records every literal in a statement, and replaces it where asked, in ONE traversal.
 ///
-/// ⚠️ Values only. A type's length, a precision and a scale are numbers the grammar requires and
-/// are not values; they are untouched because they are not expressions.
-fn mask_values(statement: &mut Statement) {
-    let _ = visit_expressions_mut(statement, |e| {
-        if let Expr::Value(v) = e {
-            let literal = matches!(
-                v.value,
-                Value::Number(..)
-                    | Value::SingleQuotedString(_)
-                    | Value::DoubleQuotedString(_)
-                    | Value::NationalStringLiteral(_)
-                    | Value::EscapedStringLiteral(_)
-                    | Value::HexStringLiteral(_)
-            );
-            if literal {
-                *e = Expr::value(Value::Placeholder("?".to_string()));
-            }
+/// ⛔⛔ AFTER THE PARSE AND NEVER BEFORE IT. Replacing tokens first destroys statements that are
+/// perfectly well formed: a number inside a type declaration is not a value, and `CHAR(?)`,
+/// `DECIMAL(?,?)` and `INT(?)` are not SQL. That cost **35 of 163 parses** on this crate's own
+/// fixture -- every `CREATE TABLE` and `ALTER TABLE` -- and the consumer's default is to mask, so
+/// the default was the lossy one. After the parse the ambiguity is gone: a type parameter is not
+/// a `Value` and a literal is.
+///
+/// ⛔ `pre_visit_value` AND NOT `Expr::Value`, which is what this used to match on.
+/// `Expr::TypedString` (`DATE '2020-01-01'`) and `Expr::MatchAgainst` (MySQL's
+/// `AGAINST ('term')`) hold a `Value` without being one, so an `Expr`-shaped pass neither masked
+/// them nor could have recorded them.
+///
+/// ⚠️ It reaches a few `Value`s that are not row-selecting -- a `CEIL(x TO 2)` scale, a
+/// `TABLESAMPLE` seed. Those are grammar, not subject, and masking them is wrong in the same way
+/// masking a type parameter was. It cannot break a parse the way the old route did, because the
+/// tree already exists; `a_masked_statement_still_parses` is what holds that.
+struct LiteralPass {
+    literals: Vec<EntryLiteral>,
+    mask: bool,
+}
+
+impl VisitorMut for LiteralPass {
+    type Break = ();
+
+    fn pre_visit_value(&mut self, value: &mut Value) -> ControlFlow<Self::Break> {
+        let (kind, payload) = match value {
+            Value::Number(n, _) => (LiteralKind::Number, n.clone()),
+            Value::SingleQuotedString(v) => (LiteralKind::SingleQuotedString, v.clone()),
+            Value::DoubleQuotedString(v) => (LiteralKind::DoubleQuotedString, v.clone()),
+            Value::NationalStringLiteral(v) => (LiteralKind::NationalString, v.clone()),
+            Value::EscapedStringLiteral(v) => (LiteralKind::EscapedString, v.clone()),
+            Value::HexStringLiteral(v) => (LiteralKind::HexString, v.clone()),
+            // ⛔ A boolean, a NULL and a placeholder are not the author's subject: `TRUE` names
+            // no rows and `?` was never theirs. Recording them would put the reader's own
+            // placeholder into a column of the author's values.
+            _ => return ControlFlow::Continue(()),
+        };
+
+        self.literals.push(EntryLiteral {
+            ordinal: self.literals.len() as u32,
+            rendered: Bytes::from(value.to_string()),
+            value: Bytes::from(payload),
+            kind,
+        });
+
+        if self.mask {
+            // ⭐ The INNER value, not the wrapper. `Expr::value(..)` builds a fresh
+            // `ValueWithSpan` through `with_empty_span()`, which throws away a span this crate
+            // may one day populate. Assigning through `&mut Value` leaves the wrapper alone.
+            *value = Value::Placeholder("?".to_string());
         }
-        ControlFlow::<()>::Continue(())
-    });
+        ControlFlow::Continue(())
+    }
 }
 
 
@@ -873,8 +949,8 @@ mod tests {
            WHERE a > b AND b < 1000 \
            ORDER BY a DESC, b";
 
-        let ast0 = parse_sql(sql0, &EntryMasking::PlaceHolder).unwrap();
-        let ast1 = parse_sql(sql1, &EntryMasking::PlaceHolder).unwrap();
+        let ast0 = parse_sql(sql0, &EntryMasking::PlaceHolder).unwrap().0;
+        let ast1 = parse_sql(sql1, &EntryMasking::PlaceHolder).unwrap().0;
 
         assert_eq!(ast0, ast1);
     }
@@ -1020,14 +1096,14 @@ mod masking_is_not_destructive {
     fn a_value_is_still_replaced() {
         let one = parse_sql("SELECT * FROM t WHERE id = 1 AND name = 'a'", &PlaceHolder).unwrap();
         let two = parse_sql("SELECT * FROM t WHERE id = 2 AND name = 'b'", &PlaceHolder).unwrap();
-        assert_eq!(one[0].to_string(), two[0].to_string());
-        assert!(one[0].to_string().contains('?'), "{}", one[0]);
+        assert_eq!(one.0[0].to_string(), two.0[0].to_string());
+        assert!(one.0[0].to_string().contains('?'), "{}", one.0[0]);
 
         // ⛔ NOT VACUOUS: unmasked, the same two statements differ. A masker that replaced
         // nothing would pass the first assertion on two identical inputs.
         let a = parse_sql("SELECT * FROM t WHERE id = 1", &NoMask).unwrap();
         let b = parse_sql("SELECT * FROM t WHERE id = 2", &NoMask).unwrap();
-        assert_ne!(a[0].to_string(), b[0].to_string());
+        assert_ne!(a.0[0].to_string(), b.0[0].to_string());
     }
 
     /// ⚠️ Masking must not change WHICH statements parse at all, in either direction.
@@ -1046,5 +1122,140 @@ mod masking_is_not_destructive {
                 "{sql}"
             );
         }
+    }
+}
+
+/// ⭐⭐ THE AUTHOR'S SUBJECT SURVIVES MASKING, AND THE MASK STAYS A MASK.
+#[cfg(test)]
+mod the_author_keeps_their_literals {
+    use crate::EntryMasking::{None as NoMask, PlaceHolder};
+    use crate::parser::{LiteralKind, parse_sql};
+
+    fn rendered(sql: &str, mask: &crate::EntryMasking) -> (String, Vec<String>) {
+        let (s, ls) = parse_sql(sql, mask).unwrap();
+        (
+            s[0].to_string(),
+            ls.iter()
+                .map(|l| String::from_utf8_lossy(&l.rendered).into_owned())
+                .collect(),
+        )
+    }
+
+    /// ⭐ The literals come back whether or not the statement is masked, so a reader can group on
+    /// the mask and still ask which subject. Before this they existed only inside the AST, which
+    /// masking then overwrote.
+    #[test]
+    fn the_literals_are_recorded_under_either_masking() {
+        let sql = "SELECT * FROM t WHERE tenant_id = 42 AND status = 'open' LIMIT 10";
+
+        let (plain, plain_ls) = rendered(sql, &NoMask);
+        let (masked, masked_ls) = rendered(sql, &PlaceHolder);
+
+        assert_eq!(plain_ls, vec!["42", "'open'", "10"]);
+        assert_eq!(masked_ls, plain_ls, "masking must not change what was recorded");
+
+        assert!(plain.contains("42") && plain.contains("'open'"), "{plain}");
+        assert!(!masked.contains("42"), "{masked}");
+        assert_eq!(masked.matches('?').count(), 3, "{masked}");
+    }
+
+    /// ⛔ THE GAP THE OLD `Expr::Value` PASS HAD. `DATE '2020-01-01'` is an `Expr::TypedString`
+    /// and MySQL's `AGAINST ('term')` is an `Expr::MatchAgainst`; each holds a `Value` without
+    /// being one, so an `Expr`-shaped pass neither masked them nor could have recorded them.
+    #[test]
+    fn a_value_that_is_not_an_expr_value_is_still_the_authors() {
+        for (sql, expected) in [
+            ("SELECT * FROM t WHERE d > DATE '2020-01-01'", "'2020-01-01'"),
+            (
+                "SELECT * FROM t WHERE MATCH(body) AGAINST ('needle')",
+                "'needle'",
+            ),
+        ] {
+            let (_, ls) = rendered(sql, &NoMask);
+            assert!(
+                ls.iter().any(|l| l == expected),
+                "{sql} -> {ls:?} is missing {expected}"
+            );
+            let (masked, _) = rendered(sql, &PlaceHolder);
+            assert!(!masked.contains(expected), "{masked}");
+        }
+    }
+
+    /// ⛔⛔ A MASKED STATEMENT MUST STILL BE SQL. `pre_visit_value` reaches every `Value` in the
+    /// tree, including a few that are grammar rather than subject -- a `CEIL(x TO 2)` scale, a
+    /// `TABLESAMPLE` seed. Masking after the parse cannot break the parse the way masking tokens
+    /// did, but it can render something that will not parse again, and a digest nobody can
+    /// re-read is not a digest.
+    #[test]
+    fn a_masked_statement_still_parses() {
+        for sql in [
+            "SELECT * FROM t WHERE id = 1",
+            "CREATE TABLE t (c CHAR(60), d DECIMAL(10,2))",
+            "INSERT INTO t VALUES (1, 'x', 2.5)",
+            "SELECT SUBSTR(name, 1, 3) FROM t LIMIT 10 OFFSET 5",
+            "SELECT * FROM t WHERE d > DATE '2020-01-01'",
+            "UPDATE t SET amount = 1.5 WHERE id = 3",
+        ] {
+            let (masked, _) = rendered(sql, &PlaceHolder);
+            assert!(
+                parse_sql(&masked, &NoMask).is_ok(),
+                "masked rendering will not re-parse: {sql} -> {masked}"
+            );
+        }
+    }
+
+    /// ⭐⭐ THE ROUND TRIP, which is what makes the record a record rather than a note. Writing
+    /// the filed literals back into the masked statement in the order they were taken must
+    /// reproduce exactly what the author wrote.
+    ///
+    /// ⛔ The order is why ONE pass does both jobs. `visit_expressions` is pre-order and
+    /// `visit_expressions_mut` is post-order, so a collector and a masker on those two hooks
+    /// would disagree on every nested expression and nothing about the result would look wrong.
+    #[test]
+    fn the_literals_and_the_mask_reconstruct_the_author() {
+        for sql in [
+            "SELECT * FROM t WHERE tenant_id = 42 AND status = 'open' LIMIT 10",
+            "INSERT INTO t VALUES (1, 'x', 2.5), (3, 'y', 4.5)",
+            "SELECT CONCAT('a', (SELECT max(n) FROM u WHERE k = 7)) FROM t WHERE j = 'z'",
+            "UPDATE t SET amount = 1.5, note = 'done' WHERE id = 3",
+        ] {
+            let (masked, ls) = rendered(sql, &PlaceHolder);
+            let (plain, _) = rendered(sql, &NoMask);
+
+            // Replace each `?` with the literal of the same ordinal.
+            let mut out = String::new();
+            let mut rest = masked.as_str();
+            for l in &ls {
+                let i = rest.find('?').expect("one placeholder per recorded literal");
+                out.push_str(&rest[..i]);
+                out.push_str(l);
+                rest = &rest[i + 1..];
+            }
+            out.push_str(rest);
+
+            assert_eq!(out, plain, "round trip failed for: {sql}");
+            assert!(!out.contains('?'), "a literal was left unaccounted for: {out}");
+        }
+    }
+
+    #[test]
+    fn a_kind_travels_with_every_literal() {
+        let (_, ls) = parse_sql(
+            "SELECT * FROM t WHERE a = 1 AND b = 'x' AND c = X'ff'",
+            &NoMask,
+        )
+        .unwrap();
+        let kinds: Vec<_> = ls.iter().map(|l| l.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                LiteralKind::Number,
+                LiteralKind::SingleQuotedString,
+                LiteralKind::HexString
+            ]
+        );
+        // ⭐ The payload is the value WITHOUT its quoting, which is what a reader groups by.
+        assert_eq!(String::from_utf8_lossy(&ls[1].value), "x");
+        assert_eq!(String::from_utf8_lossy(&ls[1].rendered), "'x'");
     }
 }

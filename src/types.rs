@@ -1,4 +1,5 @@
 use crate::graph::StatementGraph;
+use crate::parser::EntryLiteral;
 use crate::{EntryAdminCommand, SessionLine, SqlStatementContext, StatsLine};
 use bytes::{BufMut, Bytes, BytesMut};
 use sqlparser::ast::{Statement, visit_relations};
@@ -520,8 +521,28 @@ impl EntrySession {
 /// struct with information about the Entry's SQL query
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntrySqlAttributes {
-    /// the sql for this entry, possibly with values replaced by parameters
+    /// The reader's rendering: for a parsed statement this is the AST rendered back to text,
+    /// for an admin command the command word, for an unparseable statement the log's bytes.
+    ///
+    /// ⚠️ THREE DIFFERENT THINGS, and [`Self::statement`]'s arm is what says which.
     pub sql: Bytes,
+    /// ⭐⭐ THE AUTHOR'S OWN BYTES, exactly as the log carried them, `;` included.
+    ///
+    /// `None` only for an administrator command, where a different parser consumed the line and
+    /// its framing -- and there `sql` is already the log's own bytes, so nothing is lost.
+    ///
+    /// This is the ONLY record of keyword case, line layout, in-statement comments and the
+    /// author's unmasked literals. `sql` above discards all of it for exactly the statements
+    /// that parsed.
+    pub sql_raw: Option<Bytes>,
+    /// Every literal the author wrote, in traversal order, whether or not masking is on.
+    pub literals: Vec<EntryLiteral>,
+    /// The database the log said was current, where it said so.
+    ///
+    /// ⚠️ `USE` is sticky per connection and MySQL writes it only when the database CHANGES, so
+    /// this is `None` on every entry that did not itself carry one. Carrying it forward along a
+    /// thread is a reader's inference.
+    pub use_database: Option<Bytes>,
     /// the `EntryStatement for this entry
     pub statement: EntryStatement,
 }

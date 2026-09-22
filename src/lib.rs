@@ -52,7 +52,10 @@ use std::default::Default;
 use std::fmt::{Debug, Formatter};
 use thiserror::Error;
 
-pub use crate::parser::{EntryAdminCommand, SessionLine, SqlStatementContext, StatsLine, TimeLine};
+pub use crate::parser::{
+    EntryAdminCommand, EntryLiteral, LiteralKind, SessionLine, SqlStatementContext, StatsLine,
+    TimeLine,
+};
 
 use bytes::Bytes;
 
