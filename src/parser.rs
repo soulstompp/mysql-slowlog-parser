@@ -21,7 +21,10 @@ use winnow::combinator::repeat;
 use winnow::combinator::{alt, trace};
 use winnow::combinator::{not, opt};
 use winnow::combinator::{preceded, terminated};
-use winnow::error::{ContextError, ErrMode, InputError};
+use winnow::error::{ContextError, ErrMode, InputError, Needed};
+// ⚠️ Aliased: `sqlparser` exports a `ParserError` of its own and both are used in this file.
+use winnow::error::ParserError as WinnowError;
+use winnow::stream::{AsBytes, StreamIsPartial};
 use winnow::token::{any, literal, take, take_till, take_until};
 use winnow::{ModalResult, Parser, Partial, seq};
 use winnow_datetime::DateTime;
@@ -164,42 +167,85 @@ pub fn log_header<'a>(i: &mut Stream<'_>) -> ModalResult<HeaderLines> {
     }).parse_next(i)
 }
 
-pub fn sql_lines<'a>(i: &mut Stream<'_>) -> ModalResult<Bytes> {
+/// The statement's bytes, up to and including the first `;` that is not inside a quote.
+///
+/// ⛔⛔⛔ THE QUOTE STATE WAS A **STACK**, AND SQL QUOTING DOES NOT NEST — SO AN APOSTROPHE
+/// INSIDE A DOUBLE-QUOTED STRING SWALLOWED THE REST OF THE LOG. `"it's here"` pushed `"`, then
+/// pushed `'` because it did not match the top, then pushed a second `"` for the same reason:
+/// the stack never emptied, no `;` ever terminated the statement, and the scan ran to the end
+/// of the file. The decoder then reports `bytes remaining on stream` — which the analyzer
+/// files as `Coverage::Truncated` — so **one apostrophe in one string silently truncates the
+/// corpus at that entry**. Measured: the statement above, in a two-entry log, loses both.
+///
+/// ⚠️ It is not an exotic input. `"O'Brien"`, `"don't"`, `'he said "no"'` — any English text in
+/// a string quoted the other way. What hid it is that both fixtures quote in one style per
+/// statement, and `'say "hi"'` happens to pass because its inner quotes are **balanced**: the
+/// stack pops as often as it pushes and lands empty for the wrong reason.
+///
+/// ⭐ Inside a quote the only thing that can happen is the end of that quote, so the state is
+/// one `Option<u8>` and not a stack. A doubled quote — `'don''t'` — falls out: the second
+/// closes and the third reopens, which is the same span. ⚠️ Backslash escaping applies inside
+/// `'` and `"` and **not** inside a backtick, which is MySQL's rule rather than a
+/// simplification — and it is the rule under the default `sql_mode`. `NO_BACKSLASH_ESCAPES`
+/// changes it, and this crate records that the mode is `unmeasured` rather than assuming it.
+///
+/// ⛔⛔ AND IT WAS A BYTE AT A TIME THROUGH `any()` INTO A `BytesMut` OF CAPACITY ZERO. Per byte
+/// of every statement: one `any()` call, one `put_slice(&[c])` call, and a doubling
+/// reallocation whenever the accumulator filled — 9.7% of this codec's instructions, its
+/// hottest function. The bytes are already contiguous in the buffer the decoder handed over,
+/// so the scan decides a length and `take` takes it: **one copy, into one allocation of the
+/// right size**, and the quote state no longer allocates at all.
+///
+/// ⚠️ THE REFUSAL IS WINNOW'S AND NOT THIS FUNCTION'S. Running out of input used to produce
+/// whatever `any()` produces, which is `Incomplete` on a partial stream and a backtrack on a
+/// complete one — a distinction the decoder's loop turns into "read more" against "panic". A
+/// hand-written `Incomplete` would be right for this crate's one caller and wrong for a
+/// `parse()` against a finished slice, so `any_`'s own two arms are reproduced rather than
+/// collapsed.
+pub fn sql_lines(i: &mut Stream<'_>) -> ModalResult<Bytes> {
     trace("sql_lines", move |input: &mut Stream<'_>| {
-        let mut acc = BytesMut::new();
+        let end = statement_end(input.as_bytes());
 
-        let mut escaped = false;
-        let mut quotes = vec![];
-
-        loop {
-            let c = any(input)? as char;
-
-            acc.put_slice(&[c as u8]);
-
-            if escaped.not() && (c == '\'' || c == '\"' || c == '`') {
-                if let Some(q) = quotes.last() {
-                    if &c == q {
-                        let _ = quotes.pop();
-                    } else {
-                        quotes.push(c);
-                    }
-                } else {
-                    quotes.push(c);
-                }
-            }
-
-            if escaped.not() && c == '\\' {
-                escaped = true;
-            } else {
-                escaped = false;
-            }
-
-            if quotes.len() == 0 && c == ';' {
-                return Ok(acc.freeze());
-            }
+        match end {
+            Some(n) => Ok(Bytes::copy_from_slice(take(n).parse_next(input)?)),
+            None if input.is_partial() => Err(WinnowError::incomplete(input, Needed::new(1))),
+            None => Err(WinnowError::from_input(input)),
         }
     })
     .parse_next(i)
+}
+
+/// One past the first `;` that is not inside a string or a quoted identifier, or `None` where
+/// the bytes in hand do not contain one.
+///
+/// Split out from [`sql_lines`] so the rule can be tested against text directly rather than
+/// only through a decoder over a whole log — see `quoting_does_not_nest`.
+pub(crate) fn statement_end(bytes: &[u8]) -> Option<usize> {
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+
+    for (idx, c) in bytes.iter().copied().enumerate() {
+        match quote {
+            Some(q) => {
+                if escaped {
+                    escaped = false;
+                } else if c == b'\\' && q != b'`' {
+                    escaped = true;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if c == b'\'' || c == b'"' || c == b'`' {
+                    quote = Some(c);
+                } else if c == b';' {
+                    return Some(idx + 1);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 pub fn alphanumerichyphen1<'a>(i: &mut Stream<'a>) -> ModalResult<&'a [u8]> {
@@ -2202,5 +2248,88 @@ mod the_author_keeps_their_literals {
         // ⭐ The payload is the value WITHOUT its quoting, which is what a reader groups by.
         assert_eq!(String::from_utf8_lossy(&ls[1].value), "x");
         assert_eq!(String::from_utf8_lossy(&ls[1].rendered), "'x'");
+    }
+}
+
+/// ⛔⛔⛔ SQL QUOTING DOES NOT NEST, AND THE STATEMENT SCANNER TREATED IT AS A STACK.
+///
+/// The failure is not a mis-parse. A statement whose terminator is never found consumes the
+/// rest of the buffer, the decoder answers `Incomplete` forever, and at EOF the file reports
+/// `bytes remaining on stream` — which the analyzer files as `Coverage::Truncated`. **One
+/// apostrophe in one double-quoted string ends the log there**, and every entry after it is
+/// gone from every artifact with nothing but the coverage flag to say so.
+#[cfg(test)]
+mod quoting_does_not_nest {
+    use crate::parser::statement_end;
+
+    /// The rule, against the cases the stack got wrong and the ones it got right by luck.
+    #[test]
+    fn a_quote_of_one_kind_inside_another_is_not_a_quote() {
+        // ⛔ The four the stack could not terminate. Under it, `"` pushed, `'` pushed because
+        // it did not match the top, and the closing `"` pushed again — never empty, never a
+        // terminator, and the scan ran off the end of the file.
+        for s in [
+            r#"SELECT * FROM t WHERE note = "it's here";"#,
+            r#"SELECT 'it"s';"#,
+            r#"UPDATE t SET name = "O'Brien" WHERE id = 1;"#,
+            r#"INSERT INTO t VALUES ("don't", 'say "no"');"#,
+        ] {
+            assert_eq!(
+                statement_end(s.as_bytes()),
+                Some(s.len()),
+                "the terminator is the last byte: {s}"
+            );
+        }
+
+        // ⚠️ AND THE ONES THAT PASSED BEFORE STILL PASS, INCLUDING THE ONE THAT PASSED FOR THE
+        // WRONG REASON. `'say "hi"'` terminated under the stack because its inner quotes are
+        // **balanced** — two pushes and two pops landing empty — which is why a fixture full of
+        // well-formed strings witnesses nothing.
+        for s in [
+            r#"SELECT 'say "hi"';"#,
+            r#"SELECT 'don''t';"#,
+            r#"SELECT "a" FROM t WHERE b = 'c';"#,
+            r#"SELECT `tbl`.`col` FROM t;"#,
+            r#"SELECT 'a\'b';"#,
+            r#"SELECT 1;"#,
+        ] {
+            assert_eq!(statement_end(s.as_bytes()), Some(s.len()), "{s}");
+        }
+    }
+
+    /// ⭐ A `;` inside a quote is not a terminator, which is the whole point of tracking quotes
+    /// at all — and the one thing the stack did get right for a single-kind string.
+    #[test]
+    fn a_semicolon_inside_a_quote_does_not_terminate() {
+        let s = r#"SELECT 'a;b', "c;d", `e;f`; SELECT 2;"#;
+        let end = statement_end(s.as_bytes()).expect("terminated");
+
+        assert_eq!(&s[..end], r#"SELECT 'a;b', "c;d", `e;f`;"#);
+    }
+
+    /// ⚠️ BACKSLASH ESCAPES INSIDE `'` AND `"` AND NOT INSIDE A BACKTICK, which is MySQL's own
+    /// rule rather than a simplification. ⛔ Under `NO_BACKSLASH_ESCAPES` the first two change
+    /// too — and this crate records `sql_mode` as `unmeasured` rather than assuming it, so the
+    /// default is a **reading** and is filed as one.
+    #[test]
+    fn the_escape_rule_is_the_servers_and_stops_at_a_backtick() {
+        // The escaped quote does not close the string, so the terminator is the real one.
+        let s = r#"SELECT 'a\'b;c';"#;
+        assert_eq!(statement_end(s.as_bytes()), Some(s.len()));
+
+        // ⭐ A backslash before a backtick is a backslash. Escaping it would leave the
+        // identifier open and lose the rest of the file, which is the defect one kind over.
+        let s = r#"SELECT `a\`, b FROM t;"#;
+        assert_eq!(statement_end(s.as_bytes()), Some(s.len()));
+    }
+
+    /// ⭐ `None` is *"not in the bytes I have"* and never *"not in the file"* — the decoder turns
+    /// it into `Incomplete` and reads more. A scanner that answered `Some(len)` at the end of a
+    /// partial buffer would file half a statement as a whole one.
+    #[test]
+    fn an_unterminated_statement_is_not_a_statement() {
+        assert_eq!(statement_end(b"SELECT 1"), None);
+        assert_eq!(statement_end(b"SELECT 'unclosed;"), None);
+        assert_eq!(statement_end(b""), None);
     }
 }

@@ -24,3 +24,7 @@ tokio-util = {version = "0.7.15", features = ["codec"]}
 [[example]]
 name = "iterator"
 path = "examples/iterator.rs"
+
+[[example]]
+name = "throughput"
+path = "examples/throughput.rs"

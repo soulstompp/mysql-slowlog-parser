@@ -6,10 +6,11 @@ use crate::parser::{
 use crate::types::EntryStatement::SqlStatement;
 use crate::types::{Entry, EntryCall, EntrySqlAttributes, EntrySqlStatement, EntryStatement};
 use crate::{EntryCodecConfig, SessionLine, SqlStatementContext, StatsLine};
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use log::debug;
+use std::borrow::Cow;
 use std::default::Default;
-use std::fmt::{Display, Formatter};
+use std::fmt::{Display, Formatter, Write as _};
 use std::ops::AddAssign;
 use thiserror::Error;
 use tokio::io;
@@ -19,11 +20,8 @@ use winnow::Parser;
 use winnow::ascii::multispace0;
 use winnow::combinator::opt;
 use winnow::error::ErrMode;
-use winnow::stream::AsBytes;
 use winnow::stream::Stream as _;
 use winnow_datetime::DateTime;
-
-const LENGTH_MAX: usize = 10000000000;
 
 /// Error when building an entry
 #[derive(Error, Debug)]
@@ -79,6 +77,18 @@ impl Display for CodecExpect {
     }
 }
 
+/// The half-read entry. ⭐ **Everything here is cleared when an entry completes**, which is the
+/// contract that makes the two-scope model work — [`FileScope`] is what is not.
+///
+/// ⛔⛔ AND ONE OF THESE FIELDS WAS NOT AN ENTRY'S. The log header is a fact about the FILE —
+/// which server wrote it — and it lived here, so the first completed entry destroyed it. That
+/// is a scope error and not an oversight: a whole-of-file fact in a struct whose contract is
+/// "cleared between entries" cannot survive by any amount of reading it. It lives on the codec
+/// now, in [`FileScope`].
+///
+/// ⚠️ The clearing is [`EntryContext::complete`]'s `mem::take` and is no longer a separate
+/// `reset()` call after it. The two did the same thing, and doing it twice is what let five
+/// fields be **copied** on the way out of a struct that was about to be emptied.
 #[derive(Debug, Default)]
 struct EntryContext {
     expects: CodecExpect,
@@ -91,35 +101,39 @@ struct EntryContext {
 }
 
 impl EntryContext {
+    /// ⛔⛔ THIS CLONED FIVE FIELDS AND THEN THREW THE ORIGINALS AWAY, AND ONE OF THEM IS AN AST.
+    ///
+    /// `attributes` carries a whole `sqlparser::ast::Statement`. Cloning it deep-copies every
+    /// node and every `String` in the tree, and the next line — `reset()` — dropped the tree it
+    /// had just copied. Measured on `slow-test-queries.log`: `Statement::clone` was called
+    /// **326 times for 163 parsed statements** and cost **7.4% of the codec's instructions**,
+    /// with the frees of the copies on top of that. Half of those calls were this one.
+    ///
+    /// ⭐ `mem::take` **is** the reset: it hands over the fields and leaves the default behind,
+    /// which is what `reset()` did afterwards, so the same two operations become one move.
+    ///
+    /// ⚠️ It is destructive on the error arm, where the old code left the context standing.
+    /// Nothing observes that: the sole caller `unwrap`s, and `CodecError::IncompleteEntry` —
+    /// the variant this error would travel in — is **declared and never constructed**. The
+    /// state machine fills all five fields in order before `Sql` is reached, so the arm is
+    /// unreachable rather than merely unused.
     fn complete(&mut self) -> Result<Entry, EntryError> {
-        let time = self.time.clone().ok_or(MissingField("time".into()))?;
-        let session = self.user.clone().ok_or(MissingField("user".into()))?;
-        let stats = self.stats.clone().ok_or(MissingField("stats".into()))?;
-        let set_timestamp = self
+        let ctx = std::mem::take(self);
+
+        let time = ctx.time.ok_or(MissingField("time".into()))?;
+        let session = ctx.user.ok_or(MissingField("user".into()))?;
+        let stats = ctx.stats.ok_or(MissingField("stats".into()))?;
+        let set_timestamp = ctx
             .set_timestamp
-            .clone()
             .ok_or(MissingField("set timestamp".into()))?;
-        let attributes = self.attributes.clone().ok_or(MissingField("sql".into()))?;
-        let e = Entry {
+        let attributes = ctx.attributes.ok_or(MissingField("sql".into()))?;
+
+        Ok(Entry {
             call: EntryCall::new(time, set_timestamp),
             session: session.into(),
             stats: stats.into(),
             sql_attributes: attributes,
-        };
-
-        self.reset();
-
-        Ok(e)
-    }
-
-    /// ⛔⛔ `*self = default()` WIPES EVERY FIELD, AND ONE OF THEM WAS NOT AN ENTRY'S.
-    ///
-    /// The log header is a fact about the FILE — which server wrote it — and it lived in the
-    /// per-entry context, so the first completed entry destroyed it. That is a scope error and
-    /// not an oversight: a whole-of-file fact in a struct whose contract is "cleared between
-    /// entries" cannot survive by any amount of reading it. It lives on the codec now.
-    fn reset(&mut self) {
-        *self = EntryContext::default();
+        })
     }
 }
 
@@ -346,11 +360,21 @@ impl EntryCodec {
                     let sql_raw = sql_lines.clone();
                     let mut literals = Vec::new();
 
-                    let s = if let Ok((s, ls)) =
-                        parse_sql(&String::from_utf8_lossy(&sql_lines), &self.config.masking)
-                    {
+                    // ⚠️ `str::from_utf8` FIRST, AND `from_utf8_lossy` ONLY WHERE IT REFUSES.
+                    // The two validate the same bytes and disagree about how: the lossy form
+                    // walks `Utf8Chunks`, which was 1.5% of this codec's instructions, while
+                    // `from_utf8` runs the word-at-a-time ASCII path. A slow log is ASCII on
+                    // nearly every line, so the fallback is what is rare — and it is kept,
+                    // because a statement whose bytes are not UTF-8 still has to reach the
+                    // reader as `invalid` rather than stopping the file.
+                    let text = match std::str::from_utf8(&sql_lines) {
+                        Ok(s) => Cow::Borrowed(s),
+                        Err(_) => String::from_utf8_lossy(&sql_lines),
+                    };
+
+                    let s = if let Ok((mut parsed, ls)) = parse_sql(&text, &self.config.masking) {
                         literals = ls;
-                        if s.len() == 1 {
+                        if parsed.len() == 1 {
                             // ⭐⭐ NO MAPPER NOW CARRIES THE COMMENT THROUGH, RATHER THAN
                             // DISCARDING IT. `map_comment_context` defaults to `None`, and
                             // while `None` meant "drop the context" every consumer taking the
@@ -365,22 +389,30 @@ impl EntryCodec {
                                     None => SqlStatementContext::new(d),
                                 });
 
+                            // ⭐ MOVED OUT OF THE VEC, NOT COPIED OUT OF IT. `s[0].clone()`
+                            // deep-copied the whole AST and then dropped the `Vec` holding the
+                            // original two lines later — the other half of the 326
+                            // `Statement::clone` calls per pass over the shipped log. The
+                            // length is checked one line up, so `pop` is the element.
                             let s = EntrySqlStatement {
-                                statement: s[0].clone(),
+                                statement: parsed.pop().expect("length checked above"),
                                 context,
                             };
 
-                            sql_lines = Bytes::from(s.statement.to_string());
+                            // ⭐ SIZED FROM THE AUTHOR'S BYTES. `to_string()` starts a
+                            // `String` at capacity zero and doubles it, so rendering a
+                            // statement reallocated once per doubling; the render is within a
+                            // few bytes of the text it came from, so one allocation does it.
+                            let mut rendered = String::with_capacity(sql_raw.len());
+                            let _ = write!(rendered, "{}", s.statement);
+
+                            sql_lines = Bytes::from(rendered);
                             SqlStatement(s)
                         } else {
-                            EntryStatement::InvalidStatement(
-                                String::from_utf8_lossy(&sql_lines).to_string(),
-                            )
+                            EntryStatement::InvalidStatement(text.into_owned())
                         }
                     } else {
-                        EntryStatement::InvalidStatement(
-                            String::from_utf8_lossy(&sql_lines).to_string(),
-                        )
+                        EntryStatement::InvalidStatement(text.into_owned())
                     };
 
                     self.context.attributes = Some(EntrySqlAttributes {
@@ -413,45 +445,47 @@ impl Decoder for EntryCodec {
     type Error = CodecError;
 
     /// calls `parse_next` and manages state changes and buffer fill
+    ///
+    /// ⛔⛔ THIS TOOK THE WHOLE BUFFER OUT AND COPIED THE REMAINDER BACK, ONCE PER ENTRY.
+    /// `src.split()` emptied `src` and `src.extend_from_slice(i.as_bytes())` refilled it with
+    /// everything the entry had not consumed — so a decoder reading a 310-entry log through
+    /// `FramedRead`'s 8 KiB buffer moved on the order of **24 times the file's own size**
+    /// through `memcpy`, and reallocated the buffer each time because `split` had left it with
+    /// no capacity. `memcpy` was the single hottest symbol in the profile at 11.8%.
+    ///
+    /// ⭐ The parsers copy what they keep — every `Bytes` this codec produces is built with
+    /// `copy_from_slice` or accumulated into a `BytesMut`, and nothing borrows the input — so
+    /// the buffer can simply be **advanced** past what was consumed. `BytesMut::advance` moves
+    /// a pointer. What the two exits share is the arithmetic: consumed is what the stream no
+    /// longer holds, measured after any reset.
+    ///
+    /// ⛔ AND THE LENGTH MARKER IS GONE, WHICH WAS NOT A GUARD AT ALL. It read the first four
+    /// bytes of a **text** log as a little-endian `u32` — `"# Ti"` — and compared it against
+    /// `LENGTH_MAX`, a constant of 10_000_000_000 that a `u32` cannot reach: the comparison was
+    /// **false for every possible input**. A slow log is not a length-prefixed frame format,
+    /// and the check that was supposed to bound a frame could not fire once. The `src.len() <
+    /// 4` line above it existed only to read that marker; an empty buffer is what actually has
+    /// nothing to parse, and the tail of a well-formed log is one newline.
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if src.len() < 4 {
-            // Not enough data to read length marker.
+        if src.is_empty() {
             return Ok(None);
         }
 
-        // Read length marker.
-        let mut length_bytes = [0u8; 4];
-        length_bytes.copy_from_slice(&src[..4]);
-        let length = u32::from_le_bytes(length_bytes) as usize;
-
-        // Check that the length is not too large to avoid a denial of
-        // service attack where the server runs out of memory.
-        if length > LENGTH_MAX {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Frame of length {} is too large.", length),
-            )
-            .into());
-        }
-
-        let b = &src.split()[..];
-        let mut i = Stream::new(&b);
+        let available = src.len();
+        let b: &[u8] = &src[..];
+        let mut i = Stream::new(b);
 
         let mut start = i.checkpoint();
 
-        loop {
+        let (entry, remaining) = loop {
             if i.len() == 0 {
-                return Ok(None);
+                break (None, 0);
             };
 
             match self.parse_next(&mut i) {
                 Ok(e) => {
                     if let Some(e) = e {
-                        self.context = EntryContext::default();
-
-                        src.extend_from_slice(i.as_bytes());
-
-                        return Ok(Some(e));
+                        break (Some(e), i.len());
                     } else {
                         debug!("preparing input for next parser\n");
 
@@ -461,10 +495,13 @@ impl Decoder for EntryCodec {
                     }
                 }
                 Err(ErrMode::Incomplete(_)) => {
+                    // ⚠️ Back to the last **completed stage**, not to the start of the buffer.
+                    // The stages before it are committed: their values are in `self.context`
+                    // and their bytes are spent, which is what makes this a streaming decoder
+                    // rather than one that re-reads a partial entry on every poll.
                     i.reset(&start);
-                    src.extend_from_slice(i.as_bytes());
 
-                    return Ok(None);
+                    break (None, i.len());
                 }
                 Err(ErrMode::Backtrack(e)) => {
                     panic!(
@@ -481,7 +518,11 @@ impl Decoder for EntryCodec {
                     );
                 }
             }
-        }
+        };
+
+        src.advance(available - remaining);
+
+        Ok(entry)
     }
 
     /// decodes end of file and ensures that there are no unprocessed bytes on the stream.
