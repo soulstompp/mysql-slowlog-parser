@@ -69,6 +69,7 @@ mod parser;
 mod types;
 
 pub use graph::{
+    Stages,
     ConstraintKind, Edge, GraphMeasures, JoinOp, RelationOccurrence, RelationRole, Scope,
     ScopeKind, StatementGraph,
 };

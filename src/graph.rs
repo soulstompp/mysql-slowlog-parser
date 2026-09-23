@@ -32,9 +32,9 @@
 
 use bytes::Bytes;
 use sqlparser::ast::{
-    Cte, Delete, Expr, FromTable, Insert, JoinConstraint, JoinOperator, ObjectName,
-    LockTableType, ObjectNamePart, ObjectType, Query, Select, SetExpr, Statement, TableFactor,
-    TableObject, TableWithJoins, UpdateTableFromKind, visit_expressions,
+    Cte, Delete, Distinct, Expr, FromTable, GroupByExpr, Insert, JoinConstraint, JoinOperator,
+    LockTableType, ObjectName, ObjectNamePart, ObjectType, OrderByKind, Query, Select, SetExpr,
+    Statement, TableFactor, TableObject, TableWithJoins, UpdateTableFromKind, visit_expressions,
 };
 use std::ops::ControlFlow;
 
@@ -190,6 +190,100 @@ pub struct Scope {
     pub name: Option<Bytes>,
     /// whether a `WITH` introducing this scope said `RECURSIVE`
     pub recursive: bool,
+    /// ⭐⭐⭐ The row-reducing and row-reordering STAGES this scope writes down.
+    ///
+    /// A statement is a pipeline: each scope may filter, then group, then filter the groups,
+    /// then order, then cut. The walk already reads `selection` and `having` here and throws
+    /// them away; `group_by`, `distinct` and the query's `ORDER BY`/`LIMIT` it never touched.
+    ///
+    /// ⛔ THE STRUCTURE IS THE AUTHOR'S AND THE COST IS NOBODY'S. A slow log carries one
+    /// `Query_time` for the whole pipeline and nothing per stage, so what a stage cost is not in
+    /// the document at any setting — the same standing a relation occurrence's figure has.
+    pub stages: Stages,
+}
+
+/// What one scope does to its rows, counted rather than judged.
+///
+/// ⚠️ A SCOPE IS NOT ONE `Select`, so these ACCUMULATE. `INSERT ... SELECT ... WHERE` walks its
+/// source into the **same** scope as the insert target, and `UPDATE`/`DELETE` carry a `WHERE`
+/// with no `Select` at all. Assigning once would lose whichever came second.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stages {
+    /// Top-level `AND` conjuncts of this scope's `WHERE`. ⭐ `0` is a MEASURED zero: the parse
+    /// looked and there was no filter.
+    pub filter_terms: u32,
+    /// `GROUP BY` terms.
+    pub group_terms: u32,
+    /// Of those, how many are **not** a plain or qualified column.
+    ///
+    /// ⚠️ The count is the text's; *"an expression forces a temporary table"* is a claim about
+    /// the server and is not made here.
+    pub group_expression_terms: u32,
+    /// Top-level `AND` conjuncts of `HAVING`.
+    pub having_terms: u32,
+    /// Calls to a built-in aggregate in `HAVING`, and in the projection.
+    ///
+    /// ⚠️ A LOWER BOUND, and stated as one: matched against MySQL's built-in aggregate names,
+    /// so a `CREATE AGGREGATE FUNCTION` UDF is not on the list and is not counted.
+    pub having_aggregate_calls: u32,
+    /// ⭐ `group_terms == 0 && projection_aggregate_calls > 0` **is** implicit grouping — the
+    /// whole result is one group — and a reading of `group_terms` alone would say there is no
+    /// grouping stage where there is one.
+    pub projection_aggregate_calls: u32,
+    /// Whether the scope wrote `SELECT DISTINCT`. ⛔ Leaving it out would not lose a
+    /// column, it would produce a WRONG KEY: `SELECT DISTINCT a` and `SELECT a` would share one.
+    pub distinct_present: bool,
+    /// `ORDER BY` terms on the `Query` this scope heads. ⚠️ `ORDER BY` and `LIMIT` hang off
+    /// `Query` and not off `Select`.
+    pub sort_terms: u32,
+    /// Whether the query this scope heads carried a `LIMIT`.
+    pub limit_present: bool,
+    /// ⛔ A construct this grammar reaches and MySQL has no syntax for: `PREWHERE`, `QUALIFY`,
+    /// `GROUP BY ALL`, `DISTINCT ON`, Hive's `SORT BY`/`CLUSTER BY`/`DISTRIBUTE BY`, `TOP`,
+    /// `CONNECT BY`, `ORDER BY ALL`.
+    ///
+    /// ⚠️ ONE LANDING ARM AND NOT NINE NAMED ONES, exactly as [`JoinOp::NotMySql`]: naming
+    /// them would put nine cases that cannot occur in front of every consumer. A row carrying it
+    /// is a **diagnostic and not data**, and is held to zero on both corpora.
+    pub not_mysql: bool,
+}
+
+/// Top-level `AND` conjuncts of a predicate.
+///
+/// ⚠️ `AND` ONLY. `a = 1 OR b = 2` is ONE condition on two columns and splitting it would say
+/// the author wrote two filters where they wrote a disjunction — a different claim about how many
+/// row-reducing terms the scope carries.
+fn conjuncts(e: &Expr) -> u32 {
+    match e {
+        Expr::BinaryOp { left, op: sqlparser::ast::BinaryOperator::And, right } => {
+            conjuncts(left) + conjuncts(right)
+        }
+        Expr::Nested(inner) => conjuncts(inner),
+        _ => 1,
+    }
+}
+
+/// MySQL's built-in aggregates, by name.
+///
+/// ⚠️ A LOWER BOUND and stated as one: a `CREATE AGGREGATE FUNCTION` UDF is not on this list,
+/// and whether a function aggregates is not decidable from a log.
+const AGGREGATES: [&str; 15] = [
+    "COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STD", "STDDEV", "STDDEV_POP",
+    "STDDEV_SAMP", "VARIANCE", "VAR_POP", "VAR_SAMP", "BIT_AND", "BIT_OR",
+];
+
+fn aggregate_calls(e: &Expr) -> u32 {
+    let mut n = 0u32;
+    let _ = visit_expressions(e, |x| {
+        if let Expr::Function(f) = x {
+            let last = f.name.0.last().map(|p| p.to_string().to_ascii_uppercase());
+            if last.is_some_and(|l| AGGREGATES.contains(&l.trim_matches('`'))) {
+                n += 1;
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    n
 }
 
 /// One appearance of a relation in a statement.
@@ -454,6 +548,7 @@ impl Builder {
             kind,
             name,
             recursive,
+            stages: Stages::default(),
         });
         id
     }
@@ -615,6 +710,12 @@ impl Builder {
                     let ids = self.collect_from(f, scope, false);
                     self.join_edges(f, scope, &ids);
                 }
+                // ⭐⭐ AN `UPDATE`/`DELETE` WHERE IS A FILTER STAGE WITH NO `Select` AT ALL, so
+                // it is recorded here or nowhere. A scope is not one `Select` and this is the
+                // clearest case of it.
+                if let Some(e) = selection {
+                    self.graph.scopes[scope as usize].stages.filter_terms += conjuncts(e);
+                }
                 if let Some(e) = selection {
                     self.walk_expr(e, scope);
                     self.predicate_edges(e, scope, JoinOp::Predicate, ConstraintKind::On);
@@ -639,6 +740,12 @@ impl Builder {
                 if let Some(u) = using {
                     let ids = self.collect_from(u, scope, false);
                     self.join_edges(u, scope, &ids);
+                }
+                // ⭐⭐ AN `UPDATE`/`DELETE` WHERE IS A FILTER STAGE WITH NO `Select` AT ALL, so
+                // it is recorded here or nowhere. A scope is not one `Select` and this is the
+                // clearest case of it.
+                if let Some(e) = selection {
+                    self.graph.scopes[scope as usize].stages.filter_terms += conjuncts(e);
                 }
                 if let Some(e) = selection {
                     self.walk_expr(e, scope);
@@ -769,6 +876,18 @@ impl Builder {
                 self.walk_query(query, cte);
             }
         }
+        // ⚠️ ORDER BY AND LIMIT HANG OFF THE `Query`, NOT OFF THE `Select`, so they are read
+        // here and filed on the scope the query heads.
+        let st = &mut self.graph.scopes[scope as usize].stages;
+        match &query.order_by {
+            Some(o) => match &o.kind {
+                OrderByKind::Expressions(terms) => st.sort_terms += terms.len() as u32,
+                // ⛔ `ORDER BY ALL` is not MySQL.
+                OrderByKind::All(_) => st.not_mysql = true,
+            },
+            None => {}
+        }
+        st.limit_present |= query.limit_clause.is_some();
         self.walk_set_expr(&query.body, scope);
     }
 
@@ -789,7 +908,55 @@ impl Builder {
         }
     }
 
+    /// ⭐⭐⭐ What this scope does to its rows, recorded rather than judged.
+    ///
+    /// Accumulates, because a scope is not one `Select`: `INSERT ... SELECT ... WHERE` walks its
+    /// source into the same scope as the insert target, so assigning once would lose one of them.
+    fn record_stages(&mut self, select: &Select, scope: u32) {
+        let (mut g, mut gx, mut nm) = (0u32, 0u32, false);
+        match &select.group_by {
+            GroupByExpr::Expressions(terms, modifiers) => {
+                g = terms.len() as u32;
+                gx = terms
+                    .iter()
+                    .filter(|e| {
+                        !matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+                    })
+                    .count() as u32;
+                nm |= !modifiers.is_empty();
+            }
+            // ⛔ `GROUP BY ALL` is not MySQL.
+            GroupByExpr::All(_) => nm = true,
+        }
+        nm |= select.prewhere.is_some()
+            || select.qualify.is_some()
+            || select.top.is_some()
+            || select.connect_by.is_some()
+            || !select.sort_by.is_empty()
+            || !select.cluster_by.is_empty()
+            || !select.distribute_by.is_empty()
+            || matches!(select.distinct, Some(Distinct::On(_)));
+
+        let projection_aggregates: u32 = select
+            .projection
+            .iter()
+            .flat_map(select_item_exprs)
+            .map(aggregate_calls)
+            .sum();
+
+        let st = &mut self.graph.scopes[scope as usize].stages;
+        st.filter_terms += select.selection.as_ref().map_or(0, conjuncts);
+        st.group_terms += g;
+        st.group_expression_terms += gx;
+        st.having_terms += select.having.as_ref().map_or(0, conjuncts);
+        st.having_aggregate_calls += select.having.as_ref().map_or(0, aggregate_calls);
+        st.projection_aggregate_calls += projection_aggregates;
+        st.distinct_present |= select.distinct.is_some();
+        st.not_mysql |= nm;
+    }
+
     fn walk_select(&mut self, select: &Select, scope: u32) {
+        self.record_stages(select, scope);
         // ⭐ TWO PASSES, AND THE ORDER IS THE POINT. Every occurrence has to exist before any
         // predicate is resolved, because a join's `ON` clause routinely names a relation the
         // parser has not reached yet and a one-pass walk would drop that edge.
@@ -1187,6 +1354,105 @@ mod tests {
 
     fn graph(sql: &str) -> StatementGraph {
         StatementGraph::of(&one(sql))
+    }
+
+    /// The stages of the statement's own scope.
+    fn st(sql: &str) -> Stages {
+        graph(sql).scopes[0].stages
+    }
+
+    /// ⭐⭐⭐ A STATEMENT IS A PIPELINE AND THE SCOPE TREE IS ITS SKELETON.
+    ///
+    /// Each scope may filter, then group, then filter the groups, then order, then cut. The walk
+    /// already read `selection` and `having` here and threw them away; `group_by`, `distinct` and
+    /// the query's `ORDER BY`/`LIMIT` it never touched at all.
+    #[test]
+    fn a_scope_records_what_it_does_to_its_rows() {
+        let a = st("SELECT a FROM t WHERE x = 1 AND y = 2 GROUP BY a HAVING COUNT(*) > 3 ORDER BY a LIMIT 5");
+        assert_eq!(a.filter_terms, 2, "top-level AND conjuncts");
+        assert_eq!(a.group_terms, 1);
+        assert_eq!(a.having_terms, 1);
+        assert_eq!(a.having_aggregate_calls, 1);
+        assert_eq!(a.sort_terms, 1);
+        assert!(a.limit_present);
+        assert!(!a.distinct_present);
+        assert!(!a.not_mysql);
+
+        // ⭐ A MEASURED ZERO. The parse looked and there was no filter, which is a different
+        // claim from a scope that has no query at all.
+        let b = st("SELECT a FROM t");
+        assert_eq!((b.filter_terms, b.group_terms, b.having_terms), (0, 0, 0));
+    }
+
+    /// ⚠️ `AND` ONLY. `a = 1 OR b = 2` is ONE condition on two columns; splitting it would say
+    /// the author wrote two row-reducing terms where they wrote a disjunction.
+    #[test]
+    fn a_disjunction_is_one_filter_term_and_not_two() {
+        assert_eq!(st("SELECT a FROM t WHERE x = 1 OR y = 2").filter_terms, 1);
+        assert_eq!(st("SELECT a FROM t WHERE (x = 1 AND y = 2) AND z = 3").filter_terms, 3);
+    }
+
+    /// ⭐⭐ IMPLICIT GROUPING, which `group_terms` alone calls no grouping at all.
+    ///
+    /// `SELECT COUNT(*) FROM t` has no `GROUP BY` and one group — the whole result. A reading
+    /// that looked only at `group_terms` would say there is no grouping stage where there is one.
+    #[test]
+    fn an_aggregate_with_no_group_by_is_still_a_grouping_stage() {
+        let a = st("SELECT COUNT(*) FROM t");
+        assert_eq!((a.group_terms, a.projection_aggregate_calls), (0, 1));
+        let b = st("SELECT a, COUNT(*) FROM t GROUP BY a");
+        assert_eq!((b.group_terms, b.projection_aggregate_calls), (1, 1));
+        // ⚠️ And a function that is not an aggregate is not one. The list is MySQL's built-ins
+        // and a UDF is not on it, so this count is a LOWER BOUND and is stated as one.
+        assert_eq!(st("SELECT UPPER(a) FROM t").projection_aggregate_calls, 0);
+    }
+
+    /// ⚠️ A `GROUP BY` ON AN EXPRESSION is counted and NOT judged. *"An expression forces a
+    /// temporary table"* is a claim about the server; this is a claim about the text.
+    #[test]
+    fn a_grouping_on_an_expression_is_counted_and_not_judged() {
+        let a = st("SELECT YEAR(d), COUNT(*) FROM t GROUP BY YEAR(d)");
+        assert_eq!((a.group_terms, a.group_expression_terms), (1, 1));
+        let b = st("SELECT a, COUNT(*) FROM t GROUP BY t.a");
+        assert_eq!((b.group_terms, b.group_expression_terms), (1, 0), "a qualified column is a column");
+    }
+
+    /// ⭐⭐ A SCOPE IS NOT ONE `Select`, SO THE STAGES ACCUMULATE.
+    ///
+    /// `INSERT ... SELECT ... WHERE` walks its source into the **same** scope as the insert
+    /// target, and an `UPDATE`/`DELETE` `WHERE` has no `Select` at all. Assigning once rather
+    /// than accumulating would lose whichever arrived second.
+    #[test]
+    fn a_scope_is_not_one_select_so_the_stages_accumulate() {
+        assert_eq!(st("UPDATE t SET a = 1 WHERE x = 2 AND y = 3").filter_terms, 2);
+        assert_eq!(st("DELETE FROM t WHERE x = 2").filter_terms, 1);
+        // ⛔ The insert target and the source select share one scope, so one filter lands there.
+        assert_eq!(st("INSERT INTO t (a) SELECT b FROM u WHERE x = 1").filter_terms, 1);
+    }
+
+    /// ⛔⛔ ONE LANDING ARM FOR WHAT MYSQL HAS NO SYNTAX FOR, exactly as [`JoinOp::NotMySql`].
+    ///
+    /// `MySqlDialect` gates very little, so `sqlparser` will build `QUALIFY`, `DISTINCT ON`,
+    /// Hive's `SORT BY` and the rest out of text MySQL cannot run. Naming nine arms would put
+    /// nine impossible cases in front of every consumer; one diagnostic arm does not.
+    #[test]
+    fn a_construct_mysql_cannot_write_lands_on_one_arm() {
+        for sql in [
+            "SELECT DISTINCT ON (a) a FROM t",
+            "SELECT a FROM t QUALIFY ROW_NUMBER() OVER () = 1",
+            "SELECT a FROM t SORT BY a",
+            "SELECT a FROM t CLUSTER BY a",
+        ] {
+            let g = StatementGraph::of(&one(sql));
+            assert!(g.scopes[0].stages.not_mysql, "{sql} should land on the diagnostic arm");
+        }
+        // ⭐ And ordinary MySQL never does.
+        for sql in [
+            "SELECT DISTINCT a FROM t",
+            "SELECT a FROM t GROUP BY a HAVING COUNT(*) > 1 ORDER BY a LIMIT 2",
+        ] {
+            assert!(!st(sql).not_mysql, "{sql} is ordinary MySQL");
+        }
     }
 
     /// ⭐⭐⭐ EVERY ARM OF [`JoinOp`], WITH THE TEXT THAT REACHES IT.
