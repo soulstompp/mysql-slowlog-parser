@@ -123,26 +123,91 @@ impl EntryContext {
     }
 }
 
+/// ⭐⭐⭐ THE FILE SCOPE, AS A VALUE A SHARD CAN BE HANDED.
+///
+/// `EntryContext` is cleared between entries and the codec's own fields are not — that is the
+/// two-scope model `EntryContext::reset` exists to state, and it is already load-bearing: the
+/// log header lived in the per-entry struct once and the first completed entry destroyed it.
+///
+/// ⛔⛔ **BUT A SCOPE THAT CANNOT BE SEEDED IS NOT A SCOPE THAT SURVIVES A SPLIT.** The codec
+/// carries the file scope across **buffer** boundaries, which is what a `Decoder` is for. It
+/// cannot carry it across a **shard** boundary, because a shard of a log is a different file
+/// and only the first one holds the header — so a second shard reports `version: None`,
+/// `header_count: 0`, and every downstream claim about MySQL's behaviour loses the regime it
+/// holds in.
+///
+/// ⭐ This is the state to hand over, and it is `O(1)`: one header block and two counters,
+/// whatever the file's size. [`EntryCodec::file_scope`] produces one and
+/// [`EntryCodec::resume`] takes one, so *"split a log and merge the halves"* and *"read the log
+/// in two buffers"* become the same operation.
+///
+/// ⛔ **Produced and never authored**, like everything else that crosses a seam in this record:
+/// the only way to get one is to have read the prefix. A caller who hand-built one would be
+/// declaring a server that never wrote the bytes in front of it.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct FileScope {
+    headers: Option<HeaderLines>,
+    headers_seen: usize,
+    processed: usize,
+}
+
+impl FileScope {
+    /// The header block the file opened with, or `None` where it had none.
+    pub fn headers(&self) -> Option<&HeaderLines> {
+        self.headers.as_ref()
+    }
+
+    /// How many header blocks have been seen. More than one means a concatenation.
+    pub fn header_count(&self) -> usize {
+        self.headers_seen
+    }
+
+    /// Entries decoded so far. ⚠️ A **count**, which is what recovers a shard's `entry_id`
+    /// offset — a coordinate, and the reason a coordinate is never information.
+    pub fn processed(&self) -> usize {
+        self.processed
+    }
+}
+
 /// struct holding contextual information used while decoding
 #[derive(Debug, Default)]
 pub struct EntryCodec {
-    processed: usize,
-    /// ⭐ File-scoped, beside `processed`, because that is its scope. See `EntryContext::reset`.
-    headers: Option<HeaderLines>,
-    /// ⭐⭐ How many header blocks the file carried. See [`EntryCodec::header_count`].
-    headers_seen: usize,
+    /// ⭐ File-scoped state, in one place because it is one scope. See [`FileScope`].
+    file: FileScope,
     context: EntryContext,
     config: EntryCodecConfig,
 }
 
 impl EntryCodec {
+    /// ⭐⭐⭐ Hand me your carried state — everything this codec holds that is not an entry's.
+    ///
+    /// Valid at any point; a caller holding a `FramedRead` reaches it through `decoder()`.
+    /// ⚠️ It does **not** include [`EntryContext`], and that is the scope distinction rather
+    /// than an omission: a half-read entry is not a fact about the file, and a shard boundary
+    /// is an **entry** boundary by construction — a chunked reader that cut mid-entry would be
+    /// splitting a statement, which is a different and unsupported thing.
+    pub fn file_scope(&self) -> &FileScope {
+        &self.file
+    }
+
+    /// ⭐⭐⭐ Resume from the state a previous shard left.
+    ///
+    /// A shard of a log carries no header of its own; this is how the regime travels with the
+    /// seam. ⛔ The state must have been **produced** by reading the prefix — see [`FileScope`].
+    pub fn resume(c: EntryCodecConfig, file: FileScope) -> Self {
+        Self {
+            file,
+            config: c,
+            ..Default::default()
+        }
+    }
     /// ⭐ The header lines the file opened with, or `None` where it had none.
     ///
     /// Valid once the first entry has been decoded; a caller holding a `FramedRead` reaches it
     /// through `decoder()`. ⛔ `None` is `unmeasured` and never "the default server": a slow log
     /// that has been rotated or concatenated begins mid-stream and states no regime at all.
     pub fn headers(&self) -> Option<&HeaderLines> {
-        self.headers.as_ref()
+        self.file.headers.as_ref()
     }
 
     /// ⭐⭐ How many header blocks the file carried, which is how many servers claimed it.
@@ -152,7 +217,7 @@ impl EntryCodec {
     /// another, and nothing else in any artifact would distinguish them. [`EntryCodec::headers`]
     /// returns the first; this says whether "the first" is also "the only".
     pub fn header_count(&self) -> usize {
-        self.headers_seen
+        self.file.headers_seen
     }
 
     /// create a new `EntryCodec` with the specified configuration
@@ -187,9 +252,9 @@ impl EntryCodec {
                 // recorded, so a file that declares two regimes says so rather than quietly
                 // presenting one.
                 if let Some(h) = res {
-                    self.headers_seen += 1;
-                    if self.headers.is_none() {
-                        self.headers = Some(h);
+                    self.file.headers_seen += 1;
+                    if self.file.headers.is_none() {
+                        self.file.headers = Some(h);
                     }
                 }
 
@@ -334,7 +399,7 @@ impl EntryCodec {
         };
 
         return if let Some(e) = entry {
-            self.processed.add_assign(1);
+            self.file.processed.add_assign(1);
 
             Ok(Some(e))
         } else {
@@ -405,14 +470,14 @@ impl Decoder for EntryCodec {
                     panic!(
                         "unhandled parser backtrack error after {:#?} processed: {}",
                         e.to_string(),
-                        self.processed
+                        self.file.processed
                     );
                 }
                 Err(ErrMode::Cut(e)) => {
                     panic!(
                         "unhandled parser cut error after {:#?} processed: {}",
                         e.to_string(),
-                        self.processed
+                        self.file.processed
                     );
                 }
             }
@@ -454,9 +519,9 @@ mod tests {
     use crate::{EntryCodecConfig, EntryMasking, SqlStatementContext};
     use bytes::Bytes;
     use futures::StreamExt;
+    use std::collections::HashMap;
     use std::default::Default;
     use std::io::Cursor;
-    use std::collections::HashMap;
     use std::ops::AddAssign;
 
     use tokio::fs::File;
@@ -503,8 +568,14 @@ SET timestamp=1517798807;
         let expected_stmt = EntrySqlStatement {
             statement: stmts.0.first().unwrap().clone(),
             context: SqlStatementContext::new(HashMap::from([
-                (Bytes::from("request_id"), Bytes::from("apLo5wdqkmKw4W7vGfiBc5")),
-                (Bytes::from("file"), Bytes::from("src/endpoints/original/mod.rs")),
+                (
+                    Bytes::from("request_id"),
+                    Bytes::from("apLo5wdqkmKw4W7vGfiBc5"),
+                ),
+                (
+                    Bytes::from("file"),
+                    Bytes::from("src/endpoints/original/mod.rs"),
+                ),
                 (Bytes::from("method"), Bytes::from("notifications()")),
                 (Bytes::from("line"), Bytes::from("38")),
             ])),
@@ -753,7 +824,10 @@ SELECT 1;
 
         let parsed = opt(admin_command).parse_next(&mut i).unwrap();
 
-        assert!(parsed.is_none(), "no `;`, so this is not a complete command");
+        assert!(
+            parsed.is_none(),
+            "no `;`, so this is not a complete command"
+        );
         assert_eq!(
             i.as_bytes(),
             &input[..],
@@ -774,9 +848,9 @@ SELECT 1;
 mod graph_census {
     use crate::codec::EntryCodec;
     use crate::{EntryStatement, RelationRole, ScopeKind};
-    use std::ops::Not;
     use futures::StreamExt;
     use std::ops::AddAssign;
+    use std::ops::Not;
     use tokio::fs::File;
     use tokio_util::codec::Framed;
 
@@ -819,7 +893,10 @@ mod graph_census {
         // overwrote it with `None` 309 times. A test that read one entry passed and every real
         // file came out with no regime at all. Drain the stream and ask again.
         while (ff.next().await).is_some() {}
-        let h = ff.codec().headers().expect("the regime is a fact about the FILE");
+        let h = ff
+            .codec()
+            .headers()
+            .expect("the regime is a fact about the FILE");
         assert!(h.version().as_ref().starts_with(b"5.7."));
 
         // ⭐ ONE HEADER, SO "THE FIRST" IS ALSO "THE ONLY". A rotated and concatenated log
@@ -958,7 +1035,11 @@ mod graph_census {
         // ⚠️ 10 drops against 11 `DROP` lines: `DROP DATABASE IF EXISTS sakila` names a schema
         // and not a relation, and the walk declines it for the same reason the census's one
         // permitted `objects()` miss is `SHOW TABLES FROM mysql`.
-        assert_eq!((altered, dropped), (0, 10), "the DDL that names an existing table");
+        assert_eq!(
+            (altered, dropped),
+            (0, 10),
+            "the DDL that names an existing table"
+        );
         // ⭐⭐⭐ AND SIXTEEN OF THEM ARE THE LOCK THIS LOG'S OWN `Lock_time` COLUMN MEASURES THE
         // WAIT FOR. `mysqldump` writes `LOCK TABLES `t` WRITE` before each table's inserts, so a
         // restore is a sequence of explicit table locks — and `LockTables.tables` carries no
@@ -1003,6 +1084,7 @@ mod the_author_and_the_reader {
     use crate::codec::EntryCodec;
     use crate::{EntryStatement, LiteralKind};
     use futures::StreamExt;
+    use std::io::Cursor;
     use tokio::fs::File;
     use tokio_util::codec::Framed;
 
@@ -1035,7 +1117,9 @@ mod the_author_and_the_reader {
                 EntryStatement::SqlStatement(_) => {
                     parsed += 1;
                     let raw = String::from_utf8_lossy(
-                        a.sql_raw.as_ref().expect("a parsed statement has raw bytes"),
+                        a.sql_raw
+                            .as_ref()
+                            .expect("a parsed statement has raw bytes"),
                     )
                     .to_string();
                     let rendered = String::from_utf8_lossy(&a.sql).to_string();
@@ -1077,5 +1161,77 @@ mod the_author_and_the_reader {
         // statements in this log carry one and 308 inherit it -- an inference this crate
         // declines to draw. Before this commit the answer was 0, by `let _ =`.
         assert_eq!(with_db, 2);
+    }
+
+    /// ⭐⭐⭐ A SHARD OF A LOG CARRIES NO HEADER, AND THE FILE SCOPE IS WHAT TRAVELS WITH IT.
+    ///
+    /// ⛔⛔ The codec already carries its file scope across **buffer** boundaries — that is what
+    /// a `Decoder` is. It could not carry it across a **shard** boundary, because a shard is a
+    /// different file and only the first one holds the header. So a second shard read `version:
+    /// None`, `header_count: 0`, and every downstream claim about MySQL's behaviour lost the
+    /// regime it holds in — while `mysql-slowlog-analyzer`'s merge laws all re-attached the
+    /// header to every shard and could not see it.
+    ///
+    /// ⭐ Three readings of one log, and the third is the repair:
+    ///
+    /// | | version | header_count | processed |
+    /// |---|---|---|---|
+    /// | the whole file | ⭐ present | 1 | all |
+    /// | the tail, read fresh | ⛔ **None** | **0** | the tail's own |
+    /// | the tail, **resumed** | ⭐ present | 1 | ⭐ **continues the prefix's count** |
+    ///
+    /// ⚠️ `processed` continuing is what recovers `entry_id` — a coordinate, and the reason a
+    /// coordinate is never information: a merger holding the prefix knows its length because it
+    /// *holds* it, and this is merely the codec saying the same number.
+    #[tokio::test]
+    async fn a_shard_carries_no_header_and_the_file_scope_is_what_travels() {
+        let whole = tokio::fs::read("assets/slow-test-queries.log")
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&whole).into_owned();
+        let lines: Vec<&str> = text.lines().collect();
+        let first = lines.iter().position(|l| l.starts_with("# Time:")).unwrap();
+        let starts: Vec<usize> = (first..lines.len())
+            .filter(|i| lines[*i].starts_with("# Time:"))
+            .collect();
+        let cut = starts[100];
+        let (head, tail) = (
+            lines[..cut].join("\n") + "\n",
+            lines[cut..].join("\n") + "\n",
+        );
+
+        let run = |bytes: String, codec: EntryCodec| async move {
+            let mut f = Framed::new(Cursor::new(bytes.into_bytes()), codec);
+            let mut n = 0usize;
+            while let Some(r) = f.next().await {
+                r.unwrap();
+                n += 1;
+            }
+            (n, f.into_parts().codec)
+        };
+
+        let (whole_n, w) = run(text.clone() + "\n", EntryCodec::default()).await;
+        assert_eq!(w.header_count(), 1);
+        assert!(w.headers().is_some());
+
+        let (head_n, h) = run(head, EntryCodec::default()).await;
+        let scope = h.file_scope().clone();
+        assert_eq!(scope.header_count(), 1);
+        assert_eq!(scope.processed(), head_n);
+
+        // ⛔ Read fresh, the tail states no regime at all. That is honest and it is a loss.
+        let (tail_n, fresh) = run(tail.clone(), EntryCodec::default()).await;
+        assert_eq!(fresh.header_count(), 0, "a shard has no header of its own");
+        assert!(fresh.headers().is_none());
+        assert_eq!(fresh.file_scope().processed(), tail_n);
+
+        // ⭐ Resumed, it states the prefix's regime and continues the prefix's count.
+        let (resumed_n, resumed) = run(tail, EntryCodec::resume(Default::default(), scope)).await;
+        assert_eq!(resumed_n, tail_n, "resuming changes no entry");
+        assert_eq!(resumed.header_count(), 1);
+        assert_eq!(resumed.headers(), w.headers());
+        assert_eq!(resumed.file_scope().processed(), whole_n);
+        assert_eq!(head_n + tail_n, whole_n, "and the split loses nothing");
+        assert!(head_n > 0 && tail_n > 0, "an empty shard would say nothing");
     }
 }

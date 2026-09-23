@@ -61,7 +61,7 @@ pub use crate::parser::{
 
 use bytes::Bytes;
 
-pub use crate::codec::{CodecError, EntryCodec, EntryError};
+pub use crate::codec::{CodecError, EntryCodec, EntryError, FileScope};
 
 mod codec;
 mod graph;

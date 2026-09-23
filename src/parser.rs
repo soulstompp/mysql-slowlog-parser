@@ -1,5 +1,4 @@
 use crate::EntryMasking;
-use std::ops::ControlFlow;
 use bytes::{BufMut, Bytes, BytesMut};
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, Expr, ObjectName, SetExpr, Statement, Value, VisitMut,
@@ -10,6 +9,7 @@ use sqlparser::parser::{Parser as SQLParser, ParserError};
 use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::ops::Not;
 use std::str;
 use std::str::FromStr;
@@ -918,11 +918,10 @@ struct LiteralPass {
 
 /// The column name an `ObjectName` spells, split into its qualifier and its last part.
 fn column_of_name(n: &ObjectName) -> Option<LiteralColumn> {
-    let mut parts: Vec<String> = n
-        .0
-        .iter()
-        .filter_map(|p| p.as_ident().map(|i| i.value.clone()))
-        .collect();
+    let mut parts: Vec<String> =
+        n.0.iter()
+            .filter_map(|p| p.as_ident().map(|i| i.value.clone()))
+            .collect();
     let name = parts.pop()?;
     Some(LiteralColumn {
         qualifier: parts.is_empty().not().then(|| Bytes::from(parts.join("."))),
@@ -1138,7 +1137,6 @@ impl VisitorMut for LiteralPass {
     }
 }
 
-
 #[cfg(test)]
 mod every_literal_kind {
     use super::*;
@@ -1254,7 +1252,10 @@ mod a_literal_can_be_replaced_by_its_surrogate {
         let rendered = parse_sql(sql, &EntryMasking::None).unwrap().0[0].to_string();
         let same: Vec<Option<String>> = lits(&rendered).into_iter().map(Some).collect();
         assert_eq!(same.len(), 5, "TRUE and NULL are not the author's subject");
-        assert_eq!(rewrite_literals(&rendered, &same).as_deref(), Some(&*rendered));
+        assert_eq!(
+            rewrite_literals(&rendered, &same).as_deref(),
+            Some(&*rendered)
+        );
     }
 
     /// ⛔ AND THE SUBSTITUTION LANDS WHERE THE ORDINAL SAYS, not one literal over.
@@ -1294,11 +1295,20 @@ mod a_literal_can_be_replaced_by_its_surrogate {
     /// the original would return the author's values from a call whose name promises it did not.
     #[test]
     fn text_that_does_not_parse_is_refused_rather_than_returned() {
-        assert_eq!(rewrite_literals("ALTER TABLE t DISABLE KEYS", &[Some("1".into())]), None);
-        assert_eq!(rewrite_literals("LOCK TABLES shop.invoice WRITE", &[]), None);
+        assert_eq!(
+            rewrite_literals("ALTER TABLE t DISABLE KEYS", &[Some("1".into())]),
+            None
+        );
+        assert_eq!(
+            rewrite_literals("LOCK TABLES shop.invoice WRITE", &[]),
+            None
+        );
         // ⚠️ And two statements are refused as well: the ordinals would span them and a caller
         // asking for one statement's literal would reach another's.
-        assert_eq!(rewrite_literals("SELECT 1; SELECT 2", &[Some("9".into())]), None);
+        assert_eq!(
+            rewrite_literals("SELECT 1; SELECT 2", &[Some("9".into())]),
+            None
+        );
     }
 
     /// ⚠️ A short slice leaves the tail alone rather than panicking, because the caller's map
@@ -1335,14 +1345,19 @@ mod a_literal_can_be_replaced_by_its_surrogate {
 
         // ⭐ A column list names them, so they are named and NOT positional -- the two are
         // exclusive, and the same statement one clause different proves it.
-        let named = parse_sql("INSERT INTO t (a, b) VALUES (1, 'kay')", &EntryMasking::None)
-            .unwrap()
-            .1;
+        let named = parse_sql(
+            "INSERT INTO t (a, b) VALUES (1, 'kay')",
+            &EntryMasking::None,
+        )
+        .unwrap()
+        .1;
         assert!(named.iter().all(|l| l.column_position.is_none()));
         assert!(named.iter().all(|l| l.column.is_some()));
 
         // ⛔ And a literal that names nobody is in neither: a `LIMIT` is grammar.
-        let limit = parse_sql("SELECT a FROM t LIMIT 10", &EntryMasking::None).unwrap().1;
+        let limit = parse_sql("SELECT a FROM t LIMIT 10", &EntryMasking::None)
+            .unwrap()
+            .1;
         assert_eq!(limit.len(), 1);
         assert!(limit[0].column_position.is_none() && limit[0].column.is_none());
 
@@ -1364,8 +1379,14 @@ mod a_literal_can_be_replaced_by_its_surrogate {
     /// `slow-test-queries.log` is eight statements' worth of difference.
     #[test]
     fn a_value_inside_a_version_gate_is_still_a_value() {
-        assert_eq!(carries_a_value("/*!40103 SET TIME_ZONE='+00:00' */;"), Some(true));
-        assert_eq!(carries_a_value("/*!40014 SET UNIQUE_CHECKS=0 */;"), Some(true));
+        assert_eq!(
+            carries_a_value("/*!40103 SET TIME_ZONE='+00:00' */;"),
+            Some(true)
+        );
+        assert_eq!(
+            carries_a_value("/*!40014 SET UNIQUE_CHECKS=0 */;"),
+            Some(true)
+        );
         // ⭐ And the same gate with nothing in it stays false, so the recursion is not a
         // blanket `true` on every gated statement.
         assert_eq!(
@@ -1400,9 +1421,11 @@ mod a_literal_can_be_replaced_by_its_surrogate {
     #[test]
     fn a_value_written_as_an_identifier_is_not_seen() {
         assert_eq!(
-            carries_a_value("/*!50003 CREATE*/ /*!50017 DEFINER=`msandbox`@`%`*/ /*!50003 \
+            carries_a_value(
+                "/*!50003 CREATE*/ /*!50017 DEFINER=`msandbox`@`%`*/ /*!50003 \
                              TRIGGER rental_date BEFORE INSERT ON rental FOR EACH ROW \
-                             SET NEW.rental_date = NOW() */;"),
+                             SET NEW.rental_date = NOW() */;"
+            ),
             Some(false)
         );
     }
@@ -1458,12 +1481,18 @@ mod every_literal_binding {
         );
         // ⭐ The qualifier the author wrote, which is an alias far more often than a table.
         assert_eq!(
-            bound("SELECT id FROM t e1 WHERE e1.dept_id = 4", &EntryMasking::None),
+            bound(
+                "SELECT id FROM t e1 WHERE e1.dept_id = 4",
+                &EntryMasking::None
+            ),
             [("4".into(), "e1.dept_id".into(), true)]
         );
         // ⭐ An `IN` list: every member is sought in the same column.
         assert_eq!(
-            bound("SELECT id FROM t WHERE id IN (1, 2, 3)", &EntryMasking::None),
+            bound(
+                "SELECT id FROM t WHERE id IN (1, 2, 3)",
+                &EntryMasking::None
+            ),
             [
                 ("1".into(), "id".into(), true),
                 ("2".into(), "id".into(), true),
@@ -1472,7 +1501,10 @@ mod every_literal_binding {
         );
         // ⭐⭐ A range, which is where InnoDB's next-key locking actually lives.
         assert_eq!(
-            bound("SELECT id FROM t WHERE id BETWEEN 5 AND 9", &EntryMasking::None),
+            bound(
+                "SELECT id FROM t WHERE id BETWEEN 5 AND 9",
+                &EntryMasking::None
+            ),
             [
                 ("5".into(), "id".into(), true),
                 ("9".into(), "id".into(), true)
@@ -1961,7 +1993,6 @@ Time                 Id Command    Argument\n";
     }
 }
 
-
 /// ⛔⛔ MASKING USED TO DESTROY STATEMENTS, AND THE CONSUMER'S DEFAULT WAS TO MASK.
 ///
 /// `mask_tokens` runs before the parser, and a tokenizer cannot tell a value from a number the
@@ -2055,7 +2086,10 @@ mod the_author_keeps_their_literals {
         let (masked, masked_ls) = rendered(sql, &PlaceHolder);
 
         assert_eq!(plain_ls, vec!["42", "'open'", "10"]);
-        assert_eq!(masked_ls, plain_ls, "masking must not change what was recorded");
+        assert_eq!(
+            masked_ls, plain_ls,
+            "masking must not change what was recorded"
+        );
 
         assert!(plain.contains("42") && plain.contains("'open'"), "{plain}");
         assert!(!masked.contains("42"), "{masked}");
@@ -2068,7 +2102,10 @@ mod the_author_keeps_their_literals {
     #[test]
     fn a_value_that_is_not_an_expr_value_is_still_the_authors() {
         for (sql, expected) in [
-            ("SELECT * FROM t WHERE d > DATE '2020-01-01'", "'2020-01-01'"),
+            (
+                "SELECT * FROM t WHERE d > DATE '2020-01-01'",
+                "'2020-01-01'",
+            ),
             (
                 "SELECT * FROM t WHERE MATCH(body) AGAINST ('needle')",
                 "'needle'",
@@ -2129,7 +2166,9 @@ mod the_author_keeps_their_literals {
             let mut out = String::new();
             let mut rest = masked.as_str();
             for l in &ls {
-                let i = rest.find('?').expect("one placeholder per recorded literal");
+                let i = rest
+                    .find('?')
+                    .expect("one placeholder per recorded literal");
                 out.push_str(&rest[..i]);
                 out.push_str(l);
                 rest = &rest[i + 1..];
@@ -2137,7 +2176,10 @@ mod the_author_keeps_their_literals {
             out.push_str(rest);
 
             assert_eq!(out, plain, "round trip failed for: {sql}");
-            assert!(!out.contains('?'), "a literal was left unaccounted for: {out}");
+            assert!(
+                !out.contains('?'),
+                "a literal was left unaccounted for: {out}"
+            );
         }
     }
 
