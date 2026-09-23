@@ -1,10 +1,13 @@
 use crate::EntryMasking;
 use std::ops::ControlFlow;
 use bytes::{BufMut, Bytes, BytesMut};
-use sqlparser::ast::{Statement, Value, VisitMut, VisitorMut};
+use sqlparser::ast::{
+    AssignmentTarget, BinaryOperator, Expr, ObjectName, SetExpr, Statement, Value, VisitMut,
+    VisitorMut,
+};
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::{Parser as SQLParser, ParserError};
-use sqlparser::tokenizer::Tokenizer;
+use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Not;
@@ -614,6 +617,60 @@ pub struct EntryLiteral {
     pub value: Bytes,
     /// Which kind of literal it is.
     pub kind: LiteralKind,
+    /// ⭐⭐ THE COLUMN THE AUTHOR COMPARED THIS VALUE AGAINST, where the syntax names one.
+    ///
+    /// `WHERE tenant_id = 42` filed `42` and threw `tenant_id` away, so every literal in a
+    /// corpus sat in one undifferentiated pool and `42` the tenant was indistinguishable from
+    /// `42` the row limit. A value only means something **in a domain**, and the domain is a
+    /// column of a relation.
+    ///
+    /// ⛔ `None` is a **measured** absence and not a gap: a `CREATE TABLE` default, a `LIMIT`,
+    /// a `SET` value and a function argument are literals the author wrote in a position that
+    /// names no column. They select no rows and take no lock. Measured: **252 of 302** on
+    /// `slow-test-queries.log` and **136 of 248** on `structure.log`.
+    ///
+    /// ⚠️ FOUR SHAPES, AND THEY ARE NOT ALL THE SAME CLAIM. A comparison, an `IN` list and a
+    /// `BETWEEN` bound name the column a value is **sought** in. `UPDATE … SET qty = 5` and
+    /// `INSERT … VALUES` name the column a value is **written** to, which is a key the statement
+    /// creates or changes rather than one it looks up. [`Self::sought`] is what tells them apart,
+    /// because a lock taken to find a row and a lock taken to write one are different locks.
+    pub column: Option<LiteralColumn>,
+    /// Whether the author was **looking for** this value or **writing** it.
+    ///
+    /// ⛔ AND IT IS WHY THE SHIPPED CORPUS LOOKED EMPTY. `slow-test-queries.log` is a sandbox
+    /// startup and a `mysqldump` restore: **not one of its 302 literals sits in a predicate.**
+    /// Its 50 bound values are every one of them an `INSERT` column or a `SET` target. A rule
+    /// that read predicates alone would have measured zero there and called the corpus silent,
+    /// when what it actually is is a corpus that only ever wrote.
+    ///
+    /// ⚠️ `false` on an unbound literal, where it asserts nothing.
+    pub sought: bool,
+    /// ⭐⭐ The position in the row this value was written at, where the `INSERT` named no
+    /// columns: the `n`-th value reaches the table's `n`-th column.
+    ///
+    /// ⛔ A DOMAIN, AND NOT THE SAME ONE AS [`Self::column`]. Which physical column `#n` is
+    /// lives in a catalogue no slow log carries, so a positional domain and a named domain over
+    /// one table are kept apart rather than fused on a guess.
+    pub column_position: Option<u32>,
+}
+
+/// The column name an [`EntryLiteral`] was compared against, exactly as the author spelled it.
+///
+/// ⚠️ THE WRITTEN NAME AND NOT A RELATION. `e1.dept_id` carries the qualifier the author used,
+/// which is an **alias** far more often than a table — and an alias is scoped, so resolving it
+/// to a relation is a second hop through the statement's own occurrences. That hop belongs to
+/// whoever holds the scope tree, which this struct deliberately does not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiteralColumn {
+    /// Everything before the last `.`, joined as written — an alias, a table, or a schema and a
+    /// table. `None` where the author wrote a bare column name.
+    ///
+    /// ⚠️ Measured: **0 of 50** bound literals on `slow-test-queries.log` carry one and **80 of
+    /// 125** on `structure.log` do. A bare name fixes a relation only where the statement names
+    /// exactly one.
+    pub qualifier: Option<Bytes>,
+    /// The column name itself.
+    pub name: Bytes,
 }
 
 /// What kind of literal an [`EntryLiteral`] is.
@@ -656,12 +713,154 @@ pub fn parse_sql(
     let mut pass = LiteralPass {
         literals: Vec::new(),
         mask: mask == &EntryMasking::PlaceHolder,
+        binds: Vec::new(),
+        targets: HashMap::new(),
+        positional: HashMap::new(),
     };
     for s in statements.iter_mut() {
         let _ = s.visit(&mut pass);
     }
 
     Ok((statements, pass.literals))
+}
+
+/// ⭐⭐⭐ Re-render a statement with a substitute in place of chosen literals.
+///
+/// `replacements[i]` is the new **payload** for the `i`-th literal [`parse_sql`] would record,
+/// in the same traversal order and under the same arm filter -- so an ordinal from
+/// [`EntryLiteral`] indexes this directly and the two can never drift apart. `None` leaves a
+/// literal alone, and a short slice leaves the tail alone.
+///
+/// ⛔⛔ THE KIND IS TAKEN FROM THE ORIGINAL AND NOT FROM THE CALLER, which is what makes the
+/// substitution **type-preserving** by construction rather than by convention. A number stays a
+/// number and a quoted string stays a quoted string: swap them and the statement stops being the
+/// statement, because MySQL compares an integer column against a string by coercing it and takes
+/// a different path through the index. The caller cannot get this wrong because it has no way to
+/// say it.
+///
+/// ⚠️ Returns `None` where the text does not parse or is not exactly one statement. A caller
+/// with a surrogate to apply and nothing to apply it to must **withhold**, and the `None` is what
+/// says so -- silently returning the original would hand back the author's values under a name
+/// that promises it did not.
+///
+/// ⚠️ It re-parses rather than taking a tree, because the substitution a caller wants is
+/// corpus-scoped: the whole log has to be read before any surrogate is known, and by then the
+/// trees are long gone. The text it re-parses is the tree's own rendering, so the traversal it
+/// walks is the traversal that produced the ordinals.
+pub fn rewrite_literals(sql: &str, replacements: &[Option<String>]) -> Option<String> {
+    let mut tokenizer = Tokenizer::new(&MySqlDialect {}, sql);
+    let tokens = tokenizer.tokenize().ok()?;
+    let mut parser = SQLParser::new(&MySqlDialect {}).with_tokens(tokens);
+    let mut statements = parser.parse_statements().ok()?;
+    if statements.len() != 1 {
+        return None;
+    }
+
+    let mut pass = RewritePass {
+        replacements,
+        seen: 0,
+    };
+    let _ = statements[0].visit(&mut pass);
+    Some(statements[0].to_string())
+}
+
+/// ⭐⭐⭐ Does this text carry a value the author supplied? `None` where it cannot be tokenized.
+///
+/// ⛔ FOR THE STATEMENTS THIS GRAMMAR REFUSES, AND ONLY THOSE. A statement that parsed has
+/// literals with a **position** — [`EntryLiteral::column`] says whether the author went for a row
+/// with it — and that is a far better question than this one. A statement with no parse has no
+/// positions, so the only thing left to ask is whether there is a value in it at all.
+///
+/// ⚠️ IT OVER-APPROXIMATES, AND THE DIRECTION IS THE WHOLE ARGUMENT. `LIMIT 10` and
+/// `SET TIME_ZONE='+00:00'` both answer `true` while naming nobody. A caller withholding on this
+/// withholds a little more than it must, which costs **fidelity** and never costs privacy --
+/// the opposite of the tokenizer-level *masking* this crate removed, where `CHAR(60)` became
+/// `CHAR(?)` and destroyed 35 parses in silence. **Deciding is safe where editing was not.**
+///
+/// ⛔⛔ AND IT OPENS THE VERSION GATES, WITHOUT WHICH IT UNDERCOUNTS. `sqlparser`'s tokenizer
+/// files `/*!40101 ... */` as one **comment** while MySQL *executes* it, so a literal inside a
+/// gate is invisible to a plain token scan: on `slow-test-queries.log` that is the difference
+/// between 130 statements answering `false` and the true figure of 122. The server's regime and
+/// the grammar's disagree about the construct, and this is the disagreement arriving as an
+/// off-by-eight.
+///
+/// ⚠️ A value written as an **identifier** is invisible here and no token scan can see it:
+/// `DEFINER=`msandbox`@`%`` is a username and a host in backticks. A caller must say so rather
+/// than imply this covers it.
+pub fn carries_a_value(sql: &str) -> Option<bool> {
+    fn scan(sql: &str, depth: u32) -> Option<bool> {
+        if depth > 4 {
+            return Some(false);
+        }
+        let tokens = Tokenizer::new(&MySqlDialect {}, sql).tokenize().ok()?;
+        for t in &tokens {
+            match t {
+                Token::Number(..)
+                | Token::SingleQuotedString(_)
+                | Token::DoubleQuotedString(_)
+                | Token::NationalStringLiteral(_)
+                | Token::HexStringLiteral(_)
+                | Token::EscapedStringLiteral(_)
+                | Token::SingleQuotedByteStringLiteral(_)
+                | Token::DoubleQuotedByteStringLiteral(_) => return Some(true),
+                Token::Whitespace(Whitespace::MultiLineComment(body)) => {
+                    // `!40101 SET ...` -- a gate the server would have run.
+                    if let Some(rest) = body.trim_start().strip_prefix('!') {
+                        let inner = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+                        if scan(inner, depth + 1)? {
+                            return Some(true);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some(false)
+    }
+    scan(sql, 0)
+}
+
+/// The substitution half of [`LiteralPass`], sharing its arm filter and therefore its ordinals.
+struct RewritePass<'a> {
+    replacements: &'a [Option<String>],
+    seen: usize,
+}
+
+impl VisitorMut for RewritePass<'_> {
+    type Break = ();
+
+    fn pre_visit_value(&mut self, value: &mut Value) -> ControlFlow<Self::Break> {
+        // ⛔ THE SAME ARMS AS `LiteralPass::pre_visit_value`, AND THAT IS LOAD-BEARING. A
+        // boolean, a NULL or a placeholder is recorded by neither, so neither advances its
+        // counter over one -- and an ordinal that meant a different literal in the two passes
+        // would substitute the author's value into the wrong slot.
+        if !matches!(
+            value,
+            Value::Number(..)
+                | Value::SingleQuotedString(_)
+                | Value::DoubleQuotedString(_)
+                | Value::NationalStringLiteral(_)
+                | Value::HexStringLiteral(_)
+        ) {
+            return ControlFlow::Continue(());
+        }
+        let i = self.seen;
+        self.seen += 1;
+        let Some(Some(new)) = self.replacements.get(i) else {
+            return ControlFlow::Continue(());
+        };
+        // ⭐ Assigning through `&mut Value` leaves the `ValueWithSpan` wrapper alone, for the
+        // same reason masking does.
+        *value = match &*value {
+            Value::Number(_, long) => Value::Number(new.clone(), *long),
+            Value::SingleQuotedString(_) => Value::SingleQuotedString(new.clone()),
+            Value::DoubleQuotedString(_) => Value::DoubleQuotedString(new.clone()),
+            Value::NationalStringLiteral(_) => Value::NationalStringLiteral(new.clone()),
+            Value::HexStringLiteral(_) => Value::HexStringLiteral(new.clone()),
+            other => other.clone(),
+        };
+        ControlFlow::Continue(())
+    }
 }
 
 /// Records every literal in a statement, and replaces it where asked, in ONE traversal.
@@ -685,10 +884,213 @@ pub fn parse_sql(
 struct LiteralPass {
     literals: Vec<EntryLiteral>,
     mask: bool,
+    /// One entry per enclosing `Expr`, saying what a value **directly beneath it** is compared
+    /// against.
+    ///
+    /// ⭐ THE PARENT AND ONLY THE PARENT. `pre_visit_value` fires inside the `Expr::Value` node,
+    /// so the stack reads `[…, the comparison, Expr::Value]` and the binding is at `len - 2`.
+    /// Searching further up would let `WHERE a = f(g(1))` bind `1` to `a`, which is a claim the
+    /// author did not make: the value is an argument, not a key.
+    binds: Vec<Option<LiteralColumn>>,
+    /// Values reached through a node that is **not** an `Expr`, by the address of the value.
+    ///
+    /// ⛔⛔ `Assignment` AND AN INSERT COLUMN LIST ARE NOT EXPRESSIONS, so no hook on this
+    /// visitor ever sees the column beside the value — and on `slow-test-queries.log` those are
+    /// the ONLY bound literals there are. [`Self::binds`] cannot reach them at any depth.
+    ///
+    /// ⚠️ Keyed on the value's address and never on its payload. `INSERT INTO t (a, b)
+    /// VALUES (5, 5)` writes one payload into two columns, and a payload-matched queue would
+    /// hand both to whichever it met first. The address is taken in `pre_visit_statement`, which
+    /// runs before the statement's children and therefore before anything is masked; masking
+    /// assigns *through* `&mut Value` and moves no node, so the address still names the same
+    /// slot when `pre_visit_value` reaches it. Nothing is ever dereferenced.
+    targets: HashMap<usize, LiteralColumn>,
+    /// ⭐⭐ Values written by an `INSERT` that named **no columns**, by address, with the
+    /// position in the row they were written at.
+    ///
+    /// The author's data, and the column IS recoverable -- positionally. An `INSERT` with no
+    /// column list writes in the table's own column order, so the `n`-th value reaches the
+    /// `n`-th column for every such statement against that table. Kept apart from
+    /// [`Self::targets`] because a positional domain and a named one are not known to be the
+    /// same domain: deciding that needs the catalogue.
+    positional: HashMap<usize, u32>,
+}
+
+/// The column name an `ObjectName` spells, split into its qualifier and its last part.
+fn column_of_name(n: &ObjectName) -> Option<LiteralColumn> {
+    let mut parts: Vec<String> = n
+        .0
+        .iter()
+        .filter_map(|p| p.as_ident().map(|i| i.value.clone()))
+        .collect();
+    let name = parts.pop()?;
+    Some(LiteralColumn {
+        qualifier: parts.is_empty().not().then(|| Bytes::from(parts.join("."))),
+        name: Bytes::from(name),
+    })
+}
+
+/// Records the address of every literal a **non-expression** node pairs with a column.
+///
+/// ⚠️ `UPDATE … SET (a, b) = (…)` -- `AssignmentTarget::Tuple` -- is deliberately not here. The
+/// tuple's right-hand side is one `Expr`, not a list, so which column each value inside it goes
+/// to is a positional reading of a subquery or a row constructor, and MySQL does not write it.
+fn statement_targets(
+    s: &Statement,
+    out: &mut HashMap<usize, LiteralColumn>,
+    positional: &mut HashMap<usize, u32>,
+) {
+    let mut put = |col: Option<LiteralColumn>, e: &Expr| {
+        if let (Some(c), Expr::Value(v)) = (col, e) {
+            out.insert(std::ptr::from_ref(&v.value).addr(), c);
+        }
+    };
+    match s {
+        Statement::Update { assignments, .. } => {
+            for a in assignments {
+                if let AssignmentTarget::ColumnName(n) = &a.target {
+                    put(column_of_name(n), &a.value);
+                }
+            }
+        }
+        Statement::Insert(i) => {
+            let Some(q) = &i.source else { return };
+            let SetExpr::Values(vs) = q.body.as_ref() else {
+                return;
+            };
+            for row in &vs.rows {
+                // ⛔⛔ AN INSERT WITH NO COLUMN LIST IS STILL WRITING THE AUTHOR'S DATA, and
+                // filing its values as "no column is named here" put them in the same bucket as
+                // a `LIMIT` and a `CREATE TABLE` default -- things that name nobody. They are not
+                // the same: `INSERT INTO t VALUES (1, 'kay')` writes a row, and on
+                // `slow-test-queries.log` that is **98 literals** a rule keyed on the bucket
+                // would have shipped in the clear.
+                //
+                // ⚠️ The column is genuinely not recoverable -- it is the table's `n`-th, and
+                // which one that is lives in a catalogue no slow log carries. So this says the
+                // value was WRITTEN and declines to name where, which are two different claims
+                // and were one.
+                if i.columns.is_empty() {
+                    // ⭐⭐ AND THE COLUMN IS RECOVERABLE AFTER ALL, POSITIONALLY. An `INSERT`
+                    // with no column list writes in the table's own column order, so the `n`-th
+                    // value goes to the `n`-th column -- for every such statement against that
+                    // table, which is exactly what makes `(relation, #n)` a domain rather than a
+                    // label. Two statements writing the same value at the same position really
+                    // did go for the same key.
+                    //
+                    // ⛔ IT IS NOT THE SAME DOMAIN AS A NAMED ONE and must never be fused with
+                    // it. `INSERT INTO t (b, a) VALUES (1, 2)` puts `1` in `b`, and
+                    // `INSERT INTO t VALUES (1, 2)` puts `1` in the table's first column, which
+                    // the log does not say is `b`. Deciding they are one needs the catalogue,
+                    // and a slow log carries none -- so `#0` and `b` stay apart, the same way
+                    // `_bare` and `_resolved` stay apart one grain up.
+                    for (n, e) in row.iter().enumerate() {
+                        if let Expr::Value(v) = e {
+                            positional.insert(std::ptr::from_ref(&v.value).addr(), n as u32);
+                        }
+                    }
+                    continue;
+                }
+                for (col, e) in i.columns.iter().zip(row) {
+                    put(
+                        Some(LiteralColumn {
+                            qualifier: None,
+                            name: Bytes::from(col.value.clone()),
+                        }),
+                        e,
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The column a value **directly beneath this expression** is sought in, where there is one.
+///
+/// ⛔ COMPARISON OPERATORS ONLY, and the reason is not fussiness. `Expr::BinaryOp` covers `+`
+/// as well as `=`, so a rule that took any binary operator would bind the `1` in `qty + 1` to
+/// `qty` — filing arithmetic as a key lookup, in a column whose whole purpose is to say which
+/// rows a statement went for.
+fn binding_of(e: &Expr) -> Option<LiteralColumn> {
+    let is_value = |x: &Expr| matches!(x, Expr::Value(_));
+    match e {
+        Expr::BinaryOp { left, op, right } if is_comparison(op) => {
+            if is_value(right) {
+                column_of(left)
+            } else if is_value(left) {
+                column_of(right)
+            } else {
+                None
+            }
+        }
+        // ⭐ Every member of an `IN` list is sought in the same column, so one binding serves
+        // them all — and they are direct children, which is what makes that exact.
+        Expr::InList { expr, list, .. } if list.iter().any(is_value) => column_of(expr),
+        // ⭐ A range, which is where InnoDB's next-key locking actually lives: the bound is a
+        // claim about a stretch of the index rather than about one row.
+        Expr::Between {
+            expr, low, high, ..
+        } if is_value(low) || is_value(high) => column_of(expr),
+        _ => None,
+    }
+}
+
+/// Whether this operator makes its two sides a comparison rather than a computation.
+fn is_comparison(op: &BinaryOperator) -> bool {
+    use BinaryOperator as B;
+    matches!(
+        op,
+        // ⚠️ `<=>` is MySQL's own NULL-safe equality and belongs here for the same reason `=`
+        // does: it names rows.
+        B::Eq | B::NotEq | B::Lt | B::LtEq | B::Gt | B::GtEq | B::Spaceship
+    )
+}
+
+/// The written column name, where this expression is one.
+fn column_of(e: &Expr) -> Option<LiteralColumn> {
+    match e {
+        Expr::Identifier(i) => Some(LiteralColumn {
+            qualifier: None,
+            name: Bytes::from(i.value.clone()),
+        }),
+        Expr::CompoundIdentifier(parts) => {
+            let (last, rest) = parts.split_last()?;
+            Some(LiteralColumn {
+                qualifier: rest.is_empty().not().then(|| {
+                    Bytes::from(
+                        rest.iter()
+                            .map(|p| p.value.clone())
+                            .collect::<Vec<_>>()
+                            .join("."),
+                    )
+                }),
+                name: Bytes::from(last.value.clone()),
+            })
+        }
+        _ => None,
+    }
 }
 
 impl VisitorMut for LiteralPass {
     type Break = ();
+
+    fn pre_visit_statement(&mut self, statement: &mut Statement) -> ControlFlow<Self::Break> {
+        statement_targets(statement, &mut self.targets, &mut self.positional);
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        // ⚠️ Read BEFORE the value beneath is masked. `pre_visit_value` replaces the value with
+        // a placeholder, and a binding computed afterwards would see `?` on both sides.
+        self.binds.push(binding_of(expr));
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(&mut self, _expr: &mut Expr) -> ControlFlow<Self::Break> {
+        self.binds.pop();
+        ControlFlow::Continue(())
+    }
 
     fn pre_visit_value(&mut self, value: &mut Value) -> ControlFlow<Self::Break> {
         let (kind, payload) = match value {
@@ -703,11 +1105,27 @@ impl VisitorMut for LiteralPass {
             _ => return ControlFlow::Continue(()),
         };
 
+        // ⚠️ `len - 2` and never a search: see [`LiteralPass::binds`]. A value with no enclosing
+        // expression at all -- which the traversal does reach -- binds to nothing.
+        let sought = self
+            .binds
+            .len()
+            .checked_sub(2)
+            .and_then(|i| self.binds[i].clone());
+        // ⭐ The predicate first: a value can only be in one of the two positions, and where it
+        // is in neither both are `None`.
+        let addr = std::ptr::from_ref(&*value).addr();
+        let written = self.targets.get(&addr).cloned();
+        let column_position = self.positional.get(&addr).copied();
+
         self.literals.push(EntryLiteral {
             ordinal: self.literals.len() as u32,
             rendered: Bytes::from(value.to_string()),
             value: Bytes::from(payload),
             kind,
+            sought: sought.is_some(),
+            column_position,
+            column: sought.or(written),
         });
 
         if self.mask {
@@ -805,6 +1223,366 @@ mod every_literal_kind {
                 .iter()
                 .all(|(k, _)| *k == LiteralKind::SingleQuotedString),
             "the unambiguous spelling, for contrast"
+        );
+    }
+}
+
+/// ⭐⭐⭐ THE SUBSTITUTION, WHICH IS WHAT LETS A STATEMENT SHIP WITHOUT ITS SUBJECT.
+#[cfg(test)]
+mod a_literal_can_be_replaced_by_its_surrogate {
+    use super::*;
+
+    fn lits(sql: &str) -> Vec<String> {
+        parse_sql(sql, &EntryMasking::None)
+            .unwrap()
+            .1
+            .iter()
+            .map(|l| String::from_utf8_lossy(&l.value).into_owned())
+            .collect()
+    }
+
+    /// ⭐⭐ THE ROUND TRIP, WHICH IS THE ONLY THING THAT SAYS THE ORDINALS LINE UP.
+    ///
+    /// Rewrite every literal to its own recorded value and the statement must come back
+    /// unchanged. ⛔ If [`RewritePass`] counted one arm differently from [`LiteralPass`] -- a
+    /// `NULL`, a `TRUE`, a `?` -- every ordinal after it would be off by one and this is what
+    /// catches it, on a statement built to contain exactly those.
+    #[test]
+    fn rewriting_each_literal_to_itself_changes_nothing() {
+        let sql = "SELECT a FROM t WHERE id = 42 AND ok = TRUE AND note IS NULL \
+                   AND name = 'kay' AND tag = X'41' AND n = N'x' LIMIT 10";
+        let rendered = parse_sql(sql, &EntryMasking::None).unwrap().0[0].to_string();
+        let same: Vec<Option<String>> = lits(&rendered).into_iter().map(Some).collect();
+        assert_eq!(same.len(), 5, "TRUE and NULL are not the author's subject");
+        assert_eq!(rewrite_literals(&rendered, &same).as_deref(), Some(&*rendered));
+    }
+
+    /// ⛔ AND THE SUBSTITUTION LANDS WHERE THE ORDINAL SAYS, not one literal over.
+    #[test]
+    fn a_surrogate_replaces_the_literal_its_ordinal_names() {
+        let sql = "SELECT a FROM t WHERE ok = TRUE AND id = 42 AND other = 99";
+        let rendered = parse_sql(sql, &EntryMasking::None).unwrap().0[0].to_string();
+        assert_eq!(lits(&rendered), vec!["42", "99"]);
+        let out = rewrite_literals(&rendered, &[Some("7".into()), None]).unwrap();
+        assert!(out.contains("id = 7"), "{out}");
+        assert!(out.contains("other = 99"), "{out}");
+    }
+
+    /// ⛔⛔ THE KIND IS THE ORIGINAL'S AND THE CALLER CANNOT SAY OTHERWISE.
+    ///
+    /// A number that came back quoted would be a different statement: MySQL coerces the
+    /// comparison and takes a different route through the index, so a replay of it contends
+    /// somewhere else. The caller supplies a payload and never a type.
+    #[test]
+    fn a_surrogate_keeps_the_type_the_author_wrote() {
+        let n = rewrite_literals("SELECT a FROM t WHERE id = 42", &[Some("7".into())]).unwrap();
+        assert!(n.contains("id = 7") && !n.contains("'7'"), "{n}");
+
+        let q = rewrite_literals("SELECT a FROM t WHERE k = '42'", &[Some("7".into())]).unwrap();
+        assert!(q.contains("k = '7'"), "{q}");
+
+        // ⭐ And the mapped statement is still SQL, which is the whole difference between this
+        // and a `?` nobody recorded a bind for.
+        for out in [n, q] {
+            assert!(parse_sql(&out, &EntryMasking::None).is_ok(), "{out}");
+        }
+    }
+
+    /// ⛔ TEXT WITH NO PARSE GETS `None` AND NEVER ITS OWN BYTES BACK.
+    ///
+    /// A caller holding a surrogate and no tree to apply it to must **withhold**. Handing back
+    /// the original would return the author's values from a call whose name promises it did not.
+    #[test]
+    fn text_that_does_not_parse_is_refused_rather_than_returned() {
+        assert_eq!(rewrite_literals("ALTER TABLE t DISABLE KEYS", &[Some("1".into())]), None);
+        assert_eq!(rewrite_literals("LOCK TABLES shop.invoice WRITE", &[]), None);
+        // ⚠️ And two statements are refused as well: the ordinals would span them and a caller
+        // asking for one statement's literal would reach another's.
+        assert_eq!(rewrite_literals("SELECT 1; SELECT 2", &[Some("9".into())]), None);
+    }
+
+    /// ⚠️ A short slice leaves the tail alone rather than panicking, because the caller's map
+    /// is built per domain and a literal in no domain has no surrogate to offer.
+    #[test]
+    fn a_literal_with_no_surrogate_is_left_as_the_author_wrote_it() {
+        let out = rewrite_literals("SELECT a FROM t WHERE id = 42 LIMIT 10", &[]).unwrap();
+        assert!(out.contains("42") && out.contains("10"), "{out}");
+    }
+
+    /// ⛔⛔ AN INSERT WITH NO COLUMN LIST IS WRITING DATA, NOT WRITING NOTHING.
+    ///
+    /// `INSERT INTO t VALUES (1, 'kay')` puts a row in a table. Filing those values as "no
+    /// column is named here" — the bucket a `LIMIT` and a `CREATE TABLE` default live in — made
+    /// them look like grammar, and on `slow-test-queries.log` that is **98 literals** a rule
+    /// keyed on the bucket would have published in the clear.
+    ///
+    /// ⚠️ The column really is unrecoverable: it is the table's `n`-th and which one that is
+    /// lives in a catalogue no slow log carries. So the claim is *written*, and *where* is
+    /// declined — two claims that had been one.
+    #[test]
+    fn an_insert_with_no_column_list_writes_to_a_column_it_can_name_by_position() {
+        let ls = parse_sql("INSERT INTO t VALUES (1, 'kay')", &EntryMasking::None)
+            .unwrap()
+            .1;
+        assert_eq!(ls.len(), 2);
+        // ⭐⭐ AND THE COLUMN IS RECOVERABLE POSITIONALLY: the `n`-th value reaches the table's
+        // `n`-th column, for every such statement against that table.
+        assert_eq!(
+            ls.iter().map(|l| l.column_position).collect::<Vec<_>>(),
+            vec![Some(0), Some(1)]
+        );
+        assert!(ls.iter().all(|l| l.column.is_none()), "and it is not NAMED");
+
+        // ⭐ A column list names them, so they are named and NOT positional -- the two are
+        // exclusive, and the same statement one clause different proves it.
+        let named = parse_sql("INSERT INTO t (a, b) VALUES (1, 'kay')", &EntryMasking::None)
+            .unwrap()
+            .1;
+        assert!(named.iter().all(|l| l.column_position.is_none()));
+        assert!(named.iter().all(|l| l.column.is_some()));
+
+        // ⛔ And a literal that names nobody is in neither: a `LIMIT` is grammar.
+        let limit = parse_sql("SELECT a FROM t LIMIT 10", &EntryMasking::None).unwrap().1;
+        assert_eq!(limit.len(), 1);
+        assert!(limit[0].column_position.is_none() && limit[0].column.is_none());
+
+        // ⛔⛔ EVERY ROW OF A MULTI-ROW INSERT COUNTS FROM ZERO AGAIN. A counter that ran on
+        // across rows would file the second row's first value in the table's third column.
+        let rows = parse_sql("INSERT INTO t VALUES (1, 2), (3, 4)", &EntryMasking::None)
+            .unwrap()
+            .1;
+        assert_eq!(
+            rows.iter().map(|l| l.column_position).collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(0), Some(1)]
+        );
+    }
+
+    /// ⛔⛔ THE VERSION GATE IS THE WHOLE DIFFICULTY, and a plain token scan misses it.
+    ///
+    /// `sqlparser` files `/*!40101 ... */` as one comment; MySQL executes it. A scan that does
+    /// not open the gate answers `false` on a statement that sets a value, which on
+    /// `slow-test-queries.log` is eight statements' worth of difference.
+    #[test]
+    fn a_value_inside_a_version_gate_is_still_a_value() {
+        assert_eq!(carries_a_value("/*!40103 SET TIME_ZONE='+00:00' */;"), Some(true));
+        assert_eq!(carries_a_value("/*!40014 SET UNIQUE_CHECKS=0 */;"), Some(true));
+        // ⭐ And the same gate with nothing in it stays false, so the recursion is not a
+        // blanket `true` on every gated statement.
+        assert_eq!(
+            carries_a_value("/*!40101 SET character_set_client = utf8 */;"),
+            Some(false)
+        );
+    }
+
+    /// ⭐ The statements this grammar refuses and that carry nothing -- which on the shipped
+    /// corpus is 122 of 131, and is why withholding them all would be withholding for nothing.
+    #[test]
+    fn a_statement_with_no_value_carries_none() {
+        for sql in [
+            "ALTER TABLE `film` DISABLE KEYS",
+            "ANALYZE TABLE actor, address, category",
+            "UNLOCK TABLES",
+            "LOCK TABLES shop.invoice WRITE",
+        ] {
+            assert_eq!(carries_a_value(sql), Some(false), "{sql}");
+        }
+        for sql in [
+            "LOAD DATA INFILE '/tmp/load_data_test.24252' INTO TABLE percona_test.load_data",
+            "SELECT a FROM t LIMIT 10",
+        ] {
+            assert_eq!(carries_a_value(sql), Some(true), "{sql}");
+        }
+    }
+
+    /// ⚠️ AND A VALUE WRITTEN AS AN IDENTIFIER IS INVISIBLE, which is stated rather than
+    /// implied. `DEFINER=`msandbox`@`%`` is a username and a host, and no scan for literals can
+    /// see them -- three of the shipped log's unparseable statements carry exactly that.
+    #[test]
+    fn a_value_written_as_an_identifier_is_not_seen() {
+        assert_eq!(
+            carries_a_value("/*!50003 CREATE*/ /*!50017 DEFINER=`msandbox`@`%`*/ /*!50003 \
+                             TRIGGER rental_date BEFORE INSERT ON rental FOR EACH ROW \
+                             SET NEW.rental_date = NOW() */;"),
+            Some(false)
+        );
+    }
+}
+
+/// ⭐⭐⭐ THE DOMAIN A VALUE LIVES IN, WHICH THE RECORD THREW AWAY ON EVERY LITERAL.
+///
+/// `WHERE tenant_id = 42` filed `42` and lost `tenant_id`, so `42` the tenant and `42` the row
+/// limit sat in one pool with nothing separating them. A value means nothing outside a domain,
+/// and for a lock the domain is a column of a relation.
+#[cfg(test)]
+mod every_literal_binding {
+    use super::*;
+
+    /// `(rendered, qualifier.name or "-", sought)` for each literal, in ordinal order.
+    fn bound(sql: &str, mask: &EntryMasking) -> Vec<(String, String, bool)> {
+        parse_sql(sql, mask)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .1
+            .iter()
+            .map(|l| {
+                let col = match &l.column {
+                    Some(c) => match &c.qualifier {
+                        Some(q) => format!(
+                            "{}.{}",
+                            String::from_utf8_lossy(q),
+                            String::from_utf8_lossy(&c.name)
+                        ),
+                        None => String::from_utf8_lossy(&c.name).into_owned(),
+                    },
+                    None => "-".to_string(),
+                };
+                (
+                    String::from_utf8_lossy(&l.rendered).into_owned(),
+                    col,
+                    l.sought,
+                )
+            })
+            .collect()
+    }
+
+    /// ⭐ Every syntactic shape that names the column a value is **sought** in.
+    #[test]
+    fn a_literal_carries_the_column_the_author_looked_for_it_in() {
+        assert_eq!(
+            bound("SELECT id FROM t WHERE tenant_id = 42", &EntryMasking::None),
+            [("42".into(), "tenant_id".into(), true)]
+        );
+        // ⭐ Written either way round: a predicate is a comparison, not an assignment.
+        assert_eq!(
+            bound("SELECT id FROM t WHERE 42 = tenant_id", &EntryMasking::None),
+            [("42".into(), "tenant_id".into(), true)]
+        );
+        // ⭐ The qualifier the author wrote, which is an alias far more often than a table.
+        assert_eq!(
+            bound("SELECT id FROM t e1 WHERE e1.dept_id = 4", &EntryMasking::None),
+            [("4".into(), "e1.dept_id".into(), true)]
+        );
+        // ⭐ An `IN` list: every member is sought in the same column.
+        assert_eq!(
+            bound("SELECT id FROM t WHERE id IN (1, 2, 3)", &EntryMasking::None),
+            [
+                ("1".into(), "id".into(), true),
+                ("2".into(), "id".into(), true),
+                ("3".into(), "id".into(), true)
+            ]
+        );
+        // ⭐⭐ A range, which is where InnoDB's next-key locking actually lives.
+        assert_eq!(
+            bound("SELECT id FROM t WHERE id BETWEEN 5 AND 9", &EntryMasking::None),
+            [
+                ("5".into(), "id".into(), true),
+                ("9".into(), "id".into(), true)
+            ]
+        );
+    }
+
+    /// ⛔⛔ ARITHMETIC IS NOT A KEY LOOKUP, AND THE FIXTURE HAS NINE OF THEM.
+    ///
+    /// `Expr::BinaryOp` covers `+` as well as `=`. A rule taking any binary operator binds the
+    /// `1` in `qty - 1` to `qty` and files a computation as a row the statement went for.
+    /// Measured on `structure.log`: **116 bound under the comparison rule against 125 under the
+    /// naive one** — `total + 5`, `n + 1` twice, `n + 2` twice, `qty - 1`, `qty - 2`,
+    /// `price + 1`, and one more.
+    #[test]
+    fn arithmetic_is_not_a_key_lookup() {
+        // ⚠️ Neither literal is bound: `1` sits under `-`, and `0`'s other side is a
+        // computation rather than a column.
+        assert_eq!(
+            bound("SELECT id FROM t WHERE qty - 1 > 0", &EntryMasking::None),
+            [
+                ("1".into(), "-".into(), false),
+                ("0".into(), "-".into(), false)
+            ]
+        );
+        // ⭐ And the same column with a comparison **is** bound, so the rule is about the
+        // operator and not about the shape.
+        assert_eq!(
+            bound("SELECT id FROM t WHERE qty > 0", &EntryMasking::None),
+            [("0".into(), "qty".into(), true)]
+        );
+    }
+
+    /// ⛔ A VALUE SOUGHT AND A VALUE WRITTEN ARE DIFFERENT CLAIMS, and one statement makes both.
+    ///
+    /// A lock taken to find a row and a lock taken to change one are different locks, so the
+    /// column alone would fuse them.
+    #[test]
+    fn a_written_value_and_a_sought_value_are_not_the_same_claim() {
+        assert_eq!(
+            bound("UPDATE t SET qty = 5 WHERE id = 7", &EntryMasking::None),
+            [
+                ("5".into(), "qty".into(), false),
+                ("7".into(), "id".into(), true)
+            ]
+        );
+    }
+
+    /// ⛔⛔ ONE PAYLOAD WRITTEN TO TWO COLUMNS, which is what rules out matching on the payload.
+    ///
+    /// `Assignment` and an insert column list are not expressions, so the binding is taken by
+    /// the value's **address** in `pre_visit_statement`. A queue keyed on `5` would hand both
+    /// columns to whichever it met first and the two would be indistinguishable.
+    #[test]
+    fn one_payload_written_to_two_columns_keeps_them_apart() {
+        assert_eq!(
+            bound("INSERT INTO t (a, b) VALUES (5, 5)", &EntryMasking::None),
+            [
+                ("5".into(), "a".into(), false),
+                ("5".into(), "b".into(), false)
+            ]
+        );
+    }
+
+    /// ⭐⭐ THE SHIPPED CORPUS SEEKS NOTHING, which a predicate-only rule would have read as
+    /// silence.
+    ///
+    /// `slow-test-queries.log` is a sandbox startup and a `mysqldump` restore: **0 of its 302
+    /// literals sit in a predicate** and all 50 of its bound ones are insert columns. A corpus
+    /// that only ever wrote is a different thing from a corpus with no domains in it.
+    #[test]
+    fn an_insert_names_a_domain_even_where_no_predicate_does() {
+        assert_eq!(
+            bound(
+                "INSERT INTO checksums (db_tbl, checksum) VALUES ('sakila.actor', 188518946)",
+                &EntryMasking::None
+            ),
+            [
+                ("'sakila.actor'".into(), "db_tbl".into(), false),
+                ("188518946".into(), "checksum".into(), false)
+            ]
+        );
+    }
+
+    /// ⭐ MASKING MOVES THE RENDER AND NOT THE DOMAIN.
+    ///
+    /// The binding is read in `pre_visit_statement` and `pre_visit_expr`, both of which run
+    /// before the value beneath is replaced. A binding computed afterwards would see `?` on
+    /// both sides of every comparison and bind nothing at all.
+    #[test]
+    fn masking_does_not_move_a_literal_out_of_its_domain() {
+        let sql = "UPDATE t SET qty = 5 WHERE e1.dept_id BETWEEN 2 AND 8";
+        let plain = bound(sql, &EntryMasking::None);
+        let masked = bound(sql, &EntryMasking::PlaceHolder);
+        assert_eq!(
+            plain.iter().map(|(_, c, s)| (c, s)).collect::<Vec<_>>(),
+            masked.iter().map(|(_, c, s)| (c, s)).collect::<Vec<_>>(),
+            "the domain is the author's and masking is the reader's"
+        );
+        // ⚠️ `rendered` stays the author's under both settings -- it is a column of THEIR
+        // document, which is the whole point of filing literals through masking. What masking
+        // moves is the statement, so that is where the placeholder is checked.
+        assert!(
+            plain.iter().all(|(r, _, _)| r != "?"),
+            "the author's spelling is recorded either way: {plain:?}"
+        );
+        let rendered = parse_sql(sql, &EntryMasking::PlaceHolder).unwrap().0[0].to_string();
+        assert!(
+            rendered.contains("qty = ?") && rendered.contains("BETWEEN ? AND ?"),
+            "and the statement really is masked: {rendered}"
         );
     }
 }

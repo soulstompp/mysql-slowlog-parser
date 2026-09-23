@@ -53,8 +53,10 @@ use std::fmt::{Debug, Formatter};
 use thiserror::Error;
 
 pub use crate::parser::{
-    EntryAdminCommand, EntryLiteral, LiteralKind, SessionLine, SqlStatementContext, StatsLine,
+    EntryAdminCommand, EntryLiteral, LiteralColumn, LiteralKind, SessionLine, SqlStatementContext,
+    StatsLine,
     TimeLine,
+    carries_a_value, rewrite_literals,
 };
 
 use bytes::Bytes;
