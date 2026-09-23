@@ -123,25 +123,43 @@ pub enum JoinOp {
     Left,
     /// `RIGHT JOIN`
     Right,
-    /// `FULL OUTER JOIN`
-    FullOuter,
     /// `CROSS JOIN`
     Cross,
-    /// `SEMI` in any of its spellings
-    Semi,
-    /// `ANTI` in any of its spellings
-    Anti,
     /// `STRAIGHT_JOIN`
     Straight,
-    /// `CROSS APPLY` / `OUTER APPLY`
-    Apply,
-    /// `ASOF`
-    AsOf,
     /// a comma in a `FROM` list
     Comma,
-    /// ⭐ not a join at all: a predicate in a nested scope naming a relation from an enclosing
-    /// one. This is the edge that makes a descent stop being a tree.
-    Correlation,
+    /// ⭐ not a join operator at all: a comparison written in a predicate clause — `WHERE`,
+    /// `HAVING`, or an expression in the projection — whose two sides name different relations.
+    ///
+    /// ⛔ THIS WAS CALLED `Correlation` AND THAT NAME WAS TRUE OF TWO THIRDS OF THEM. A
+    /// correlation is specifically the **cross-scope** case, and this variant also holds the
+    /// ordinary same-scope predicate — which for a comma join is the join condition itself,
+    /// since old-style SQL puts it in the `WHERE` where there is no `ON` to put it in. Whether
+    /// an edge crosses a scope is [`JoinEdge::crosses_scope`] and was already filed beside it,
+    /// so the two facts stay two columns:
+    ///
+    /// > a correlation is `op == Predicate && crosses_scope`, and it is a **reading**.
+    ///
+    /// Making it a variant instead would define `op` out of `crosses_scope` and file one
+    /// witness twice.
+    Predicate,
+    /// ⛔⛔ A JOIN OPERATOR MYSQL CANNOT WRITE.
+    ///
+    /// `sqlparser` is a multi-dialect parser and `MySqlDialect` gates very little, so it will
+    /// build `FULL OUTER JOIN`, `SEMI`/`ANTI JOIN`, `CROSS`/`OUTER APPLY` and `ASOF JOIN` out of
+    /// text MySQL has no syntax for. **This crate reads MySQL slow logs**, so a server that
+    /// wrote one of those lines is not the server this parser is for.
+    ///
+    /// ⭐ They used to be five named arms. Naming them made the vocabulary a union of every
+    /// dialect `sqlparser` knows, and put five cases that **cannot occur** in front of every
+    /// consumer, every match and every coverage law. One arm instead: the grammar we worry about
+    /// is MySQL's.
+    ///
+    /// ⚠️ A row carrying this is a **diagnostic and not data** — either the input was not a
+    /// MySQL slow log, or `sqlparser` built a tree the server could not have run. The author's
+    /// bytes are on the entry either way.
+    NotMySql,
 }
 
 /// What the join said about how to match rows.
@@ -599,7 +617,7 @@ impl Builder {
                 }
                 if let Some(e) = selection {
                     self.walk_expr(e, scope);
-                    self.predicate_edges(e, scope, JoinOp::Correlation, ConstraintKind::On);
+                    self.predicate_edges(e, scope, JoinOp::Predicate, ConstraintKind::On);
                 }
             }
             Statement::Delete(Delete {
@@ -624,7 +642,7 @@ impl Builder {
                 }
                 if let Some(e) = selection {
                     self.walk_expr(e, scope);
-                    self.predicate_edges(e, scope, JoinOp::Correlation, ConstraintKind::On);
+                    self.predicate_edges(e, scope, JoinOp::Predicate, ConstraintKind::On);
                 }
             }
             Statement::CreateView { name, query, .. } => {
@@ -726,9 +744,11 @@ impl Builder {
             // | `FLUSH TABLES t` | `Flush.tables`, **unannotated** | ⛔ not walked — takes a metadata lock and is invisible |
             // | `SHOW CREATE TABLE t` | `ShowCreate.obj_name`, unannotated | ⛔ not walked — reads the dictionary, opens nothing |
             // | `EXPLAIN t` / `DESCRIBE t` | `ExplainTable.table_name`, annotated | ⛔ not walked — reads the dictionary |
+            // | `EXPLAIN SELECT … FROM t` | `Explain.statement`, a whole `Statement` | ⛔⛔ not walked — and this row did not exist. The form above is `ExplainTable`; THIS one wraps an entire query whose `FROM` names a relation the walk drops. `EXPLAIN` plans without executing: it opens the table and takes a shared metadata lock, and reads **no rows**. Filing it as a read would put a demand on `demand.parquet` for a statement that examined nothing; filing nothing loses a metadata-lock holder. The second is chosen because the first invents a figure, and `rows_examined = 0` is what the record has to show for it. |
             // | `OPTIMIZE` / `CHECK` / `REPAIR TABLE` | — | ⛔ `sqlparser` refuses them outright |
             // | `DROP INDEX idx ON t` | — | ⛔ `sqlparser` refuses MySQL's form |
             // | `LOAD DATA INFILE … INTO TABLE t` | — | ⛔ `sqlparser` refuses MySQL's form |
+            // | `a CROSS JOIN b ON …` | — | ⛔ `sqlparser` refuses it; in MySQL `JOIN`, `CROSS JOIN` and `INNER JOIN` are **syntactic equivalents** and all three take an `ON` |
             //
             // ⛔ The annotated ones are held by a law rather than by this comment:
             // `nothing objects() found may be missing from the graph` fires the moment one
@@ -784,14 +804,14 @@ impl Builder {
             .chain(select.qualify.iter())
         {
             self.walk_expr(e, scope);
-            self.predicate_edges(e, scope, JoinOp::Correlation, ConstraintKind::On);
+            self.predicate_edges(e, scope, JoinOp::Predicate, ConstraintKind::On);
         }
         for item in &select.projection {
             // ⭐ `actor_info`'s correlated subquery lives inside a `GROUP_CONCAT` inside a
             // `CONCAT` in the projection, which is why the projection is walked at all.
             for e in select_item_exprs(item) {
                 self.walk_expr(e, scope);
-                self.predicate_edges(e, scope, JoinOp::Correlation, ConstraintKind::On);
+                self.predicate_edges(e, scope, JoinOp::Predicate, ConstraintKind::On);
             }
         }
     }
@@ -1098,13 +1118,13 @@ fn classify(op: &JoinOperator) -> (JoinOp, ConstraintKind) {
         J::Join(c) | J::Inner(c) => (JoinOp::Inner, kind(c)),
         J::Left(c) | J::LeftOuter(c) => (JoinOp::Left, kind(c)),
         J::Right(c) | J::RightOuter(c) => (JoinOp::Right, kind(c)),
-        J::FullOuter(c) => (JoinOp::FullOuter, kind(c)),
-        J::Semi(c) | J::LeftSemi(c) | J::RightSemi(c) => (JoinOp::Semi, kind(c)),
-        J::Anti(c) | J::LeftAnti(c) | J::RightAnti(c) => (JoinOp::Anti, kind(c)),
         J::StraightJoin(c) => (JoinOp::Straight, kind(c)),
-        J::AsOf { constraint, .. } => (JoinOp::AsOf, kind(constraint)),
         J::CrossJoin => (JoinOp::Cross, ConstraintKind::None),
-        J::CrossApply | J::OuterApply => (JoinOp::Apply, ConstraintKind::None),
+        // ⛔ MySQL has no syntax for any of these. See [`JoinOp::NotMySql`].
+        J::FullOuter(c) | J::Semi(c) | J::LeftSemi(c) | J::RightSemi(c) | J::Anti(c)
+        | J::LeftAnti(c) | J::RightAnti(c) => (JoinOp::NotMySql, kind(c)),
+        J::AsOf { constraint, .. } => (JoinOp::NotMySql, kind(constraint)),
+        J::CrossApply | J::OuterApply => (JoinOp::NotMySql, ConstraintKind::None),
     }
 }
 
@@ -1167,6 +1187,144 @@ mod tests {
 
     fn graph(sql: &str) -> StatementGraph {
         StatementGraph::of(&one(sql))
+    }
+
+    /// ⭐⭐⭐ EVERY ARM OF [`JoinOp`], WITH THE TEXT THAT REACHES IT.
+    ///
+    /// The rule this crate arrived at is that an unwitnessed arm is a wrong arm — three of three,
+    /// last time one was checked. Sweeping this enum found the arms split two ways, and that is
+    /// what shrank it:
+    ///
+    /// - **seven** are ordinary MySQL. Each is a hole a corpus can and should fill.
+    /// - **five were other dialects'** — `FULL OUTER JOIN`, `SEMI`/`ANTI JOIN`, `CROSS`/`OUTER
+    ///   APPLY` and `ASOF JOIN`, which `MySqlDialect` accepts because `sqlparser`'s parser is
+    ///   largely shared and the dialect gates very little.
+    ///
+    /// ⛔ THE FIVE ARE NOW ONE ARM. **This crate reads MySQL slow logs**, so naming them made
+    /// the vocabulary a union of every dialect `sqlparser` knows and put five cases that cannot
+    /// occur in front of every consumer, every match and every coverage law. They land on
+    /// [`JoinOp::NotMySql`], which this test holds them to — the point being that nothing
+    /// foreign leaks into a MySQL arm, not which foreign thing it was.
+    #[test]
+    fn every_join_operator_the_grammar_can_build_is_classified() {
+        // ⭐ Reachable from MySQL itself. Each of these is valid text for the server that wrote
+        // the log, so each is a hole a fixture can and should fill.
+        let mysql: &[(&str, JoinOp, ConstraintKind)] = &[
+            ("SELECT 1 FROM a JOIN b ON a.i = b.i", JoinOp::Inner, ConstraintKind::On),
+            ("SELECT 1 FROM a INNER JOIN b ON a.i = b.i", JoinOp::Inner, ConstraintKind::On),
+            ("SELECT 1 FROM a LEFT JOIN b ON a.i = b.i", JoinOp::Left, ConstraintKind::On),
+            ("SELECT 1 FROM a LEFT OUTER JOIN b ON a.i = b.i", JoinOp::Left, ConstraintKind::On),
+            ("SELECT 1 FROM a RIGHT JOIN b ON a.i = b.i", JoinOp::Right, ConstraintKind::On),
+            ("SELECT 1 FROM a RIGHT OUTER JOIN b ON a.i = b.i", JoinOp::Right, ConstraintKind::On),
+            ("SELECT 1 FROM a CROSS JOIN b", JoinOp::Cross, ConstraintKind::None),
+            ("SELECT 1 FROM a STRAIGHT_JOIN b ON a.i = b.i", JoinOp::Straight, ConstraintKind::On),
+            ("SELECT 1 FROM a STRAIGHT_JOIN b", JoinOp::Straight, ConstraintKind::None),
+            ("SELECT 1 FROM a JOIN b USING (i)", JoinOp::Inner, ConstraintKind::Using),
+            ("SELECT 1 FROM a NATURAL JOIN b", JoinOp::Inner, ConstraintKind::Natural),
+            ("SELECT 1 FROM a NATURAL LEFT JOIN b", JoinOp::Left, ConstraintKind::Natural),
+            ("SELECT 1 FROM a NATURAL RIGHT JOIN b", JoinOp::Right, ConstraintKind::Natural),
+        ];
+        // ⛔ Text MySQL cannot write. Parsed here so the arm is known to be live code rather
+        // than assumed to be, and so nobody files the absence of a corpus witness as a gap in
+        // the fixtures: no MySQL slow log can contain any of these.
+        let not_mysql: &[&str] = &[
+            "SELECT 1 FROM a FULL OUTER JOIN b ON a.i = b.i",
+            "SELECT 1 FROM a SEMI JOIN b ON a.i = b.i",
+            "SELECT 1 FROM a LEFT SEMI JOIN b ON a.i = b.i",
+            "SELECT 1 FROM a ANTI JOIN b ON a.i = b.i",
+            "SELECT 1 FROM a CROSS APPLY b",
+            "SELECT 1 FROM a OUTER APPLY b",
+            "SELECT 1 FROM a ASOF JOIN b MATCH_CONDITION (a.t >= b.t) ON a.i = b.i",
+        ];
+
+        let mut seen: std::collections::BTreeSet<String> = Default::default();
+        for (sql, want_op, want_con) in mysql {
+            let g = graph(sql);
+            let e = g
+                .edges
+                .iter()
+                .find(|e| e.op == *want_op)
+                .unwrap_or_else(|| panic!("{sql}: no {want_op:?} edge in {:?}", g.edges));
+            assert_eq!(e.constraint, *want_con, "{sql}");
+            assert!(!e.crosses_scope, "{sql}: a FROM-list join stays in its scope");
+            seen.insert(format!("{want_op:?}"));
+        }
+        for sql in not_mysql {
+            let g = graph(sql);
+            // ⛔ The whole claim: it lands on the one arm, and on no MySQL arm.
+            assert!(
+                g.edges.iter().any(|e| e.op == JoinOp::NotMySql),
+                "{sql}: no NotMySql edge in {:?}",
+                g.edges
+            );
+            assert!(
+                !g.edges.iter().any(|e| matches!(
+                    e.op,
+                    JoinOp::Inner | JoinOp::Left | JoinOp::Right | JoinOp::Cross | JoinOp::Straight
+                )),
+                "{sql}: something MySQL cannot write reached a MySQL arm — {:?}",
+                g.edges
+            );
+            seen.insert("NotMySql".to_string());
+        }
+
+        // The two arms no join operator produces: a comma in the FROM list, and a predicate.
+        for (sql, want) in [
+            ("SELECT 1 FROM a, b", JoinOp::Comma),
+            ("SELECT 1 FROM a, b WHERE a.i = b.i", JoinOp::Predicate),
+        ] {
+            assert!(graph(sql).edges.iter().any(|e| e.op == want), "{sql}");
+            seen.insert(format!("{want:?}"));
+        }
+
+        // ⛔ THE GUARD. Eight arms — seven MySQL and the one landing place — written out rather
+        // than derived from the enum, because there is no way to iterate it, so adding a ninth
+        // without a witness has to fail here. It was twelve before the five foreign operators
+        // were collapsed onto one.
+        assert_eq!(
+            seen.len(),
+            8,
+            "every JoinOp arm needs text that reaches it; reached {seen:?}"
+        );
+        assert_eq!(mysql.len() + not_mysql.len(), 20, "cases, for the record");
+    }
+
+    /// ⛔⛔ `op == Predicate` IS NOT A CORRELATION, AND THE NAME SAID IT WAS.
+    ///
+    /// The variant used to be called `Correlation` and was documented as *"a predicate in a
+    /// nested scope naming a relation from an enclosing one"*. That is true of the cross-scope
+    /// ones and false of the rest: an ordinary `WHERE a.i = b.i` over two tables in **one** scope
+    /// draws the same edge, and for a comma join it is the join condition itself — old-style SQL
+    /// has no `ON` to put it in.
+    ///
+    /// ⭐ Both kinds here, distinguished by the column that was already carrying the difference.
+    #[test]
+    fn a_predicate_edge_is_a_correlation_only_when_it_crosses_a_scope() {
+        // Same scope: the comma join's condition. This is the case the old name denied.
+        let g = graph("SELECT 1 FROM a, b WHERE a.i = b.i");
+        let p: Vec<_> = g.edges.iter().filter(|e| e.op == JoinOp::Predicate).collect();
+        assert_eq!(p.len(), 1, "{:?}", g.edges);
+        assert!(!p[0].crosses_scope, "a WHERE over two FROM-list tables stays put");
+
+        // ⚠️ And the comma join writes ONE relationship that arrives as TWO edges: the adjacency
+        // from the FROM list, and the condition from the WHERE. They join the same pair, which is
+        // why `measures()` deduplicates on the node pair and the written count is the larger one.
+        let comma: Vec<_> = g.edges.iter().filter(|e| e.op == JoinOp::Comma).collect();
+        assert_eq!(comma.len(), 1);
+        assert_eq!(
+            (comma[0].lhs, comma[0].rhs).min((comma[0].rhs, comma[0].lhs)),
+            (p[0].lhs, p[0].rhs).min((p[0].rhs, p[0].lhs)),
+            "the adjacency and the condition are about the same pair"
+        );
+        assert_eq!(g.edges.len(), 2);
+        assert_eq!(g.measures().edges, 1, "deduplicated onto the pair");
+
+        // Crossing a scope: the real correlation, and the edge that makes a descent stop being
+        // a tree.
+        let g = graph("SELECT 1 FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.i = a.i)");
+        let p: Vec<_> = g.edges.iter().filter(|e| e.op == JoinOp::Predicate).collect();
+        assert_eq!(p.len(), 1, "{:?}", g.edges);
+        assert!(p[0].crosses_scope, "the inner WHERE names the outer relation");
     }
 
     fn one(sql: &str) -> Statement {

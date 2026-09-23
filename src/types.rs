@@ -2,7 +2,7 @@ use crate::graph::StatementGraph;
 use crate::parser::EntryLiteral;
 use crate::{EntryAdminCommand, SessionLine, SqlStatementContext, StatsLine};
 use bytes::{BufMut, Bytes, BytesMut};
-use sqlparser::ast::{Statement, visit_relations};
+use sqlparser::ast::{ObjectType, Statement, visit_relations};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
@@ -166,7 +166,19 @@ impl EntrySqlStatement {
             Statement::CreateIndex { .. } => EntrySqlType::CreateIndex,
             Statement::CreateView { .. } => EntrySqlType::CreateView,
             Statement::AlterTable { .. } => EntrySqlType::AlterTable,
-            Statement::AlterIndex { .. } => EntrySqlType::AlterIndex,
+            // ⛔ `DROP VIEW v` AND `DROP DATABASE d` BOTH DISPLAYED AS "DROP TABLE". One arm
+            // covered every object type and its spelling asserted the one it is not: the shipped
+            // log's 11 rows typed `DROP TABLE` include a `DROP DATABASE`, and `graph.rs` walks a
+            // drop target only for `Table | View`, so the record disagreed with itself about what
+            // the tenth one dropped.
+            Statement::Drop {
+                object_type: ObjectType::View,
+                ..
+            } => EntrySqlType::DropView,
+            Statement::Drop {
+                object_type: ObjectType::Database | ObjectType::Schema,
+                ..
+            } => EntrySqlType::DropDatabase,
             Statement::Drop { .. } => EntrySqlType::Drop,
             Statement::DropFunction { .. } => EntrySqlType::DropFunction,
             Statement::Set { .. } => EntrySqlType::Set,
@@ -189,8 +201,26 @@ impl EntrySqlStatement {
             Statement::Explain { .. } => EntrySqlType::Explain,
             Statement::Savepoint { .. } => EntrySqlType::Savepoint,
             Statement::LockTables { .. } => EntrySqlType::LockTables,
-            Statement::UnlockTables { .. } => EntrySqlType::LockTables,
+            // ⛔⛔ THIS READ `EntrySqlType::LockTables` AND THE `UnlockTables` ARM WAS DEAD. The
+            // statement that RELEASES a lock was recorded as the statement that takes one, so
+            // the shipped log's 32 rows typed `LOCK TABLES` are 16 locks and 16 unlocks and a
+            // reader counting lock-takers got exactly double. `Lock_time` is the wait for
+            // precisely this lock, which makes it the worst column in the record to double.
+            Statement::UnlockTables => EntrySqlType::UnlockTables,
             Statement::Flush { .. } => EntrySqlType::Flush,
+            // ⭐⭐ THREE STATEMENTS `graph.rs` WALKS IN FULL AND THIS FUNCTION HAD NO ARM FOR.
+            // `relations.parquet` gave them `truncate_target`, `drop_target` + `create_target`
+            // and `analyze_target`; `raw.parquet` said their type was unknown. One record, two
+            // artifacts, contradicting each other about the same three statements.
+            //
+            // ⚠️ The rule for when an arm is OWED, since `sqlparser` has hundreds of statement
+            // forms and this enum cannot have one each: **wherever another artifact in this
+            // record already says something specific about the statement.** `CALL`, `EXECUTE`
+            // and `DEALLOCATE` parse fine here and get no role from the walk, so `Unknown` is
+            // coherent for them and they stay there.
+            Statement::Truncate { .. } => EntrySqlType::Truncate,
+            Statement::RenameTable { .. } => EntrySqlType::RenameTable,
+            Statement::Analyze { .. } => EntrySqlType::Analyze,
             _ => EntrySqlType::Unknown,
         }
     }
@@ -336,15 +366,21 @@ pub enum EntrySqlType {
     CreateView,
     /// ALTER TABLE
     AlterTable,
-    /// ALTER INDEX
-    AlterIndex,
     /// DROP TABLE
     Drop,
+    /// DROP VIEW
+    DropView,
+    /// DROP DATABASE / DROP SCHEMA
+    DropDatabase,
     /// DROP FUNCTION
     DropFunction,
     /// SET
     Set,
-    /// SHOW VARIABLE
+    /// ⚠️ `SHOW <anything this enum has no arm for>`. Upstream's `Statement::ShowVariable` is
+    /// a **catch-all**, not a variable: `SHOW WARNINGS`, `SHOW ENGINE INNODB STATUS`,
+    /// `SHOW GRANTS` and `SHOW CHARACTER SET` all land here. It displays as `SHOW` for that
+    /// reason — it used to display as `SHOW VARIABLE`, which the shipped log's one such row
+    /// (`SHOW /*!40100 ENGINE*/ INNODB STATUS`) is not.
     ShowVariable,
     /// SHOW VARIABLES
     ShowVariables,
@@ -360,8 +396,6 @@ pub enum EntrySqlType {
     Use,
     /// BEGIN TRANSACTION
     StartTransaction,
-    /// SET TRANSACTION
-    SetTransaction,
     /// COMMIT TRANSACTION
     Commit,
     /// ROLLBACK TRANSACTION
@@ -388,7 +422,21 @@ pub enum EntrySqlType {
     UnlockTables,
     /// FLUSH
     Flush,
-    /// Unable to identy if the type of statement
+    /// TRUNCATE TABLE
+    Truncate,
+    /// RENAME TABLE
+    RenameTable,
+    /// ANALYZE TABLE
+    Analyze,
+    /// ⛔ Parsed, and this enum has no MySQL name for it. **Not an absence** — see the
+    /// `Display`, which spells it `UNKNOWN` and used to spell it `NULL`.
+    ///
+    /// ⭐ Two kinds of statement land here and both belong here. One is ordinary MySQL this
+    /// enum has no arm for — `CALL`, `EXECUTE`, `DEALLOCATE` — which `graph.rs` gives no role,
+    /// so nothing else in the record says anything specific about them. The other is text
+    /// `sqlparser` accepts and MySQL cannot write, such as `ALTER INDEX`: **this crate reads
+    /// MySQL slow logs**, so naming those separately would make the vocabulary a union of every
+    /// dialect `sqlparser` knows and put cases that cannot occur in front of every consumer.
     Unknown,
 }
 
@@ -403,11 +451,12 @@ impl Display for EntrySqlType {
             Self::CreateIndex => "CREATE INDEX",
             Self::CreateView => "CREATE VIEW",
             Self::AlterTable => "ALTER TABLE",
-            Self::AlterIndex => "ALTER INDEX",
             Self::Drop => "DROP TABLE",
+            Self::DropView => "DROP VIEW",
+            Self::DropDatabase => "DROP DATABASE",
             Self::DropFunction => "DROP FUNCTION",
             Self::Set => "SET",
-            Self::ShowVariable => "SHOW VARIABLE",
+            Self::ShowVariable => "SHOW",
             Self::ShowVariables => "SHOW VARIABLES",
             Self::ShowCreate => "SHOW CREATE TABLE",
             Self::ShowColumns => "SHOW COLUMNS",
@@ -415,7 +464,6 @@ impl Display for EntrySqlType {
             Self::ShowCollation => "SHOW COLLATION",
             Self::Use => "USE",
             Self::StartTransaction => "BEGIN TRANSACTION",
-            Self::SetTransaction => "SET TRANSACTION",
             Self::Commit => "COMMIT TRANSACTION",
             Self::Rollback => "ROLLBACK TRANSACTION",
             Self::CreateSchema => "CREATE SCHEMA",
@@ -429,7 +477,16 @@ impl Display for EntrySqlType {
             Self::LockTables => "LOCK TABLES",
             Self::UnlockTables => "UNLOCK TABLES",
             Self::Flush => "FLUSH",
-            Self::Unknown => "NULL",
+            Self::Truncate => "TRUNCATE TABLE",
+            Self::RenameTable => "RENAME TABLE",
+            Self::Analyze => "ANALYZE TABLE",
+            // ⛔⛔ THIS SPELLED ITSELF "NULL" INTO A NULLABLE COLUMN. `sql_type = 'NULL'` (four
+            // characters, a statement this enum has no arm for) and `sql_type IS NULL` (an
+            // administrator command or an unparseable line) are different facts, and every text
+            // rendering of the parquet spelled them the same. The record's own documentation
+            // told a reader that NULL there means "not SQL" — so the three rows saying it about
+            // a TRUNCATE, a RENAME and an ANALYZE were read as unparseable.
+            Self::Unknown => "UNKNOWN",
         };
 
         write!(f, "{}", out)
@@ -649,3 +706,157 @@ impl From<StatsLine> for EntryStats {
     }
 }
 
+
+#[cfg(test)]
+mod every_sql_type_arm {
+    use super::*;
+    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::parser::Parser;
+    use std::collections::BTreeSet;
+
+    fn typed(sql: &str) -> EntrySqlType {
+        let mut s = Parser::parse_sql(&MySqlDialect {}, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(s.len(), 1, "{sql}");
+        EntrySqlStatement::from(s.remove(0)).sql_type()
+    }
+
+    /// ⭐⭐⭐ EVERY ARM OF [`EntrySqlType`], AND THE REGIME THAT CAN REACH IT.
+    ///
+    /// Sweeping this enum the way `JoinOp` was swept found **five defects**, every one of them
+    /// in an arm no corpus had ever produced:
+    ///
+    /// | | |
+    /// |---|---|
+    /// | ⛔ `UNLOCK TABLES` typed as `LockTables` | the arm was dead, and 16 of the shipped log's 32 "LOCK TABLES" rows release a lock rather than take one |
+    /// | ⛔ `Unknown` displayed as `"NULL"` | four characters, in a nullable column documented as meaning "not SQL" |
+    /// | ⛔ `TRUNCATE`, `RENAME TABLE`, `ANALYZE TABLE` had no arm | `graph.rs` walks all three and gives them roles — one record disagreeing with itself |
+    /// | ⛔ `DROP VIEW` and `DROP DATABASE` displayed as `"DROP TABLE"` | the label asserted the one object type it was not |
+    /// | ⛔ `SetTransaction` was unreachable | nothing in the classifier produced it; every spelling of `SET TRANSACTION …` parses as `Statement::Set` |
+    ///
+    /// ⚠️ And `ShowVariable` is upstream's catch-all rather than a variable, so it displays as
+    /// `SHOW`.
+    #[test]
+    fn every_arm_that_a_mysql_statement_reaches_has_one() {
+        // ⭐ Ordinary MySQL. Each of these is text the server that wrote the log could have run.
+        let mysql: &[(&str, EntrySqlType)] = &[
+            ("SELECT 1 FROM t", EntrySqlType::Query),
+            ("INSERT INTO t VALUES (1)", EntrySqlType::Insert),
+            ("UPDATE t SET a = 1", EntrySqlType::Update),
+            ("DELETE FROM t", EntrySqlType::Delete),
+            ("CREATE TABLE t (a INT)", EntrySqlType::CreateTable),
+            ("CREATE INDEX i ON t (a)", EntrySqlType::CreateIndex),
+            ("CREATE VIEW v AS SELECT 1 FROM t", EntrySqlType::CreateView),
+            ("ALTER TABLE t ADD COLUMN b INT", EntrySqlType::AlterTable),
+            ("DROP TABLE t", EntrySqlType::Drop),
+            ("DROP VIEW v", EntrySqlType::DropView),
+            ("DROP DATABASE d", EntrySqlType::DropDatabase),
+            ("DROP SCHEMA d", EntrySqlType::DropDatabase),
+            ("DROP FUNCTION f", EntrySqlType::DropFunction),
+            ("SET autocommit = 0", EntrySqlType::Set),
+            // ⚠️ Every `SET TRANSACTION` spelling lands on `Set`, which is why `connection.rs`
+            // reads the isolation level off the author's bytes rather than off this enum.
+            ("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", EntrySqlType::Set),
+            ("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED", EntrySqlType::Set),
+            ("SHOW WARNINGS", EntrySqlType::ShowVariable),
+            ("SHOW ENGINE INNODB STATUS", EntrySqlType::ShowVariable),
+            ("SHOW VARIABLES LIKE 'long%'", EntrySqlType::ShowVariables),
+            ("SHOW CREATE TABLE t", EntrySqlType::ShowCreate),
+            ("SHOW COLUMNS FROM t", EntrySqlType::ShowColumns),
+            ("SHOW TABLES FROM d", EntrySqlType::ShowTables),
+            ("SHOW COLLATION", EntrySqlType::ShowCollation),
+            ("USE d", EntrySqlType::Use),
+            ("START TRANSACTION", EntrySqlType::StartTransaction),
+            ("BEGIN", EntrySqlType::StartTransaction),
+            ("COMMIT", EntrySqlType::Commit),
+            ("ROLLBACK", EntrySqlType::Rollback),
+            ("CREATE SCHEMA d", EntrySqlType::CreateSchema),
+            ("CREATE DATABASE d", EntrySqlType::CreateDatabase),
+            ("GRANT SELECT ON d.* TO 'u'@'h'", EntrySqlType::Grant),
+            ("REVOKE SELECT ON d.* FROM 'u'@'h'", EntrySqlType::Revoke),
+            ("KILL 12345", EntrySqlType::Kill),
+            ("EXPLAIN t", EntrySqlType::ExplainTable),
+            ("DESCRIBE t", EntrySqlType::ExplainTable),
+            ("EXPLAIN SELECT 1 FROM t", EntrySqlType::Explain),
+            ("SAVEPOINT sp1", EntrySqlType::Savepoint),
+            ("LOCK TABLES t WRITE", EntrySqlType::LockTables),
+            ("UNLOCK TABLES", EntrySqlType::UnlockTables),
+            ("FLUSH TABLES", EntrySqlType::Flush),
+            ("TRUNCATE TABLE t", EntrySqlType::Truncate),
+            ("RENAME TABLE a TO b", EntrySqlType::RenameTable),
+            ("ANALYZE TABLE t", EntrySqlType::Analyze),
+            // ⭐ `Unknown` is a REAL arm and this is what it means: parsed, and this enum has no
+            // name for it. The rule for when an arm is owed instead is that another artifact in
+            // the record already says something specific — `graph.rs` gives these no role.
+            ("CALL myproc(1)", EntrySqlType::Unknown),
+            ("EXECUTE s", EntrySqlType::Unknown),
+            ("DEALLOCATE PREPARE s", EntrySqlType::Unknown),
+            ("SHOW STATUS", EntrySqlType::Unknown),
+        ];
+        let mut seen: BTreeSet<String> = Default::default();
+        for (sql, want) in mysql {
+            assert_eq!(typed(sql), *want, "{sql}");
+            seen.insert(format!("{want:?}"));
+        }
+
+        // ⛔ AND TEXT MYSQL CANNOT WRITE LANDS ON `Unknown` TOO. MySQL has no `ALTER INDEX`
+        // statement at all; `sqlparser` parses one because its parser is largely shared across
+        // dialects. It had its own arm, which made the vocabulary a union of every dialect
+        // `sqlparser` knows — **this crate reads MySQL slow logs**, so the case that cannot
+        // occur does not get a name of its own.
+        assert_eq!(typed("ALTER INDEX idx RENAME TO idx2"), EntrySqlType::Unknown);
+
+        // ⛔ THE GUARD. Written out rather than derived, because the enum cannot be iterated —
+        // so a new arm without a case has to fail here. This sweep removed two: `SetTransaction`,
+        // which nothing in the classifier produced, and `AlterIndex`, which no MySQL server can
+        // write.
+        assert_eq!(
+            seen.len(),
+            38,
+            "every EntrySqlType arm needs a statement that reaches it; reached {seen:?}"
+        );
+    }
+
+    /// ⛔⛔ THE LABEL IS WHAT A READER SEES, AND FOUR OF THEM ASSERTED SOMETHING FALSE.
+    ///
+    /// `Display` is not cosmetic here: `parquet.rs` writes `sql_type().to_string()` straight into
+    /// the column, so each of these strings IS the filed value.
+    #[test]
+    fn no_label_asserts_something_the_statement_did_not_say() {
+        // ⛔ The one that mattered most: a four-character string spelling itself as the absence
+        // marker, in a nullable column whose documentation said NULL means "not SQL".
+        assert_eq!(EntrySqlType::Unknown.to_string(), "UNKNOWN");
+        assert_ne!(EntrySqlType::Unknown.to_string(), "NULL");
+
+        // ⛔ Three labels that named the wrong object or the wrong direction.
+        assert_eq!(EntrySqlType::UnlockTables.to_string(), "UNLOCK TABLES");
+        assert_eq!(EntrySqlType::DropView.to_string(), "DROP VIEW");
+        assert_eq!(EntrySqlType::DropDatabase.to_string(), "DROP DATABASE");
+
+        // ⚠️ And the catch-all, which is not a variable.
+        assert_eq!(EntrySqlType::ShowVariable.to_string(), "SHOW");
+
+        // ⭐ Every label distinct, so no two arms collapse in the parquet the way `Drop` and
+        // `DropView` did and the way `LockTables` and `UnlockTables` did.
+        let labels: Vec<String> = [
+            EntrySqlType::Query, EntrySqlType::Insert, EntrySqlType::Update,
+            EntrySqlType::Delete, EntrySqlType::CreateTable, EntrySqlType::CreateIndex,
+            EntrySqlType::CreateView, EntrySqlType::AlterTable, EntrySqlType::Drop, EntrySqlType::DropView, EntrySqlType::DropDatabase,
+            EntrySqlType::DropFunction, EntrySqlType::Set, EntrySqlType::ShowVariable,
+            EntrySqlType::ShowVariables, EntrySqlType::ShowCreate, EntrySqlType::ShowColumns,
+            EntrySqlType::ShowTables, EntrySqlType::ShowCollation, EntrySqlType::Use,
+            EntrySqlType::StartTransaction, EntrySqlType::Commit, EntrySqlType::Rollback,
+            EntrySqlType::CreateSchema, EntrySqlType::CreateDatabase, EntrySqlType::Grant,
+            EntrySqlType::Revoke, EntrySqlType::Kill, EntrySqlType::ExplainTable,
+            EntrySqlType::Explain, EntrySqlType::Savepoint, EntrySqlType::LockTables,
+            EntrySqlType::UnlockTables, EntrySqlType::Flush, EntrySqlType::Truncate,
+            EntrySqlType::RenameTable, EntrySqlType::Analyze, EntrySqlType::Unknown,
+        ]
+        .iter()
+        .map(|t| t.to_string())
+        .collect();
+        assert_eq!(labels.len(), 38);
+        let distinct: BTreeSet<&String> = labels.iter().collect();
+        assert_eq!(distinct.len(), 38, "two arms share a label: {labels:?}");
+    }
+}

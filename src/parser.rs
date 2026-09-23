@@ -617,6 +617,14 @@ pub struct EntryLiteral {
 }
 
 /// What kind of literal an [`EntryLiteral`] is.
+///
+/// ⛔ `E'…'` had an arm and MySQL has no such literal — `MySqlDialect` refuses the text, so
+/// nothing could ever produce it. Removed rather than documented: **this crate reads MySQL slow
+/// logs**, and an arm no input reaches is one more case every consumer has to handle.
+///
+/// ⚠️ `"…"` stays, and it is the one that is genuinely ambiguous: MySQL reads it as a string
+/// literal by default and as an **identifier** under `ANSI_QUOTES`. Which one it was is
+/// `sql_mode`, and a slow log does not record it — see `connection.rs`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LiteralKind {
     /// a numeric literal
@@ -627,8 +635,6 @@ pub enum LiteralKind {
     DoubleQuotedString,
     /// `N'...'`
     NationalString,
-    /// `E'...'`
-    EscapedString,
     /// `X'...'`
     HexString,
 }
@@ -690,7 +696,6 @@ impl VisitorMut for LiteralPass {
             Value::SingleQuotedString(v) => (LiteralKind::SingleQuotedString, v.clone()),
             Value::DoubleQuotedString(v) => (LiteralKind::DoubleQuotedString, v.clone()),
             Value::NationalStringLiteral(v) => (LiteralKind::NationalString, v.clone()),
-            Value::EscapedStringLiteral(v) => (LiteralKind::EscapedString, v.clone()),
             Value::HexStringLiteral(v) => (LiteralKind::HexString, v.clone()),
             // ⛔ A boolean, a NULL and a placeholder are not the author's subject: `TRUE` names
             // no rows and `?` was never theirs. Recording them would put the reader's own
@@ -715,6 +720,94 @@ impl VisitorMut for LiteralPass {
     }
 }
 
+
+#[cfg(test)]
+mod every_literal_kind {
+    use super::*;
+
+    fn kinds(sql: &str) -> Vec<(LiteralKind, String)> {
+        parse_sql(sql, &EntryMasking::None)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .1
+            .iter()
+            .map(|l| (l.kind, String::from_utf8_lossy(&l.rendered).into_owned()))
+            .collect()
+    }
+
+    /// ⭐⭐ EVERY ARM OF [`LiteralKind`], AND THERE ARE FIVE BECAUSE ONE WAS NOT MYSQL'S.
+    ///
+    /// Two of the six had a witness — `Number` and `SingleQuotedString`. Of the other four,
+    /// three are ordinary MySQL and one was `E'…'`, which `MySqlDialect` **refuses**, so nothing
+    /// could ever produce it. It is gone rather than documented: this crate reads MySQL slow
+    /// logs, and an arm no input reaches is one more case every consumer has to handle.
+    #[test]
+    fn every_arm_that_a_mysql_literal_reaches_has_one() {
+        use LiteralKind as K;
+        let cases: &[(&str, K)] = &[
+            ("SELECT 1 FROM t WHERE a = 42", K::Number),
+            ("SELECT 1 FROM t WHERE a = 4.25", K::Number),
+            ("SELECT 1 FROM t WHERE a = 'x'", K::SingleQuotedString),
+            ("SELECT 1 FROM t WHERE a = \"x\"", K::DoubleQuotedString),
+            ("SELECT 1 FROM t WHERE a = N'x'", K::NationalString),
+            ("SELECT 1 FROM t WHERE a = X'41'", K::HexString),
+        ];
+        let mut seen: std::collections::BTreeSet<String> = Default::default();
+        for (sql, want) in cases {
+            let got = kinds(sql);
+            assert!(
+                got.iter().any(|(k, _)| k == want),
+                "{sql}: wanted {want:?}, got {got:?}"
+            );
+            seen.insert(format!("{want:?}"));
+        }
+        // ⛔ THE GUARD. Five arms, written out because the enum cannot be iterated. It was six
+        // before `EscapedString` went.
+        assert_eq!(
+            seen.len(),
+            5,
+            "every LiteralKind arm needs text that reaches it; reached {seen:?}"
+        );
+
+        // ⛔ And the arm that was removed stays removed: MySQL has no such literal and this
+        // grammar refuses the text, so there is nothing for an arm to hold.
+        assert!(
+            parse_sql("SELECT 1 FROM t WHERE a = E'x'", &EntryMasking::None).is_err(),
+            "E'…' is not MySQL and this parser does not accept it"
+        );
+    }
+
+    /// ⛔⛔ `"x"` IS A LITERAL OR AN IDENTIFIER AND THE LOG DOES NOT SAY WHICH.
+    ///
+    /// This is not two dialects disagreeing — it is **MySQL disagreeing with itself** depending
+    /// on a setting a slow log never records. By default `"x"` is a string literal; under
+    /// `sql_mode = 'ANSI_QUOTES'` the same bytes are a quoted **identifier**, which is a column
+    /// and not a subject at all.
+    ///
+    /// ⭐ So this arm firing is the `sql_mode` risk made concrete rather than argued: the crate
+    /// files a row in `literals.parquet` — the author's subject — for text that may have been a
+    /// column name. `connection.rs` carries `sql_mode` with its provenance for exactly this, and
+    /// on both corpora it is `opaque` or `unmeasured`, so the question stays open.
+    ///
+    /// ⚠️ The parser is not wrong to pick one: `MySqlDialect` is fixed and honours no mode. What
+    /// would be wrong is filing the reading without recording that a reading was made.
+    #[test]
+    fn a_double_quoted_string_is_the_one_literal_the_mode_can_reinterpret() {
+        let got = kinds("SELECT \"name\" FROM person");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, LiteralKind::DoubleQuotedString);
+        assert_eq!(got[0].1, "\"name\"", "the author's own spelling is kept");
+
+        // ⭐ Under `ANSI_QUOTES` this same statement has NO literal and names a column — so the
+        // count this crate files for it is 1 under one mode and 0 under the other. Nothing else
+        // in the record would show that, which is why the mode is carried per connection.
+        assert!(
+            kinds("SELECT 'name' FROM person")
+                .iter()
+                .all(|(k, _)| *k == LiteralKind::SingleQuotedString),
+            "the unambiguous spelling, for contrast"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
