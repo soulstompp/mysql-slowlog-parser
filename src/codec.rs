@@ -40,9 +40,11 @@ pub enum CodecError {
     /// a problem from the IO layer below caused the error
     #[error("file read error: {0}")]
     IO(#[from] io::Error),
-    /// a new entry started before the previous one was completed
-    #[error("found start of new entry before entry completed at line: {0}")]
-    IncompleteEntry(EntryError),
+    // ⛔ `IncompleteEntry(EntryError)` STOOD HERE AND NOTHING EVER BUILT ONE. Its message read
+    // *"found start of new entry before entry completed"*, a condition the state machine makes
+    // unreachable: `parse_next` reaches `complete()` only from the `Sql` arm, by which point
+    // every field is set, and the sole caller `unwrap`s. `EntryError` stays — it is `complete`'s
+    // return type and public API — and the variant that would have carried it does not.
 }
 
 #[derive(Debug)]

@@ -175,6 +175,186 @@ pub enum ConstraintKind {
     None,
 }
 
+/// Which clause a split was written in.
+///
+/// On an outer join `ON p` and `WHERE p` are different queries, so this is not decoration.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum Clause {
+    /// A join's `ON`.
+    On,
+    /// The scope's `WHERE`.
+    Where,
+    /// The scope's `HAVING`, which filters groups rather than rows.
+    Having,
+    /// `USING (cols)`, which names columns without writing a comparison.
+    JoinUsing,
+    /// A comparison in the projection — a `CASE`, a boolean expression selected as a value.
+    Projection,
+}
+
+/// A boolean connective, as a step on the path from a scope's root to one comparison.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum Connective {
+    /// `AND`
+    And,
+    /// `OR`
+    Or,
+    /// MySQL's `XOR`, which no other dialect spells this way.
+    Xor,
+    /// `NOT`, which negates the branch beneath it.
+    Not,
+}
+
+/// One step of a comparison's position in its scope's boolean tree.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub struct PathStep {
+    /// The connective at this level.
+    pub connective: Connective,
+    /// Which operand of that connective this branch is.
+    pub branch: u16,
+}
+
+/// How a split compares its sides.
+///
+/// The subquery arms are the shape MySQL plans differently: `IN (SELECT …)` admits semi-join and
+/// materialisation, `EXISTS` is a correlated probe, and a scalar subquery is evaluated once.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum PredicateOp {
+    /// `=`
+    Eq,
+    /// `!=` or `<>`
+    Ne,
+    /// `<`
+    Lt,
+    /// `<=`
+    Le,
+    /// `>`
+    Gt,
+    /// `>=`
+    Ge,
+    /// `<=>`
+    NullSafeEq,
+    /// `IN (a, b, c)` — a finite set of points.
+    InList,
+    /// `BETWEEN lo AND hi`
+    Between,
+    /// `LIKE` or `ILIKE`.
+    Like,
+    /// `IS NULL` or `IS NOT NULL`.
+    IsNull,
+    /// `IN (SELECT …)`
+    InSubquery,
+    /// `NOT IN (SELECT …)`
+    NotInSubquery,
+    /// `EXISTS (SELECT …)`
+    Exists,
+    /// `NOT EXISTS (SELECT …)`
+    NotExists,
+    /// `> ANY (SELECT …)`
+    Any,
+    /// `> ALL (SELECT …)`
+    All,
+    /// A comparison whose right-hand side is a single-row subquery.
+    Scalar,
+    /// An operator MySQL has no syntax for. A diagnostic and not data, held to zero on a MySQL
+    /// corpus, exactly as [`JoinOp::NotMySql`] is.
+    NotMySql,
+}
+
+/// What the right-hand side of a split is.
+///
+/// `Subquery` is what makes the walk recursive: a subselect is an operand of a split rather than a
+/// scope that merely exists, so [`Predicate::rhs_scope`] leads to its own predicates.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum RhsKind {
+    /// Another column, which is what makes a split a relationship.
+    Column,
+    /// A value the author wrote.
+    Literal,
+    /// A subselect — see [`Predicate::rhs_scope`].
+    Subquery,
+    /// Anything computed: a function call, arithmetic, a `CASE`.
+    Expression,
+    /// `(a, b)`, a row constructor.
+    RowConstructor,
+    /// A unary split — `IS NULL`, `EXISTS` — which has no right-hand side.
+    None,
+}
+
+/// One side of a split, as the author spelled it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Side {
+    /// The occurrence a written qualifier resolved to. `None` where the column was unqualified,
+    /// which a consumer holding the whole statement can resolve against its sole relation.
+    pub occ: Option<u32>,
+    /// The column as the author spelled it.
+    pub column: Option<Bytes>,
+}
+
+/// One comparison the author wrote, with where it sits in the boolean tree.
+///
+/// A split with both sides occupied is a relationship — the join — and one with a single side is a
+/// filter. They are the same kind of object, which is why they share a row type.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Predicate {
+    /// The scope whose boolean tree this split sits in.
+    pub scope: u32,
+    /// Which clause the author wrote it in.
+    pub clause: Clause,
+    /// Connectives from the scope's root down to this comparison, outermost first. Two splits sit
+    /// in one disjunction exactly when their paths share a prefix ending in [`Connective::Or`].
+    pub path: Vec<PathStep>,
+    /// How the two sides are compared.
+    pub op: PredicateOp,
+    /// The left side.
+    pub lhs: Side,
+    /// The right side, empty on a unary split.
+    pub rhs: Side,
+    /// What the right side is.
+    pub rhs_kind: RhsKind,
+    /// The subquery's scope, where `rhs_kind` is [`RhsKind::Subquery`].
+    pub rhs_scope: Option<u32>,
+}
+
+/// Which set operation combined two queries.
+///
+/// `UNION` deduplicates and `UNION ALL` does not, which is a sort or a temporary table. `INTERSECT`
+/// and `EXCEPT` are MySQL 8.0.31 and later, so a corpus from an older server cannot write one.
+#[derive(Copy, Clone, Debug, Default, Eq, Hash, PartialEq)]
+pub enum SetOperator {
+    /// `UNION`, which deduplicates.
+    Union,
+    /// `UNION ALL`, which does not.
+    UnionAll,
+    /// `INTERSECT`
+    Intersect,
+    /// `INTERSECT ALL`
+    IntersectAll,
+    /// `EXCEPT`
+    Except,
+    /// `EXCEPT ALL`
+    ExceptAll,
+    /// This scope heads no set operation.
+    #[default]
+    NotApplicable,
+    /// An operator MySQL has no syntax for, such as `PIVOT`. A diagnostic and not data.
+    NotMySql,
+}
+
+/// The directions an `ORDER BY` wrote, which decide whether an index can be walked to satisfy it.
+#[derive(Copy, Clone, Debug, Default, Eq, Hash, PartialEq)]
+pub enum SortDirections {
+    /// Every term ascending, written or defaulted.
+    Asc,
+    /// Every term descending.
+    Desc,
+    /// Terms in both directions, which no single index walk satisfies.
+    Mixed,
+    /// This scope wrote no `ORDER BY`.
+    #[default]
+    NotApplicable,
+}
+
 /// A naming scope: the statement itself, or something nested inside it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Scope {
@@ -238,6 +418,16 @@ pub struct Stages {
     pub sort_terms: u32,
     /// Whether the query this scope heads carried a `LIMIT`.
     pub limit_present: bool,
+    /// The row count a `LIMIT` asked for, where it wrote a literal one.
+    ///
+    /// `None` under a placeholder, which is a measured absence rather than a zero.
+    pub limit_rows: Option<u64>,
+    /// The offset a `LIMIT` skipped. A deep one reads and discards every row before it.
+    pub limit_offset: Option<u64>,
+    /// The directions the `ORDER BY` wrote.
+    pub sort_directions: SortDirections,
+    /// Which set operation this scope heads, where it heads one.
+    pub set_operator: SetOperator,
     /// ⛔ A construct this grammar reaches and MySQL has no syntax for: `PREWHERE`, `QUALIFY`,
     /// `GROUP BY ALL`, `DISTINCT ON`, Hive's `SORT BY`/`CLUSTER BY`/`DISTRIBUTE BY`, `TOP`,
     /// `CONNECT BY`, `ORDER BY ALL`.
@@ -359,6 +549,8 @@ pub struct StatementGraph {
     pub occurrences: Vec<RelationOccurrence>,
     /// the edges
     pub edges: Vec<Edge>,
+    /// every comparison the statement wrote, with its place in the boolean tree
+    pub predicates: Vec<Predicate>,
 }
 
 impl StatementGraph {
@@ -526,6 +718,9 @@ pub struct GraphMeasures {
 #[derive(Default)]
 struct Builder {
     graph: StatementGraph,
+    /// Which scope each subquery expression opened, keyed on its address — see
+    /// [`Builder::note_subquery_scope`].
+    subquery_scopes: std::collections::BTreeMap<usize, u32>,
 }
 
 impl Builder {
@@ -886,13 +1081,21 @@ impl Builder {
         let st = &mut self.graph.scopes[scope as usize].stages;
         match &query.order_by {
             Some(o) => match &o.kind {
-                OrderByKind::Expressions(terms) => st.sort_terms += terms.len() as u32,
+                OrderByKind::Expressions(terms) => {
+                    st.sort_terms += terms.len() as u32;
+                    st.sort_directions = directions_of(terms);
+                }
                 // ⛔ `ORDER BY ALL` is not MySQL.
                 OrderByKind::All(_) => st.not_mysql = true,
             },
             None => {}
         }
         st.limit_present |= query.limit_clause.is_some();
+        if let Some(limit) = &query.limit_clause {
+            let (rows, offset) = limit_operands(limit);
+            st.limit_rows = st.limit_rows.or(rows);
+            st.limit_offset = st.limit_offset.or(offset);
+        }
         self.walk_set_expr(&query.body, scope);
     }
 
@@ -905,9 +1108,16 @@ impl Builder {
             // dialect wrote it — and an arm that silently dropped them would be the "behaviour
             // absent from an artifact" case this record separates from "workload never did it".
             SetExpr::Merge(s) => self.walk_statement(s, scope),
-            SetExpr::SetOperation { left, right, .. } => {
+            SetExpr::SetOperation {
+                left,
+                right,
+                op,
+                set_quantifier,
+            } => {
+                let operator = set_operator_of(op, set_quantifier);
                 for side in [left, right] {
                     let s = self.push_scope(Some(scope), ScopeKind::SetOp, None, false);
+                    self.graph.scopes[s as usize].stages.set_operator = operator;
                     self.walk_set_expr(side, s);
                 }
             }
@@ -973,22 +1183,43 @@ impl Builder {
         let ids = self.collect_from(&select.from, scope, false);
         self.join_edges(&select.from, scope, &ids);
 
-        for e in select
-            .selection
-            .iter()
-            .chain(select.having.iter())
-            .chain(select.prewhere.iter())
-            .chain(select.qualify.iter())
-        {
+        let clauses = [
+            (select.selection.as_ref(), Clause::Where),
+            (select.having.as_ref(), Clause::Having),
+            // `PREWHERE` and `QUALIFY` are not MySQL; `Stages::not_mysql` already records that,
+            // and the split is filed under the clause it was written in either way.
+            (select.prewhere.as_ref(), Clause::Where),
+            (select.qualify.as_ref(), Clause::Having),
+        ];
+        for (expr, clause) in clauses {
+            let Some(e) = expr else { continue };
             self.walk_expr(e, scope);
-            self.predicate_edges(e, scope, JoinOp::Predicate, ConstraintKind::On);
+            let mut path = Vec::new();
+            self.walk_condition(
+                e,
+                scope,
+                JoinOp::Predicate,
+                ConstraintKind::On,
+                clause,
+                true,
+                &mut path,
+            );
         }
         for item in &select.projection {
             // ⭐ `actor_info`'s correlated subquery lives inside a `GROUP_CONCAT` inside a
             // `CONCAT` in the projection, which is why the projection is walked at all.
             for e in select_item_exprs(item) {
                 self.walk_expr(e, scope);
-                self.predicate_edges(e, scope, JoinOp::Predicate, ConstraintKind::On);
+                let mut path = Vec::new();
+                self.walk_condition(
+                    e,
+                    scope,
+                    JoinOp::Predicate,
+                    ConstraintKind::On,
+                    Clause::Projection,
+                    true,
+                    &mut path,
+                );
             }
         }
     }
@@ -1029,6 +1260,20 @@ impl Builder {
                     Some(e) => self.resolved_qualifiers(e, scope),
                     None => Vec::new(),
                 };
+                // The `ON` condition's splits, with no edges: the pair is drawn below from the
+                // `FROM` structure, so walking for edges here would draw each one twice.
+                if let Some(e) = constraint_expr(&j.join_operator) {
+                    let mut path = Vec::new();
+                    self.walk_condition(
+                        e,
+                        scope,
+                        op,
+                        constraint,
+                        Clause::On,
+                        false,
+                        &mut path,
+                    );
+                }
                 let mut drawn = false;
                 for lhs in named.into_iter().filter(|o| *o != rhs) {
                     self.push_edge(lhs, rhs, op, constraint);
@@ -1096,9 +1341,10 @@ impl Builder {
         match expr {
             Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => {
                 let inner = self.push_scope(Some(scope), ScopeKind::Subquery, None, false);
+                self.note_subquery_scope(expr, inner);
                 self.walk_query(q, inner);
             }
-            Expr::InSubquery { expr, subquery, .. } => {
+            outer @ Expr::InSubquery { expr, subquery, .. } => {
                 // ⭐⭐ `InSubquery.subquery` WAS A `SetExpr` AND IS A `Query` SINCE sqlparser
                 // 0.63 — so it carries a `with` clause now and `IN (WITH … SELECT …)` reaches
                 // the CTE walk like `EXISTS` and a scalar subquery already did. This file used
@@ -1106,9 +1352,17 @@ impl Builder {
                 // and the walk goes through `walk_query` for all three.
                 self.walk_expr(expr, scope);
                 let inner = self.push_scope(Some(scope), ScopeKind::Subquery, None, false);
+                self.note_subquery_scope(outer, inner);
                 self.walk_query(subquery, inner);
             }
             Expr::BinaryOp { left, right, .. } => {
+                self.walk_expr(left, scope);
+                self.walk_expr(right, scope);
+            }
+            // `> ANY (SELECT …)` and `> ALL (SELECT …)` hold their subquery on the right. Without
+            // this the walk never descends, so the relation they read reaches no artifact and the
+            // split that names them carries a subquery operand with no scope.
+            Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
                 self.walk_expr(left, scope);
                 self.walk_expr(right, scope);
             }
@@ -1175,34 +1429,269 @@ impl Builder {
     /// comparison arms carry an edge; `AND`, `OR` and `XOR` are descended through and contribute
     /// none of their own.
     fn predicate_edges(&mut self, expr: &Expr, scope: u32, op: JoinOp, constraint: ConstraintKind) {
+        let mut path = Vec::new();
+        self.walk_condition(expr, scope, op, constraint, Clause::Where, true, &mut path);
+    }
+
+    /// Walks one condition, emitting the edges it draws and the splits it writes.
+    ///
+    /// One walk and not two: the edges and the predicates are the same recursion over the same
+    /// boolean tree, and separating them would be two lists that must agree with nothing making
+    /// them agree.
+    ///
+    /// `emit_edges` is false for a join's `ON`, whose pair is already drawn from the `FROM`
+    /// structure by [`Builder::join_edges`]. The splits are still recorded, so a disjunctive join
+    /// naming a third relation reaches the predicates even though it draws no edge.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_condition(
+        &mut self,
+        expr: &Expr,
+        scope: u32,
+        op: JoinOp,
+        constraint: ConstraintKind,
+        clause: Clause,
+        emit_edges: bool,
+        path: &mut Vec<PathStep>,
+    ) {
         use sqlparser::ast::BinaryOperator as B;
         match expr {
             Expr::BinaryOp {
                 left,
                 right,
-                op: B::And | B::Or | B::Xor,
+                op: b @ (B::And | B::Or | B::Xor),
             } => {
-                self.predicate_edges(left, scope, op, constraint);
-                self.predicate_edges(right, scope, op, constraint);
+                let connective = match b {
+                    B::Or => Connective::Or,
+                    B::Xor => Connective::Xor,
+                    _ => Connective::And,
+                };
+                path.push(PathStep { connective, branch: 0 });
+                self.walk_condition(left, scope, op, constraint, clause, emit_edges, path);
+                if let Some(last) = path.last_mut() {
+                    last.branch = 1;
+                }
+                self.walk_condition(right, scope, op, constraint, clause, emit_edges, path);
+                path.pop();
             }
-            Expr::BinaryOp { left, right, .. } => {
-                let (l, r) = (
-                    self.resolved_qualifiers(left, scope),
-                    self.resolved_qualifiers(right, scope),
-                );
-                for a in &l {
-                    for b in &r {
-                        if a != b {
-                            self.push_edge(*a, *b, op, constraint);
+            Expr::BinaryOp { left, right, op: b } => {
+                if emit_edges {
+                    let (l, r) = (
+                        self.resolved_qualifiers(left, scope),
+                        self.resolved_qualifiers(right, scope),
+                    );
+                    for a in &l {
+                        for b in &r {
+                            if a != b {
+                                self.push_edge(*a, *b, op, constraint);
+                            }
                         }
                     }
                 }
+                if let Some(pop) = comparison_op(b) {
+                    let rhs_scope = self.subquery_scope_of(right, scope);
+                    let (rhs_kind, pop) = match rhs_scope {
+                        Some(_) => (RhsKind::Subquery, PredicateOp::Scalar),
+                        None => (rhs_kind_of(right), pop),
+                    };
+                    self.push_predicate(scope, clause, path, pop, left, right, rhs_kind, rhs_scope);
+                }
+            }
+            Expr::UnaryOp {
+                op: sqlparser::ast::UnaryOperator::Not,
+                expr: e,
+            } => {
+                path.push(PathStep {
+                    connective: Connective::Not,
+                    branch: 0,
+                });
+                self.walk_condition(e, scope, op, constraint, clause, emit_edges, path);
+                path.pop();
             }
             Expr::Nested(e) | Expr::UnaryOp { expr: e, .. } => {
-                self.predicate_edges(e, scope, op, constraint)
+                self.walk_condition(e, scope, op, constraint, clause, emit_edges, path)
+            }
+            Expr::IsNull(e) | Expr::IsNotNull(e) => {
+                self.push_predicate(
+                    scope,
+                    clause,
+                    path,
+                    PredicateOp::IsNull,
+                    e,
+                    e,
+                    RhsKind::None,
+                    None,
+                );
+            }
+            Expr::InList { expr: e, .. } => {
+                self.push_predicate(
+                    scope,
+                    clause,
+                    path,
+                    PredicateOp::InList,
+                    e,
+                    e,
+                    RhsKind::Literal,
+                    None,
+                );
+            }
+            Expr::Between { expr: e, .. } => {
+                self.push_predicate(
+                    scope,
+                    clause,
+                    path,
+                    PredicateOp::Between,
+                    e,
+                    e,
+                    RhsKind::Literal,
+                    None,
+                );
+            }
+            Expr::Like { expr: e, .. } | Expr::ILike { expr: e, .. } => {
+                self.push_predicate(
+                    scope,
+                    clause,
+                    path,
+                    PredicateOp::Like,
+                    e,
+                    e,
+                    RhsKind::Literal,
+                    None,
+                );
+            }
+            Expr::InSubquery { expr: e, negated, .. } => {
+                let rhs_scope = self.subquery_scope_of(expr, scope);
+                let pop = if *negated {
+                    PredicateOp::NotInSubquery
+                } else {
+                    PredicateOp::InSubquery
+                };
+                self.push_predicate(
+                    scope,
+                    clause,
+                    path,
+                    pop,
+                    e,
+                    e,
+                    RhsKind::Subquery,
+                    rhs_scope,
+                );
+            }
+            Expr::Exists { negated, .. } => {
+                let rhs_scope = self.subquery_scope_of(expr, scope);
+                let pop = if *negated {
+                    PredicateOp::NotExists
+                } else {
+                    PredicateOp::Exists
+                };
+                self.push_predicate_sides(
+                    scope,
+                    clause,
+                    path,
+                    pop,
+                    Side::default(),
+                    Side::default(),
+                    RhsKind::Subquery,
+                    rhs_scope,
+                );
+            }
+            Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+                let pop = if matches!(expr, Expr::AnyOp { .. }) {
+                    PredicateOp::Any
+                } else {
+                    PredicateOp::All
+                };
+                // The subquery is the right operand, so the scope is looked up against that and
+                // not against the comparison holding it.
+                let rhs_scope = self.subquery_scope_of(right, scope);
+                self.push_predicate(
+                    scope,
+                    clause,
+                    path,
+                    pop,
+                    left,
+                    left,
+                    RhsKind::Subquery,
+                    rhs_scope,
+                );
             }
             _ => {}
         }
+    }
+
+    /// Files one split, resolving each side's written qualifier to an occurrence.
+    #[allow(clippy::too_many_arguments)]
+    fn push_predicate(
+        &mut self,
+        scope: u32,
+        clause: Clause,
+        path: &[PathStep],
+        op: PredicateOp,
+        left: &Expr,
+        right: &Expr,
+        rhs_kind: RhsKind,
+        rhs_scope: Option<u32>,
+    ) {
+        let lhs = self.side_of(left, scope);
+        let rhs = if std::ptr::eq(left, right) {
+            Side::default()
+        } else {
+            self.side_of(right, scope)
+        };
+        self.push_predicate_sides(scope, clause, path, op, lhs, rhs, rhs_kind, rhs_scope);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_predicate_sides(
+        &mut self,
+        scope: u32,
+        clause: Clause,
+        path: &[PathStep],
+        op: PredicateOp,
+        lhs: Side,
+        rhs: Side,
+        rhs_kind: RhsKind,
+        rhs_scope: Option<u32>,
+    ) {
+        self.graph.predicates.push(Predicate {
+            scope,
+            clause,
+            path: path.to_vec(),
+            op,
+            lhs,
+            rhs,
+            rhs_kind,
+            rhs_scope,
+        });
+    }
+
+    /// The column one side names, with its qualifier resolved where it wrote one.
+    ///
+    /// An unqualified column leaves `occ` empty rather than guessing: a consumer holding the whole
+    /// statement can fall back to its sole relation, and this walk cannot.
+    fn side_of(&self, expr: &Expr, scope: u32) -> Side {
+        match column_ref(expr) {
+            Some((qualifier, column)) => Side {
+                occ: qualifier.and_then(|q| self.resolve(&q, scope)),
+                column: Some(column),
+            },
+            None => Side::default(),
+        }
+    }
+
+    /// Remembers which scope one subquery expression opened.
+    ///
+    /// Keyed on the expression's address, which is stable because the whole walk borrows one
+    /// `Statement`. A positional rule — "the last subquery scope under this parent" — is wrong
+    /// the moment a scope holds two of them, and `WHERE a IN (…) AND b IN (…)` is ordinary.
+    fn note_subquery_scope(&mut self, expr: &Expr, inner: u32) {
+        self.subquery_scopes.insert(std::ptr::from_ref(expr) as usize, inner);
+    }
+
+    /// The scope a subquery on this side was walked into, where there is one.
+    fn subquery_scope_of(&self, expr: &Expr, _scope: u32) -> Option<u32> {
+        self.subquery_scopes
+            .get(&(std::ptr::from_ref(expr) as usize))
+            .copied()
     }
 
     /// The occurrences named by the qualifiers of every `alias.column` in an expression.
@@ -1220,6 +1709,117 @@ impl Builder {
             }
         });
         out
+    }
+}
+
+/// The comparison a binary operator makes, or `None` where it is arithmetic rather than a split.
+///
+/// `Expr::BinaryOp` covers `+` as well as `=`, so taking every binary operator would file a
+/// computation as a row the statement went for.
+fn comparison_op(op: &sqlparser::ast::BinaryOperator) -> Option<PredicateOp> {
+    use sqlparser::ast::BinaryOperator as B;
+    Some(match op {
+        B::Eq => PredicateOp::Eq,
+        B::NotEq => PredicateOp::Ne,
+        B::Lt => PredicateOp::Lt,
+        B::LtEq => PredicateOp::Le,
+        B::Gt => PredicateOp::Gt,
+        B::GtEq => PredicateOp::Ge,
+        B::Spaceship => PredicateOp::NullSafeEq,
+        _ => return None,
+    })
+}
+
+/// What kind of thing one side of a split is.
+fn rhs_kind_of(expr: &Expr) -> RhsKind {
+    match expr {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => RhsKind::Column,
+        Expr::Value(_) => RhsKind::Literal,
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => RhsKind::Subquery,
+        Expr::Tuple(_) => RhsKind::RowConstructor,
+        Expr::Nested(inner) => rhs_kind_of(inner),
+        _ => RhsKind::Expression,
+    }
+}
+
+/// The `(qualifier, column)` a side names, where it names one.
+///
+/// Matched on the last two identifiers, so `schema.table.column` resolves on `table` — the rule
+/// MySQL itself enforces, since a relation given an alias may not be referred to by its name.
+fn column_ref(expr: &Expr) -> Option<(Option<Bytes>, Bytes)> {
+    match expr {
+        Expr::Identifier(i) => Some((None, ident_bytes(i))),
+        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => Some((
+            Some(ident_bytes(&parts[parts.len() - 2])),
+            ident_bytes(&parts[parts.len() - 1]),
+        )),
+        Expr::Nested(inner) => column_ref(inner),
+        _ => None,
+    }
+}
+
+/// The directions an `ORDER BY` wrote, with an unwritten one reading as ascending.
+fn directions_of(terms: &[sqlparser::ast::OrderByExpr]) -> SortDirections {
+    use sqlparser::ast::OrderBySort as S;
+    let mut asc = false;
+    let mut desc = false;
+    for t in terms {
+        // `ORDER BY x` is ascending; MySQL has no way to leave it undecided. `USING <op>` is
+        // PostgreSQL's and reaches no MySQL corpus, so it reads as neither.
+        match t.options.sort {
+            Some(S::Desc) => desc = true,
+            Some(S::Using(_)) => {}
+            _ => asc = true,
+        }
+    }
+    match (asc, desc) {
+        (true, true) => SortDirections::Mixed,
+        (false, true) => SortDirections::Desc,
+        (true, false) => SortDirections::Asc,
+        (false, false) => SortDirections::NotApplicable,
+    }
+}
+
+/// The `(rows, offset)` a `LIMIT` wrote, where it wrote literal ones.
+///
+/// A placeholder leaves the operand `None`, which is a measured absence: the author wrote a limit
+/// and the value is not in the document.
+fn limit_operands(limit: &sqlparser::ast::LimitClause) -> (Option<u64>, Option<u64>) {
+    use sqlparser::ast::LimitClause as L;
+    let literal = |e: &Expr| -> Option<u64> {
+        match e {
+            Expr::Value(v) => match &v.value {
+                sqlparser::ast::Value::Number(n, _) => n.parse().ok(),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    match limit {
+        L::LimitOffset { limit, offset, .. } => (
+            limit.as_ref().and_then(literal),
+            offset.as_ref().and_then(|o| literal(&o.value)),
+        ),
+        // MySQL's `LIMIT offset, rows`.
+        L::OffsetCommaLimit { offset, limit } => (literal(limit), literal(offset)),
+    }
+}
+
+/// Which set operation an arm heads.
+fn set_operator_of(
+    op: &sqlparser::ast::SetOperator,
+    quantifier: &sqlparser::ast::SetQuantifier,
+) -> SetOperator {
+    use sqlparser::ast::SetOperator as O;
+    use sqlparser::ast::SetQuantifier as Q;
+    let all = matches!(quantifier, Q::All | Q::AllByName);
+    match op {
+        O::Union if all => SetOperator::UnionAll,
+        O::Union => SetOperator::Union,
+        O::Intersect if all => SetOperator::IntersectAll,
+        O::Intersect => SetOperator::Intersect,
+        O::Except | O::Minus if all => SetOperator::ExceptAll,
+        O::Except | O::Minus => SetOperator::Except,
     }
 }
 
@@ -1389,6 +1989,210 @@ mod tests {
     /// The stages of the statement's own scope.
     fn st(sql: &str) -> Stages {
         graph(sql).scopes[0].stages
+    }
+
+    /// Every split a statement wrote, as `(clause, path, op)`.
+    fn splits(sql: &str) -> Vec<(Clause, String, PredicateOp)> {
+        graph(sql)
+            .predicates
+            .iter()
+            .map(|p| (p.clause, render_path(&p.path), p.op))
+            .collect()
+    }
+
+    fn render_path(path: &[PathStep]) -> String {
+        path.iter()
+            .map(|s| {
+                let c = match s.connective {
+                    Connective::And => "and",
+                    Connective::Or => "or",
+                    Connective::Xor => "xor",
+                    Connective::Not => "not",
+                };
+                format!("{c}[{}]", s.branch)
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// A disjunction is one condition and two splits.
+    ///
+    /// `Stages::filter_terms` counts `AND` conjuncts and must stay 1, because the author wrote one
+    /// condition; the splits beneath it are what the boolean path carries.
+    #[test]
+    fn a_disjunction_is_one_condition_and_two_splits() {
+        let sql = "SELECT a FROM t WHERE x = 1 OR y = 2";
+        assert_eq!(st(sql).filter_terms, 1, "one condition");
+
+        let s = splits(sql);
+        assert_eq!(s.len(), 2, "two splits");
+        assert_eq!(s[0], (Clause::Where, "or[0]".into(), PredicateOp::Eq));
+        assert_eq!(s[1], (Clause::Where, "or[1]".into(), PredicateOp::Eq));
+    }
+
+    /// The path separates a conjunct inside a disjunction from one outside it, which is what
+    /// decides whether a split can act as an index condition on its own.
+    #[test]
+    fn the_path_says_which_splits_share_a_disjunction() {
+        let s = splits("SELECT a FROM t WHERE z = 9 AND (x = 1 OR y = 2)");
+        let paths: Vec<&str> = s.iter().map(|(_, p, _)| p.as_str()).collect();
+        assert_eq!(paths, ["and[0]", "and[1]/or[0]", "and[1]/or[1]"]);
+
+        let disjunctive = |p: &str| p.contains("or[");
+        assert!(!disjunctive(paths[0]), "z = 9 stands alone");
+        assert!(disjunctive(paths[1]) && disjunctive(paths[2]));
+    }
+
+    /// The clause is recorded, because on an outer join `ON p` and `WHERE p` are different
+    /// queries and nothing else in the record separates them.
+    #[test]
+    fn a_join_condition_and_a_filter_are_the_same_object_in_different_clauses() {
+        let on = splits("SELECT a FROM t LEFT JOIN u ON u.x = 1");
+        let wh = splits("SELECT a FROM t LEFT JOIN u ON t.i = u.i WHERE u.x = 1");
+        assert_eq!(on[0].0, Clause::On);
+        assert_eq!(wh.iter().filter(|(c, ..)| *c == Clause::Where).count(), 1);
+        assert_eq!(wh.iter().filter(|(c, ..)| *c == Clause::On).count(), 1);
+    }
+
+    /// The operator, which decides the shape of the region a statement went for.
+    #[test]
+    fn the_comparison_operator_is_recorded_and_arithmetic_is_not() {
+        let ops: Vec<PredicateOp> =
+            splits("SELECT a FROM t WHERE a = 1 AND b > 2 AND c BETWEEN 3 AND 4 AND d IN (5, 6)")
+                .into_iter()
+                .map(|(_, _, o)| o)
+                .collect();
+        assert_eq!(
+            ops,
+            [
+                PredicateOp::Eq,
+                PredicateOp::Gt,
+                PredicateOp::Between,
+                PredicateOp::InList
+            ]
+        );
+
+        // `Expr::BinaryOp` covers `+` as well as `=`, and a computation is not a split. The
+        // projection is walked for the correlated subqueries it can hide, so this is where an
+        // arithmetic expression arrives at the top of a branch and must file nothing.
+        assert!(
+            splits("SELECT qty - 1 FROM t").is_empty(),
+            "arithmetic is not a split"
+        );
+
+        // And a comparison is a leaf: it does not descend into its own operands, so an
+        // expression on one side is part of the split rather than another one.
+        let over = splits("SELECT a FROM t WHERE qty - 1 = 5");
+        assert_eq!(over.len(), 1, "one split, not one per operator");
+        assert_eq!(over[0].2, PredicateOp::Eq);
+    }
+
+    /// A subquery is an operand of a split, so the walk descends through it.
+    #[test]
+    fn a_subquery_is_an_operand_and_carries_its_own_splits() {
+        let g = graph("SELECT a FROM t WHERE t.x IN (SELECT u.y FROM u WHERE u.z = 1 OR u.z = 2)");
+
+        let outer = g
+            .predicates
+            .iter()
+            .find(|p| p.op == PredicateOp::InSubquery)
+            .expect("the IN is a split");
+        assert_eq!(outer.rhs_kind, RhsKind::Subquery);
+        let inner_scope = outer.rhs_scope.expect("and it names the scope it opened");
+
+        let inner: Vec<&Predicate> = g
+            .predicates
+            .iter()
+            .filter(|p| p.scope == inner_scope)
+            .collect();
+        assert_eq!(inner.len(), 2, "the subquery's own disjunction");
+        assert!(
+            inner.iter().all(|p| p.path[0].connective == Connective::Or),
+            "and they share it"
+        );
+        assert_ne!(outer.scope, inner_scope, "two levels, not one");
+    }
+
+    /// A quantified comparison holds its subquery on the right, and the walk descends into it.
+    ///
+    /// Without the descent the relation the subquery reads reaches no artifact at all, and the
+    /// split naming it carries a subquery operand with no scope — the row contradicting itself.
+    #[test]
+    fn a_quantified_comparison_descends_into_its_subquery() {
+        for sql in [
+            "SELECT p.id FROM pallet p WHERE p.weight > ANY (SELECT c.weight FROM crate c)",
+            "SELECT p.id FROM pallet p WHERE p.weight > ALL (SELECT c.weight FROM crate c)",
+        ] {
+            let g = graph(sql);
+            let named: Vec<String> = g
+                .occurrences
+                .iter()
+                .filter_map(|o| o.object_name.as_ref())
+                .map(|b| String::from_utf8_lossy(b.as_ref()).into_owned())
+                .collect();
+            assert!(named.contains(&"crate".to_string()), "{sql}: {named:?}");
+
+            let p = g
+                .predicates
+                .iter()
+                .find(|p| matches!(p.op, PredicateOp::Any | PredicateOp::All))
+                .expect("the quantified comparison is a split");
+            assert_eq!(p.rhs_kind, RhsKind::Subquery);
+            assert!(
+                p.rhs_scope.is_some(),
+                "{sql}: a subquery operand with no scope is a row contradicting itself"
+            );
+        }
+    }
+
+    /// Two subqueries in one scope point at two scopes.
+    ///
+    /// A positional rule — "the last subquery scope under this parent" — gives both splits the
+    /// same scope, and `WHERE a IN (…) AND b IN (…)` is ordinary enough that the corpus carries
+    /// it. The mapping is by expression identity instead.
+    #[test]
+    fn two_subqueries_in_one_scope_are_two_operands() {
+        let g = graph(
+            "SELECT a FROM t WHERE t.x IN (SELECT u.y FROM u) AND t.z IN (SELECT v.w FROM v)",
+        );
+        let scopes: Vec<Option<u32>> = g
+            .predicates
+            .iter()
+            .filter(|p| p.op == PredicateOp::InSubquery)
+            .map(|p| p.rhs_scope)
+            .collect();
+
+        assert_eq!(scopes.len(), 2, "two splits");
+        assert!(scopes.iter().all(Option::is_some), "each names a scope");
+        assert_ne!(scopes[0], scopes[1], "and they are not the same scope");
+
+        // And each points at a scope that really is a subquery of this statement.
+        for s in scopes.into_iter().flatten() {
+            let sc = &g.scopes[s as usize];
+            assert_eq!(sc.kind, ScopeKind::Subquery);
+            assert_eq!(sc.parent, Some(0));
+        }
+    }
+
+    /// Both sides occupied is a relationship; one side is a filter.
+    #[test]
+    fn a_split_with_two_sides_is_the_join_the_statement_wrote() {
+        let g = graph("SELECT a FROM t JOIN u ON t.i = u.j WHERE t.x = 1");
+        let join = g
+            .predicates
+            .iter()
+            .find(|p| p.clause == Clause::On)
+            .unwrap();
+        assert!(join.lhs.occ.is_some() && join.rhs.occ.is_some());
+        assert_eq!(join.lhs.column.as_deref(), Some(&b"i"[..]));
+        assert_eq!(join.rhs.column.as_deref(), Some(&b"j"[..]));
+
+        let filter = g
+            .predicates
+            .iter()
+            .find(|p| p.clause == Clause::Where)
+            .unwrap();
+        assert!(filter.lhs.occ.is_some() && filter.rhs.occ.is_none());
     }
 
     /// ⭐⭐⭐ A STATEMENT IS A PIPELINE AND THE SCOPE TREE IS ITS SKELETON.
