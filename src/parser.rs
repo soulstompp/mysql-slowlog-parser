@@ -1,7 +1,7 @@
 use crate::EntryMasking;
 use bytes::{BufMut, Bytes, BytesMut};
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, Expr, ObjectName, SetExpr, Statement, Value, VisitMut,
+    AssignmentTarget, BinaryOperator, Expr, ObjectName, SetExpr, Statement, Value, ValueWithSpan, VisitMut,
     VisitorMut,
 };
 use sqlparser::dialect::MySqlDialect;
@@ -875,7 +875,11 @@ struct RewritePass<'a> {
 impl VisitorMut for RewritePass<'_> {
     type Break = ();
 
-    fn pre_visit_value(&mut self, value: &mut Value) -> ControlFlow<Self::Break> {
+    /// ⚠️ Still shadowed to the inner `Value`: every arm below is about what the author wrote,
+    /// and assigning through the inner value leaves the span alone — which is what the two
+    /// comments about `with_empty_span()` were already asking for and could not have.
+    fn pre_visit_value(&mut self, value: &mut ValueWithSpan) -> ControlFlow<Self::Break> {
+        let value = &mut value.value;
         // ⛔ THE SAME ARMS AS `LiteralPass::pre_visit_value`, AND THAT IS LOAD-BEARING. A
         // boolean, a NULL or a placeholder is recorded by neither, so neither advances its
         // counter over one -- and an ordinal that meant a different literal in the two passes
@@ -991,8 +995,8 @@ fn statement_targets(
         }
     };
     match s {
-        Statement::Update { assignments, .. } => {
-            for a in assignments {
+        Statement::Update(u) => {
+            for a in &u.assignments {
                 if let AssignmentTarget::ColumnName(n) = &a.target {
                     put(column_of_name(n), &a.value);
                 }
@@ -1029,21 +1033,19 @@ fn statement_targets(
                     // the log does not say is `b`. Deciding they are one needs the catalogue,
                     // and a slow log carries none -- so `#0` and `b` stay apart, the same way
                     // `_bare` and `_resolved` stay apart one grain up.
-                    for (n, e) in row.iter().enumerate() {
+                    for (n, e) in row.content.iter().enumerate() {
                         if let Expr::Value(v) = e {
                             positional.insert(std::ptr::from_ref(&v.value).addr(), n as u32);
                         }
                     }
                     continue;
                 }
-                for (col, e) in i.columns.iter().zip(row) {
-                    put(
-                        Some(LiteralColumn {
-                            qualifier: None,
-                            name: Bytes::from(col.value.clone()),
-                        }),
-                        e,
-                    );
+                // ⚠️ `Insert.columns` IS A `Vec<ObjectName>` SINCE sqlparser 0.63, WHERE IT WAS
+                // A `Vec<Ident>`. A column list entry can be qualified in some dialects; MySQL's
+                // cannot, so the last part is the column and `column_of_name` is the routine that
+                // already knows how to say so — reused rather than re-derived here.
+                for (col, e) in i.columns.iter().zip(&row.content) {
+                    put(column_of_name(col), e);
                 }
             }
         }
@@ -1137,7 +1139,11 @@ impl VisitorMut for LiteralPass {
         ControlFlow::Continue(())
     }
 
-    fn pre_visit_value(&mut self, value: &mut Value) -> ControlFlow<Self::Break> {
+    /// ⭐⭐ See [`RewritePass::pre_visit_value`]: the hook carries the span now. The body is
+    /// unchanged and works on the inner value, so `addr` is still the inner `Value`'s — which
+    /// is what `targets` and `positional` are keyed on, one function up.
+    fn pre_visit_value(&mut self, value: &mut ValueWithSpan) -> ControlFlow<Self::Break> {
+        let value = &mut value.value;
         let (kind, payload) = match value {
             Value::Number(n, _) => (LiteralKind::Number, n.clone()),
             Value::SingleQuotedString(v) => (LiteralKind::SingleQuotedString, v.clone()),

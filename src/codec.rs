@@ -672,7 +672,7 @@ GROUP BY film.film_id, category.name;
 # User@Host: msandbox[msandbox] @ localhost []  Id:    10
 # Query_time: 0.000352  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
 SET timestamp=1517798808;
-/*!40101 SET NAMES utf8 */;
+ALTER TABLE `film` DISABLE KEYS;
 # Time: 2018-02-05T02:46:47.273788Z
 # User@Host: msandbox[msandbox] @ localhost []  Id:    10
 # Query_time: 0.000352  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
@@ -702,7 +702,14 @@ GROUP BY film2.film_id, category.name;
         }
 
         assert_eq!(found, 3, "found");
-        assert_eq!(invalid, 1, "valid");
+        // ⛔⛔ THE MIDDLE ENTRY USED TO BE `/*!40101 SET NAMES utf8 */;` AND IT IS NO LONGER
+        // UNPARSEABLE. `sqlparser` 0.56 filed a MySQL version gate as a comment, so the
+        // statement inside it was invisible and the entry landed on `invalid`; 0.63 executes
+        // the gate the way the server does. The test's subject is a log that MIXES parseable
+        // and unparseable statements, so the example moved rather than the assertion — and it
+        // moved to `ALTER TABLE … DISABLE KEYS`, which is still refused and is the largest
+        // refused family this corpus has.
+        assert_eq!(invalid, 1, "the mix is the subject, so the arm keeps a witness");
     }
 
     #[tokio::test]
@@ -1030,7 +1037,7 @@ mod graph_census {
 
         missed.sort();
         missed.dedup();
-        // ⛔ ONE MISS IN 163 STATEMENTS, AND IT IS NOT A RELATION. `SHOW TABLES FROM mysql` names
+        // ⛔ ONE MISS IN 259 STATEMENTS, AND IT IS NOT A RELATION. `SHOW TABLES FROM mysql` names
         // a SCHEMA, and `ShowStatementIn.parent_name` carries a `visit_relation` annotation, so
         // `objects()` files the schema `mysql` as though it were a table. The graph declines to,
         // which is why this is an exception with an argument rather than a gap to close.
@@ -1041,7 +1048,20 @@ mod graph_census {
         );
 
         assert_eq!(parsed, 310);
-        assert_eq!(with_graph, 163, "statements with an AST to walk");
+        // ⭐⭐⭐ 163 UNTIL sqlparser 0.63 EXECUTED THE VERSION GATES. `/*!40101 SET NAMES utf8
+        // */` was a **comment** to the old grammar — the statement inside it was invisible, the
+        // parse returned zero statements, and the entry was filed `invalid`. MySQL runs those
+        // gates; the new grammar does too. **96 of this log's 131 refusals became parses in one
+        // dependency bump**, which is the grammar regime catching up with the server regime this
+        // file spends two comments distinguishing.
+        //
+        // ⭐⭐ AND NOT ONE OF THE 96 NAMES A RELATION, which is why every other number in this
+        // census is unmoved. They are `mysqldump`'s session settings — `SET NAMES`,
+        // `SET TIME_ZONE`, `SET UNIQUE_CHECKS` — so occurrences, edges, roles, view bodies and
+        // the non-tree descent are all exactly what they were. The grammar gained 96 statements
+        // and the graph gained nothing: the cleanest evidence available that the two regimes
+        // were the whole of the disagreement.
+        assert_eq!(with_graph, 259, "statements with an AST to walk");
 
         // ⭐ The seven `CREATE VIEW`s are the whole of this log's structure, and all 39 relations
         // they mention sit in a view body -- NAMED, never read. `PLAN-2026-09-22-02-fusion.md`
@@ -1052,7 +1072,7 @@ mod graph_census {
         assert_eq!(view_bodies, 7, "every multi-relation statement is a view");
         assert_eq!(named_only, 39, "relations named in a body, not scanned");
 
-        // ⭐⭐ ONE non-tree descent in 163 statements, and it is `actor_info`: its correlated
+        // ⭐⭐ ONE non-tree descent in 259 statements, and it is `actor_info`: its correlated
         // subquery rebinds `fa` and `fc`, and the two correlation edges close a cycle.
         // `rank/composition_closure.sqlc` computes a kernel two ways and says they "agree
         // exactly where the descent is a tree"; every layer graph in that corpus is a forest, so
@@ -1183,20 +1203,29 @@ mod the_author_and_the_reader {
             }
         }
 
-        assert_eq!((n, parsed), (310, 163));
+        // ⭐ 163 until sqlparser 0.63 executed the version gates — see the census above.
+        assert_eq!((n, parsed), (310, 259));
 
-        // ⭐⭐ SIXTY-ONE PER CENT OF THE PARSED STATEMENTS ARE NOT WHAT THE AUTHOR WROTE, and
+        // ⭐⭐ SEVENTY-FIVE PER CENT OF THE PARSED STATEMENTS ARE NOT WHAT THE AUTHOR WROTE, and
         // that column is what a consumer's coarsening ladder calls its byte-identity floor.
-        assert_eq!(differs, 99);
-        assert_eq!(newlines_lost, 59, "multi-line statements flattened to one");
+        // ⚠️ It read 99 of 163 — sixty-one per cent — and the 96 statements the grammar gained
+        // are session settings the render rewrites almost to a one, so the **share** moved as
+        // well as the count. The finding is the same and larger.
+        assert_eq!(differs, 195);
+        assert_eq!(newlines_lost, 62, "multi-line statements flattened to one");
         assert_eq!(lowercase, 9, "keywords the author did not capitalise");
 
         // ⭐ The author's subject, recovered -- and recovered whether or not masking is on,
         // because the bytes carry it even when the tree does not.
-        assert_eq!(literals, 302);
-        assert_eq!(entries_with_literals, 80);
-        assert_eq!(kinds.get(&LiteralKind::Number), Some(&98));
-        assert_eq!(kinds.get(&LiteralKind::SingleQuotedString), Some(&204));
+        // ⚠️ 302 over 80 entries until the version gates parsed. The 21 new literals are
+        // `utf8`, `'+00:00'`, `0` — a `SET`'s right-hand side, which names no rows and reaches
+        // `position = no_domain` downstream. The subject population did not grow; the
+        // **grammar** population did, and those are the two things `literals.position` exists
+        // to keep apart.
+        assert_eq!(literals, 323);
+        assert_eq!(entries_with_literals, 98);
+        assert_eq!(kinds.get(&LiteralKind::Number), Some(&114));
+        assert_eq!(kinds.get(&LiteralKind::SingleQuotedString), Some(&209));
 
         // ⚠️ Thin, and not zero. `USE` is written only when the database CHANGES, so two
         // statements in this log carry one and 308 inherit it -- an inference this crate

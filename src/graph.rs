@@ -694,12 +694,8 @@ impl Builder {
                     self.walk_query(q, scope);
                 }
             }
-            Statement::Update {
-                table,
-                from,
-                selection,
-                ..
-            } => {
+            Statement::Update(u) => {
+                let (table, from, selection) = (&u.table, &u.from, &u.selection);
                 // ⚠️ MySQL's multi-table `UPDATE a JOIN b` puts a whole join graph in the TARGET
                 // position, so this is a `TableWithJoins` and not a name.
                 let ids = self.collect_from(std::slice::from_ref(table), scope, true);
@@ -752,7 +748,8 @@ impl Builder {
                     self.predicate_edges(e, scope, JoinOp::Predicate, ConstraintKind::On);
                 }
             }
-            Statement::CreateView { name, query, .. } => {
+            Statement::CreateView(cv) => {
+                let (name, query) = (&cv.name, &cv.query);
                 // ⛔ `CreateView.name` carries no `visit_relation` annotation either, so the view
                 // a statement brings into being is missing from `objects()` while every relation
                 // in its body is present.
@@ -780,7 +777,10 @@ impl Builder {
             // `Drop.names` carries no annotation, so a dropped table was absent from every
             // artifact in both crates.
             // ⚠️ `ALTER VIEW` files the same way: it redefines a relation that already exists.
-            Statement::AlterTable { name, .. } | Statement::AlterView { name, .. } => {
+            Statement::AlterTable(at) => {
+                self.push_occurrence(scope, Some(&at.name), None, RelationRole::AlterTarget);
+            }
+            Statement::AlterView { name, .. } => {
                 self.push_occurrence(scope, Some(name), None, RelationRole::AlterTarget);
             }
             // ⭐ AN INDEX IS NOT A RELATION, AND THE TABLE IS THE ONE THAT GETS LOCKED.
@@ -790,8 +790,8 @@ impl Builder {
             Statement::CreateIndex(ci) => {
                 self.push_occurrence(scope, Some(&ci.table_name), None, RelationRole::AlterTarget);
             }
-            Statement::Truncate { table_names, .. } => {
-                for t in table_names {
+            Statement::Truncate(tr) => {
+                for t in &tr.table_names {
                     self.push_occurrence(
                         scope,
                         Some(&t.name),
@@ -831,8 +831,13 @@ impl Builder {
                     self.push_occurrence(scope, Some(&name), alias, role);
                 }
             }
-            Statement::Analyze { table_name, .. } => {
-                self.push_occurrence(scope, Some(table_name), None, RelationRole::AnalyzeTarget);
+            // ⚠️ `Analyze.table_name` IS AN `Option` SINCE sqlparser 0.63 — a dialect can write
+            // `ANALYZE` with no table. MySQL cannot, so `None` names nothing and files nothing
+            // rather than being unwrapped into a panic on a statement the server never sent.
+            Statement::Analyze(an) => {
+                if let Some(name) = &an.table_name {
+                    self.push_occurrence(scope, Some(name), None, RelationRole::AnalyzeTarget);
+                }
             }
             Statement::Drop {
                 object_type: ObjectType::Table | ObjectType::View,
@@ -895,6 +900,11 @@ impl Builder {
         match body {
             SetExpr::Select(s) => self.walk_select(s, scope),
             SetExpr::Query(q) => self.walk_query(q, scope),
+            // ⛔ `SetExpr::Merge` ARRIVED IN sqlparser 0.63 AND MYSQL HAS NO `MERGE`. Walked
+            // rather than ignored, because the statement inside it names relations whatever
+            // dialect wrote it — and an arm that silently dropped them would be the "behaviour
+            // absent from an artifact" case this record separates from "workload never did it".
+            SetExpr::Merge(s) => self.walk_statement(s, scope),
             SetExpr::SetOperation { left, right, .. } => {
                 for side in [left, right] {
                     let s = self.push_scope(Some(scope), ScopeKind::SetOp, None, false);
@@ -931,7 +941,7 @@ impl Builder {
         nm |= select.prewhere.is_some()
             || select.qualify.is_some()
             || select.top.is_some()
-            || select.connect_by.is_some()
+            || !select.connect_by.is_empty()
             || !select.sort_by.is_empty()
             || !select.cluster_by.is_empty()
             || !select.distribute_by.is_empty()
@@ -1089,12 +1099,14 @@ impl Builder {
                 self.walk_query(q, inner);
             }
             Expr::InSubquery { expr, subquery, .. } => {
-                // ⚠️ `InSubquery.subquery` is a `SetExpr` and NOT a `Query`, so it has no `with`
-                // field and cannot carry CTEs, while `Exists` and `Subquery` hold a whole `Query`
-                // and can. One entry point for both silently drops the difference.
+                // ⭐⭐ `InSubquery.subquery` WAS A `SetExpr` AND IS A `Query` SINCE sqlparser
+                // 0.63 — so it carries a `with` clause now and `IN (WITH … SELECT …)` reaches
+                // the CTE walk like `EXISTS` and a scalar subquery already did. This file used
+                // to record the asymmetry as a limitation of the grammar; the grammar closed it,
+                // and the walk goes through `walk_query` for all three.
                 self.walk_expr(expr, scope);
                 let inner = self.push_scope(Some(scope), ScopeKind::Subquery, None, false);
-                self.walk_set_expr(subquery, inner);
+                self.walk_query(subquery, inner);
             }
             Expr::BinaryOp { left, right, .. } => {
                 self.walk_expr(left, scope);
@@ -1286,12 +1298,23 @@ fn classify(op: &JoinOperator) -> (JoinOp, ConstraintKind) {
         J::Left(c) | J::LeftOuter(c) => (JoinOp::Left, kind(c)),
         J::Right(c) | J::RightOuter(c) => (JoinOp::Right, kind(c)),
         J::StraightJoin(c) => (JoinOp::Straight, kind(c)),
-        J::CrossJoin => (JoinOp::Cross, ConstraintKind::None),
+        // ⭐ `CrossJoin` CARRIES A CONSTRAINT SINCE sqlparser 0.63, AND MYSQL ALLOWS ONE.
+        // `CROSS JOIN`, `INNER JOIN` and `JOIN` are synonyms in MySQL and all three accept an
+        // `ON` clause, so a cross join that writes one now files it instead of being forced to
+        // `none`. ⚠️ Both of `structure.log`'s cross joins are bare, so no artifact moves — the
+        // capability is recorded rather than demonstrated.
+        J::CrossJoin(c) => (JoinOp::Cross, kind(c)),
         // ⛔ MySQL has no syntax for any of these. See [`JoinOp::NotMySql`].
         J::FullOuter(c) | J::Semi(c) | J::LeftSemi(c) | J::RightSemi(c) | J::Anti(c)
         | J::LeftAnti(c) | J::RightAnti(c) => (JoinOp::NotMySql, kind(c)),
         J::AsOf { constraint, .. } => (JoinOp::NotMySql, kind(constraint)),
-        J::CrossApply | J::OuterApply => (JoinOp::NotMySql, ConstraintKind::None),
+        // ⭐ AND THREE MORE ARRIVED WITH sqlparser 0.63 — ClickHouse's `ARRAY JOIN`. They land
+        // on `not_mysql` without anyone deciding anything, which is the whole argument for
+        // having one landing arm rather than naming every dialect's operators: the enum grew by
+        // three and this crate's vocabulary did not.
+        J::CrossApply | J::OuterApply | J::ArrayJoin | J::LeftArrayJoin | J::InnerArrayJoin => {
+            (JoinOp::NotMySql, ConstraintKind::None)
+        }
     }
 }
 
@@ -1313,7 +1336,10 @@ fn constraint_expr(op: &JoinOperator) -> Option<&Expr> {
         | J::RightAnti(c)
         | J::StraightJoin(c)
         | J::AsOf { constraint: c, .. } => c,
-        J::CrossJoin | J::CrossApply | J::OuterApply => return None,
+        J::CrossJoin(c) => c,
+        J::CrossApply | J::OuterApply | J::ArrayJoin | J::LeftArrayJoin | J::InnerArrayJoin => {
+            return None;
+        }
     };
     match c {
         JoinConstraint::On(e) => Some(e),
@@ -1329,9 +1355,13 @@ fn split_name(n: &ObjectName) -> (Option<Bytes>, Option<Bytes>) {
     let parts: Vec<Bytes> = n
         .0
         .iter()
-        .map(|p| {
-            let ObjectNamePart::Identifier(i) = p;
-            ident_bytes(i)
+        .filter_map(|p| match p {
+            ObjectNamePart::Identifier(i) => Some(ident_bytes(i)),
+            // ⛔ `ObjectNamePart::Function` ARRIVED IN sqlparser 0.63 for dialects that let a
+            // function produce an identifier. MySQL has no such syntax, so a part of that shape
+            // names no relation this crate can file — and dropping it is the same filing
+            // `JoinOp::NotMySql` gets, rather than a name invented out of a call.
+            ObjectNamePart::Function(_) => None,
         })
         .collect();
     match parts.len() {
