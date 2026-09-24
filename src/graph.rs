@@ -49,11 +49,11 @@
 
 use bytes::Bytes;
 use sqlparser::ast::{
-    Cte, Delete, Distinct, Expr, FromTable, GroupByExpr, Insert, JoinConstraint, JoinOperator,
-    LockClause, LockTableType, LockType, NonBlock, ObjectName, ObjectNamePart, ObjectType,
-    OnInsert, OptimizerHintStyle, OrderByKind, Query, Select, SetExpr, ShowCreateObject, Statement,
-    TableFactor, TableIndexHintForClause, TableIndexHintType, TableIndexType, TableObject,
-    TableWithJoins, UpdateTableFromKind, visit_expressions,
+    Cte, Delete, Distinct, Expr, FromTable, GroupByExpr, GroupByWithModifier, Insert,
+    JoinConstraint, JoinOperator, LockClause, LockTableType, LockType, NonBlock, ObjectName,
+    ObjectNamePart, ObjectType, OnInsert, OptimizerHintStyle, OrderByKind, Query, Select, SetExpr,
+    ShowCreateObject, Statement, TableFactor, TableIndexHintForClause, TableIndexHintType,
+    TableIndexType, TableObject, TableWithJoins, UpdateTableFromKind, visit_expressions,
 };
 use std::ops::ControlFlow;
 
@@ -1088,10 +1088,30 @@ impl Builder {
         match statement {
             Statement::Query(q) => self.walk_query(q, scope),
             Statement::Insert(Insert {
-                table, source, on, ..
+                table,
+                source,
+                on,
+                partitioned,
+                optimizer_hints,
+                ..
             }) => {
+                self.push_optimizer_hints(optimizer_hints, scope);
                 if let TableObject::TableName(name) = table {
-                    self.push_occurrence(scope, Some(name), None, RelationRole::InsertTarget);
+                    let occ =
+                        self.push_occurrence(scope, Some(name), None, RelationRole::InsertTarget);
+                    // `INSERT INTO t PARTITION (p0)` restricts the write, and the restriction is
+                    // a field of the statement rather than of a table factor: an insert target is
+                    // a `TableObject`, so it does not pass the one site that reads a relation's
+                    // partitions. A write is the statement kind the disjointness claim matters
+                    // most for.
+                    for e in partitioned.iter().flatten() {
+                        if let Expr::Identifier(i) = e {
+                            self.graph.partitions.push(Partition {
+                                occ,
+                                name: ident_bytes(i),
+                            });
+                        }
+                    }
                 }
                 // `INSERT ... SELECT` is a write and a whole read subgraph at once, which
                 // `objects()` puts in one undifferentiated set.
@@ -1107,6 +1127,7 @@ impl Builder {
                 }
             }
             Statement::Update(u) => {
+                self.push_optimizer_hints(&u.optimizer_hints, scope);
                 let (table, from, selection) = (&u.table, &u.from, &u.selection);
                 // MySQL's multi-table `UPDATE a JOIN b` puts a whole join graph in the target
                 // position, so this is a `TableWithJoins` and not a name.
@@ -1142,8 +1163,10 @@ impl Builder {
                 from,
                 using,
                 selection,
+                optimizer_hints,
                 ..
             }) => {
+                self.push_optimizer_hints(optimizer_hints, scope);
                 for name in tables {
                     // Never visited by `visit_relations`: `Delete.tables` carries no
                     // `visit_relation` annotation, so MySQL's `DELETE t1, t2 FROM ...` target
@@ -1435,7 +1458,12 @@ impl Builder {
                     .iter()
                     .filter(|e| !matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_)))
                     .count() as u32;
-                nm |= !modifiers.is_empty();
+                // `WITH ROLLUP` is MySQL's own and has been since 4.1. `CUBE`, `TOTALS` and
+                // `GROUPING SETS` are other dialects', so they land on the diagnostic arm and
+                // `ROLLUP` does not.
+                nm |= modifiers
+                    .iter()
+                    .any(|m| !matches!(m, GroupByWithModifier::Rollup));
             }
             // `GROUP BY ALL` is not MySQL.
             GroupByExpr::All(_) => nm = true,
@@ -1467,9 +1495,13 @@ impl Builder {
         st.not_mysql |= nm;
     }
 
-    fn walk_select(&mut self, select: &Select, scope: u32) {
-        self.record_stages(select, scope);
-        for h in &select.optimizer_hints {
+    /// The optimizer hints written against one scope.
+    ///
+    /// MySQL admits `/*+ ... */` on `SELECT`, `INSERT`, `REPLACE`, `UPDATE` and `DELETE`, and
+    /// `sqlparser` carries the field on each of those nodes, so reading it on `Select` alone would
+    /// answer for one statement kind of five.
+    fn push_optimizer_hints(&mut self, hints: &[sqlparser::ast::OptimizerHint], scope: u32) {
+        for h in hints {
             self.graph.optimizer_hints.push(OptimizerHintText {
                 scope,
                 text: Bytes::copy_from_slice(h.text.as_bytes()),
@@ -1477,6 +1509,11 @@ impl Builder {
                 line_comment: matches!(h.style, OptimizerHintStyle::SingleLine { .. }),
             });
         }
+    }
+
+    fn walk_select(&mut self, select: &Select, scope: u32) {
+        self.record_stages(select, scope);
+        self.push_optimizer_hints(&select.optimizer_hints, scope);
         // Two passes, and the order matters: every occurrence has to exist before any predicate
         // is resolved, because a join's `ON` clause routinely names a relation the walk has not
         // reached yet and a one-pass walk would drop that edge.
@@ -1580,6 +1617,36 @@ impl Builder {
                         &mut path,
                     );
                 }
+                // A `USING (i, j)` list is a relationship per named column. MySQL matches the
+                // same column name on both sides, so each name is an equality whose two sides are
+                // the two relations the join brought together -- the same fact an `ON` writes as
+                // an expression, which is why `clause` is what separates them and not the shape of
+                // the row. `NATURAL` names no column and writes none: which columns it matched is
+                // a fact about the catalogue and not about the statement.
+                if let Some(cols) = constraint_using(&j.join_operator) {
+                    for n in cols {
+                        let Some(column) = split_name(n).1 else {
+                            continue;
+                        };
+                        self.push_predicate_sides(
+                            scope,
+                            Clause::JoinUsing,
+                            &[],
+                            PredicateOp::Eq,
+                            Side {
+                                occ: Some(ids[i]),
+                                column: Some(column.clone()),
+                            },
+                            Side {
+                                occ: Some(rhs),
+                                column: Some(column),
+                            },
+                            RhsKind::Column,
+                            None,
+                            Some(rhs),
+                        );
+                    }
+                }
                 let mut drawn = false;
                 for lhs in named.into_iter().filter(|o| *o != rhs) {
                     self.push_edge(lhs, rhs, op, constraint);
@@ -1665,6 +1732,17 @@ impl Builder {
                 // Also unannotated, so also absent from `objects()`.
                 let a = alias.as_ref().map(|a| ident_bytes(&a.name));
                 self.push_occurrence(scope, Some(name), a, role)
+            }
+            // `PIVOT`, `UNPIVOT` and `MATCH_RECOGNIZE` are other dialects'; MySQL writes
+            // conditional aggregation instead. Each wraps a base table, so the relation is kept --
+            // dropping it would leave the statement naming nothing and make the occurrence
+            // indistinguishable from a derived table -- and the scope lands on the diagnostic arm,
+            // which is what says the grammar built a tree the server could not have run.
+            TableFactor::Pivot { table, .. }
+            | TableFactor::Unpivot { table, .. }
+            | TableFactor::MatchRecognize { table, .. } => {
+                self.graph.scopes[scope as usize].stages.not_mysql = true;
+                self.walk_table_factor(table, scope, role)
             }
             other => {
                 let a = table_factor_alias(other);
@@ -1934,10 +2012,22 @@ impl Builder {
                     join_occ,
                 );
             }
-            Expr::Like {
-                expr: e, negated, ..
+            // `ILIKE` is PostgreSQL's; MySQL's `LIKE` is collation-insensitive already, so there
+            // is no MySQL text that produces one and it lands on the diagnostic arm.
+            Expr::ILike { expr: e, .. } | Expr::SimilarTo { expr: e, .. } => {
+                self.push_predicate(
+                    scope,
+                    clause,
+                    path,
+                    PredicateOp::NotMySql,
+                    e,
+                    e,
+                    RhsKind::Literal,
+                    None,
+                    join_occ,
+                );
             }
-            | Expr::ILike {
+            Expr::Like {
                 expr: e, negated, ..
             } => {
                 let pop = if *negated {
@@ -2176,7 +2266,15 @@ impl Builder {
 /// The comparison a binary operator makes, or `None` where it is arithmetic rather than a split.
 ///
 /// `Expr::BinaryOp` covers `+` as well as `=`, so taking every binary operator would file a
-/// computation as a row the statement went for.
+/// computation as a row the statement went for. Three answers rather than two: the comparison,
+/// `None` for an operator MySQL has that compares nothing, and the diagnostic arm for one MySQL
+/// does not have at all. A foreign comparison producing no row would be a silence where the
+/// grammar built a tree the server could not have run.
+///
+/// The `None` list is MySQL's own operator set and not `sqlparser`'s naming of it, which is why
+/// `PGBitwiseShiftLeft` and `PGBitwiseShiftRight` are in it: those are MySQL's `<<` and `>>`.
+/// The catch-all therefore answers the diagnostic arm, so an operator a later `sqlparser` adds
+/// is visible rather than silently absent.
 fn comparison_op(op: &sqlparser::ast::BinaryOperator) -> Option<PredicateOp> {
     use sqlparser::ast::BinaryOperator as B;
     Some(match op {
@@ -2187,7 +2285,26 @@ fn comparison_op(op: &sqlparser::ast::BinaryOperator) -> Option<PredicateOp> {
         B::Gt => PredicateOp::Gt,
         B::GtEq => PredicateOp::Ge,
         B::Spaceship => PredicateOp::NullSafeEq,
-        _ => return None,
+        // MySQL's own, and none of them compares: arithmetic, `DIV`, the bitwise set, the JSON
+        // extractors, and the connectives, which are read as boolean structure elsewhere.
+        B::Plus
+        | B::Minus
+        | B::Multiply
+        | B::Divide
+        | B::Modulo
+        | B::MyIntegerDivide
+        | B::StringConcat
+        | B::BitwiseOr
+        | B::BitwiseAnd
+        | B::BitwiseXor
+        | B::PGBitwiseShiftLeft
+        | B::PGBitwiseShiftRight
+        | B::Arrow
+        | B::LongArrow
+        | B::And
+        | B::Or
+        | B::Xor => return None,
+        _ => PredicateOp::NotMySql,
     })
 }
 
@@ -2284,8 +2401,12 @@ fn set_operator_of(
         O::Union => SetOperator::Union,
         O::Intersect if all => SetOperator::IntersectAll,
         O::Intersect => SetOperator::Intersect,
-        O::Except | O::Minus if all => SetOperator::ExceptAll,
-        O::Except | O::Minus => SetOperator::Except,
+        O::Except if all => SetOperator::ExceptAll,
+        O::Except => SetOperator::Except,
+        // `MINUS` is Oracle's. It means what `EXCEPT` means and MySQL has no such keyword, so
+        // filing it as `except` would put a statement the server could not have run on a MySQL
+        // arm -- the defect the landing arms exist to stop.
+        O::Minus => SetOperator::NotMySql,
     }
 }
 
@@ -2388,6 +2509,21 @@ fn classify(op: &JoinOperator) -> (JoinOp, ConstraintKind) {
 }
 
 fn constraint_expr(op: &JoinOperator) -> Option<&Expr> {
+    match join_constraint(op) {
+        Some(JoinConstraint::On(e)) => Some(e),
+        _ => None,
+    }
+}
+
+/// The columns a `USING` list names, where the join wrote one.
+fn constraint_using(op: &JoinOperator) -> Option<&Vec<ObjectName>> {
+    match join_constraint(op) {
+        Some(JoinConstraint::Using(cols)) => Some(cols),
+        _ => None,
+    }
+}
+
+fn join_constraint(op: &JoinOperator) -> Option<&JoinConstraint> {
     use JoinOperator as J;
     let c = match op {
         J::Join(c)
@@ -2410,10 +2546,7 @@ fn constraint_expr(op: &JoinOperator) -> Option<&Expr> {
             return None;
         }
     };
-    match c {
-        JoinConstraint::On(e) => Some(e),
-        _ => None,
-    }
+    Some(c)
 }
 
 fn ident_bytes(i: &sqlparser::ast::Ident) -> Bytes {
@@ -2775,6 +2908,25 @@ mod tests {
         // An unrestricted occurrence files nothing, which is a written absence and not a blank:
         // the author named no partition, so every one is in play.
         assert!(graph("SELECT id FROM t WHERE x = 1").partitions.is_empty());
+
+        // ⭐⭐ THE WRITES, and `INSERT` is the one that does not route through a table factor at
+        // all: its target is a `TableObject` and its restriction a field of the statement, so the
+        // one site reading a relation's partitions never saw it. A write is the statement kind the
+        // disjointness reading matters most for -- two writers on disjoint partitions cannot
+        // contend, and a reader that could not see the restriction would pair them.
+        for sql in [
+            "INSERT INTO t PARTITION (p0) VALUES (1)",
+            "UPDATE t PARTITION (p0) SET a = 1",
+            "DELETE FROM t PARTITION (p0) WHERE x = 1",
+        ] {
+            let g = graph(sql);
+            assert_eq!(g.partitions.len(), 1, "{sql}: no partition read");
+            assert_eq!(g.partitions[0].name, Bytes::from_static(b"p0"), "{sql}");
+            assert_eq!(
+                g.partitions[0].occ, g.occurrences[0].occ,
+                "{sql}: the restriction belongs to the relation it was written on"
+            );
+        }
     }
 
     /// An optimizer hint is carried as the author's own bytes and deliberately not decomposed.
@@ -2811,6 +2963,25 @@ mod tests {
                 .optimizer_hints
                 .is_empty()
         );
+
+        // ⭐ Every statement kind MySQL admits a hint on, not just the one. Reading the field on
+        // `Select` alone answered for a fifth of them, on the commit whose subject says the crate
+        // reads optimizer hints.
+        for sql in [
+            "SELECT /*+ NO_ICP(t idx) */ id FROM t WHERE x = 1",
+            "UPDATE /*+ NO_ICP(t idx) */ t SET a = 1 WHERE x = 1",
+            "DELETE /*+ NO_ICP(t idx) */ FROM t WHERE x = 1",
+            "INSERT /*+ NO_ICP(t idx) */ INTO t (a) VALUES (1)",
+            "REPLACE /*+ NO_ICP(t idx) */ INTO t (a) VALUES (1)",
+        ] {
+            let g = graph(sql);
+            assert_eq!(g.optimizer_hints.len(), 1, "{sql}: no hint read");
+            assert_eq!(
+                g.optimizer_hints[0].text,
+                Bytes::from_static(b" NO_ICP(t idx) "),
+                "{sql}"
+            );
+        }
     }
 
     /// An index hint is the author naming an index, filed against the occurrence it was written on.
@@ -3135,6 +3306,9 @@ mod tests {
             "SELECT a FROM t QUALIFY ROW_NUMBER() OVER () = 1",
             "SELECT a FROM t SORT BY a",
             "SELECT a FROM t CLUSTER BY a",
+            "SELECT a, COUNT(*) FROM t GROUP BY a WITH CUBE",
+            "SELECT * FROM t PIVOT (SUM(a) FOR b IN ('x'))",
+            "SELECT * FROM t UNPIVOT (a FOR b IN (c))",
         ] {
             let g = StatementGraph::of(&one(sql));
             assert!(
@@ -3142,10 +3316,30 @@ mod tests {
                 "{sql} should land on the diagnostic arm"
             );
         }
+        // ⭐ And the relation is kept even where the construct is not MySQL's. Dropping it left
+        // the occurrence nameless and indistinguishable from a derived table, so the statement
+        // named nothing at all.
+        for sql in [
+            "SELECT * FROM t PIVOT (SUM(a) FOR b IN ('x'))",
+            "SELECT * FROM t UNPIVOT (a FOR b IN (c))",
+        ] {
+            let g = StatementGraph::of(&one(sql));
+            assert_eq!(
+                g.occurrences
+                    .iter()
+                    .filter_map(|o| o.object_name.as_deref())
+                    .collect::<Vec<_>>(),
+                vec![b"t".as_slice()],
+                "{sql}: the base relation is the author's and survives the regime"
+            );
+        }
         // ⭐ And ordinary MySQL never does.
         for sql in [
             "SELECT DISTINCT a FROM t",
             "SELECT a FROM t GROUP BY a HAVING COUNT(*) > 1 ORDER BY a LIMIT 2",
+            // ⭐ `WITH ROLLUP` is the pair that makes the two halves discriminate: the grammar
+            // hands every group-by modifier over the same way, and exactly one of them is MySQL.
+            "SELECT a, COUNT(*) FROM t GROUP BY a WITH ROLLUP",
         ] {
             assert!(!st(sql).not_mysql, "{sql} is ordinary MySQL");
         }
@@ -3304,6 +3498,273 @@ mod tests {
             "every JoinOp arm needs text that reaches it; reached {seen:?}"
         );
         assert_eq!(mysql.len() + not_mysql.len(), 20, "cases, for the record");
+    }
+
+    /// ⭐⭐⭐ EVERY ARM OF [`SetOperator`], WITH THE TEXT THAT REACHES IT.
+    ///
+    /// `MINUS` is why this law exists. It is Oracle's spelling of `EXCEPT`, `MySqlDialect` builds
+    /// it, and it filed `except` — a statement the server could not have run, on a MySQL arm.
+    /// That is the defect [`JoinOp::NotMySql`] was created to stop, one enum over, with the
+    /// landing arm already declared and sitting unused.
+    ///
+    /// ⚠️ `INTERSECT` and `EXCEPT` with and without `ALL` are MySQL 8.0.31+, so each is a hole a
+    /// corpus can fill rather than an arm to hold to zero.
+    #[test]
+    fn every_set_operator_the_grammar_can_build_is_classified() {
+        let mysql: &[(&str, SetOperator)] = &[
+            (
+                "SELECT a FROM t1 UNION SELECT a FROM t2",
+                SetOperator::Union,
+            ),
+            (
+                "SELECT a FROM t1 UNION ALL SELECT a FROM t2",
+                SetOperator::UnionAll,
+            ),
+            (
+                "SELECT a FROM t1 INTERSECT SELECT a FROM t2",
+                SetOperator::Intersect,
+            ),
+            (
+                "SELECT a FROM t1 INTERSECT ALL SELECT a FROM t2",
+                SetOperator::IntersectAll,
+            ),
+            (
+                "SELECT a FROM t1 EXCEPT SELECT a FROM t2",
+                SetOperator::Except,
+            ),
+            (
+                "SELECT a FROM t1 EXCEPT ALL SELECT a FROM t2",
+                SetOperator::ExceptAll,
+            ),
+        ];
+        let mut seen: std::collections::BTreeSet<String> = Default::default();
+        for (sql, want) in mysql {
+            let g = graph(sql);
+            assert!(
+                g.scopes.iter().any(|sc| sc.stages.set_operator == *want),
+                "{sql}: no {want:?} scope in {:?}",
+                g.scopes
+                    .iter()
+                    .map(|sc| sc.stages.set_operator)
+                    .collect::<Vec<_>>()
+            );
+            seen.insert(format!("{want:?}"));
+        }
+
+        // ⛔ Oracle's, and the whole claim is that it reaches the landing arm and no MySQL one.
+        let g = graph("SELECT a FROM t1 MINUS SELECT a FROM t2");
+        assert!(
+            g.scopes
+                .iter()
+                .any(|sc| sc.stages.set_operator == SetOperator::NotMySql),
+            "MINUS should land on the diagnostic arm"
+        );
+        assert!(
+            !g.scopes
+                .iter()
+                .any(|sc| sc.stages.set_operator == SetOperator::Except),
+            "MINUS reached a MySQL arm — it means what EXCEPT means and MySQL has no such keyword"
+        );
+        seen.insert("NotMySql".to_string());
+
+        // The arm a scope heading no set operation takes, which is a measurement and not a blank.
+        assert!(
+            graph("SELECT a FROM t")
+                .scopes
+                .iter()
+                .all(|sc| sc.stages.set_operator == SetOperator::NotApplicable),
+            "a statement with no set operation is NotApplicable throughout"
+        );
+        seen.insert("NotApplicable".to_string());
+
+        // ⛔ THE GUARD, as [`JoinOp`]'s: eight arms written out rather than derived, because the
+        // enum cannot be iterated, so a ninth without a witness fails here.
+        assert_eq!(
+            seen.len(),
+            8,
+            "every SetOperator arm needs text that reaches it; reached {seen:?}"
+        );
+    }
+
+    /// ⭐⭐⭐ EVERY ARM OF [`RelationRole`], WITH THE TEXT THAT REACHES IT.
+    ///
+    /// This is the widest enum in the crate and the most consequential: a consumer maps `role` to
+    /// a read, a write or a DDL, and that mapping is what decides whether two statements holding
+    /// one table exclude each other. [`JoinOp`] has had a completeness guard since it was shrunk
+    /// and this had none.
+    ///
+    /// ⛔ [`RelationRole::UpdateTarget`] was the arm it cost: constructed in one place, asserted
+    /// nowhere. An `UPDATE` regressing to the default the way the single-table `DELETE` did —
+    /// filed `from`, and therefore read as a *read* by the artifact whose whole purpose is
+    /// `write × read` exclusion — would have been invisible.
+    #[test]
+    fn every_relation_role_the_walk_files_is_reached() {
+        let cases: &[(&str, RelationRole)] = &[
+            ("SELECT a FROM t", RelationRole::From),
+            (
+                "SELECT a FROM t1 JOIN t2 ON t1.i = t2.i",
+                RelationRole::Join,
+            ),
+            ("INSERT INTO t (a) VALUES (1)", RelationRole::InsertTarget),
+            ("UPDATE t SET a = 1", RelationRole::UpdateTarget),
+            ("DELETE FROM t WHERE x = 1", RelationRole::DeleteTarget),
+            ("CREATE TABLE t (a INT)", RelationRole::CreateTarget),
+            ("CREATE INDEX i ON t (a)", RelationRole::AlterTarget),
+            ("DROP TABLE t", RelationRole::DropTarget),
+            ("TRUNCATE TABLE t", RelationRole::TruncateTarget),
+            ("LOCK TABLES t WRITE", RelationRole::LockExclusiveTarget),
+            ("LOCK TABLES t READ", RelationRole::LockSharedTarget),
+            ("ANALYZE TABLE t", RelationRole::AnalyzeTarget),
+            ("SHOW CREATE TABLE t", RelationRole::MetadataTarget),
+            ("FLUSH TABLES t", RelationRole::FlushTarget),
+        ];
+        let mut seen: std::collections::BTreeSet<String> = Default::default();
+        for (sql, want) in cases {
+            let g = graph(sql);
+            assert!(
+                g.occurrences.iter().any(|o| o.role == *want),
+                "{sql}: no {want:?} occurrence in {:?}",
+                g.occurrences
+                    .iter()
+                    .map(|o| (o.object_name.clone(), o.role))
+                    .collect::<Vec<_>>()
+            );
+            seen.insert(format!("{want:?}"));
+        }
+
+        // ⛔ THE GUARD: fourteen arms written out rather than derived, because the enum cannot be
+        // iterated, so a fifteenth without text that reaches it fails here.
+        assert_eq!(
+            seen.len(),
+            14,
+            "every RelationRole arm needs text that reaches it; reached {seen:?}"
+        );
+
+        // ⭐ And the pair that made this law worth writing: a write must not be filed as a read.
+        // Both of these are the ordinary single-table form, where the target list upstream reads
+        // is empty and the relation arrives in the `FROM`.
+        for (sql, want) in [
+            ("UPDATE t SET a = 1", RelationRole::UpdateTarget),
+            ("DELETE FROM t WHERE x = 1", RelationRole::DeleteTarget),
+        ] {
+            let g = graph(sql);
+            assert_eq!(g.occurrences.len(), 1, "{sql}");
+            assert_eq!(
+                g.occurrences[0].role, want,
+                "{sql}: a write filed as {:?}",
+                g.occurrences[0].role
+            );
+        }
+    }
+
+    /// ⭐⭐ A COMPARISON MYSQL CANNOT WRITE LANDS ON THE DIAGNOSTIC ARM RATHER THAN ON NO ROW.
+    ///
+    /// [`PredicateOp::NotMySql`] was declared and never constructed. `comparison_op` ended in
+    /// `_ => return None`, so a foreign comparison produced **no predicate row at all** — a
+    /// silence where the grammar had built a tree the server could not have run — while `ILIKE`
+    /// shared an arm with `LIKE` and filed as it.
+    ///
+    /// ⭐ The second half is what makes the catch-all safe: MySQL's own operators that compare
+    /// nothing must still produce no predicate of their own. `<<` and `>>` are the sharp pair,
+    /// because `sqlparser` names them `PGBitwiseShiftLeft`/`Right` and they are MySQL's.
+    #[test]
+    fn a_comparison_mysql_cannot_write_lands_on_one_arm() {
+        for sql in [
+            "SELECT a FROM t WHERE a ILIKE 'x'",
+            "SELECT a FROM t WHERE a SIMILAR TO 'x'",
+            "SELECT a FROM t WHERE a ~ 'x'",
+            "SELECT a FROM t WHERE a @> b",
+            "SELECT a FROM t WHERE a OVERLAPS b",
+        ] {
+            let g = graph(sql);
+            assert!(
+                g.predicates.iter().any(|pr| pr.op == PredicateOp::NotMySql),
+                "{sql}: no NotMySql predicate in {:?}",
+                g.predicates.iter().map(|pr| pr.op).collect::<Vec<_>>()
+            );
+            assert!(
+                !g.predicates.iter().any(|pr| matches!(
+                    pr.op,
+                    PredicateOp::Like | PredicateOp::NotLike | PredicateOp::Eq
+                )),
+                "{sql}: something MySQL cannot write reached a MySQL arm — {:?}",
+                g.predicates.iter().map(|pr| pr.op).collect::<Vec<_>>()
+            );
+        }
+
+        for sql in [
+            "SELECT a FROM t WHERE a + 1 = 2",
+            "SELECT a FROM t WHERE a DIV 2 = 1",
+            "SELECT a FROM t WHERE j -> '$.a' = 1",
+            "SELECT a FROM t WHERE a << 2 = 4",
+            "SELECT a FROM t WHERE a >> 2 = 1",
+            "SELECT a FROM t WHERE a | b = 1",
+        ] {
+            let g = graph(sql);
+            assert_eq!(
+                g.predicates.len(),
+                1,
+                "{sql}: the comparison and not the arithmetic — {:?}",
+                g.predicates.iter().map(|pr| pr.op).collect::<Vec<_>>()
+            );
+            assert_eq!(g.predicates[0].op, PredicateOp::Eq, "{sql}");
+        }
+    }
+
+    /// ⭐⭐ A `USING` LIST WRITES THE RELATIONSHIP IT NAMES, AND [`Clause::JoinUsing`] WAS DEAD.
+    ///
+    /// The arm's only occurrence in the crate was its own declaration. `edges.parquet` recorded
+    /// *that* there was a `USING`, and the column it matched on was filed nowhere — so a reader
+    /// asking which columns realise a relationship got an answer for `ON` and none for `USING`.
+    #[test]
+    fn a_using_list_writes_one_relationship_per_column() {
+        let g = graph("SELECT a FROM t1 JOIN t2 USING (i, j)");
+        let using: Vec<_> = g
+            .predicates
+            .iter()
+            .filter(|pr| pr.clause == Clause::JoinUsing)
+            .collect();
+        assert_eq!(
+            using.len(),
+            2,
+            "one per named column, got {:?}",
+            g.predicates
+        );
+        for pr in &using {
+            assert_eq!(pr.op, PredicateOp::Eq, "a USING column is an equality");
+            assert_eq!(
+                pr.lhs.column, pr.rhs.column,
+                "MySQL matches one name on both sides"
+            );
+            assert!(
+                pr.lhs.occ.is_some() && pr.rhs.occ.is_some(),
+                "both sides occupied, so it is a relationship and not a filter"
+            );
+            assert_ne!(
+                pr.lhs.occ, pr.rhs.occ,
+                "the two sides are the two relations the join brought together"
+            );
+            assert_eq!(
+                pr.join_occ, pr.rhs.occ,
+                "the join brought the right side in"
+            );
+        }
+
+        // ⭐ `NATURAL` names no column and writes none: which columns it matched is a fact about
+        // the catalogue, which a slow log carries none of.
+        assert!(
+            graph("SELECT a FROM t1 NATURAL JOIN t2")
+                .predicates
+                .is_empty(),
+            "NATURAL names no column, so it can write no split"
+        );
+
+        // ⛔ THE GUARD: an `ON` over the same pair writes the same relationship in a different
+        // clause, so `clause` is what separates them rather than the shape of the row.
+        let on = graph("SELECT a FROM t1 JOIN t2 ON t1.i = t2.i");
+        assert_eq!(on.predicates.len(), 1, "{:?}", on.predicates);
+        assert_eq!(on.predicates[0].clause, Clause::On);
+        assert_eq!(on.predicates[0].op, PredicateOp::Eq);
     }
 
     /// ⛔⛔ `op == Predicate` IS NOT A CORRELATION, AND THE NAME SAID IT WAS.
