@@ -50,13 +50,10 @@ extern crate core;
 use std::collections::HashMap;
 use std::default::Default;
 use std::fmt::{Debug, Formatter};
-use thiserror::Error;
 
 pub use crate::parser::{
-    EntryAdminCommand, EntryLiteral, LiteralColumn, LiteralKind, SessionLine, SqlStatementContext,
-    StatsLine,
-    TimeLine,
-    carries_a_value, rewrite_literals,
+    EntryAdminCommand, EntryLiteral, HeaderLines, LiteralColumn, LiteralKind, SessionLine,
+    SqlStatementContext, StatsLine, TimeLine, carries_a_value, rewrite_literals,
 };
 
 use bytes::Bytes;
@@ -70,51 +67,26 @@ mod types;
 
 pub use graph::{
     Clause, Connective, ConstraintKind, Edge, GraphMeasures, IndexHint, IndexHintKind,
-    IndexHintScope, JoinOp, LockStrength, LockWait, PathStep, Predicate, PredicateOp,
-    RelationOccurrence, RelationRole, RhsKind, Scope, ScopeKind, SetOperator, Side, SortDirections,
-    Stages, StatementGraph,
+    IndexHintScope, JoinOp, LockStrength, LockWait, OptimizerHintText, Partition, PathStep,
+    Predicate, PredicateOp, RelationOccurrence, RelationRole, RhsKind, Scope, ScopeKind,
+    SetOperator, Side, SortDirections, Stages, StatementGraph,
 };
 
 pub use types::{
-    Entry, EntryCall, EntrySession, EntrySqlAttributes, EntrySqlStatement,
-    EntrySqlStatementObject, EntrySqlType, EntryStatement, EntryStats,
+    Entry, EntryCall, EntrySession, EntrySqlAttributes, EntrySqlStatement, EntrySqlStatementObject,
+    EntrySqlType, EntryStatement, EntryStats,
 };
-
-/// Error covering problems reading or parsing a log
-#[derive(Error, Debug)]
-pub enum ReadError {
-    /// problem found where a Time:... line is expected
-    #[error("invalid time line: {0}")]
-    InvalidTimeLine(String),
-    /// problem found where a User:... line is expected
-    #[error("invalid user line: {0}")]
-    InvalidUserLine(String),
-    /// problem found where a Query_time:... line is expected
-    #[error("invalid stats line: {0}")]
-    InvalidStatsLine(String),
-    /// problem found at end of file with an incomplete SQL statement
-    #[error("invalid entry with invalid sql starting at end of file")]
-    IncompleteSql,
-    /// problem found at end of file somewhere in the middle of an entry
-    #[error("Invalid log format or format contains no entries")]
-    IncompleteLog,
-}
 
 /// types of masking to apply when parsing SQL statements
 /// * PlaceHolder - mask all sql values with a '?' placeholder
 /// * None - leave all values in place
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum EntryMasking {
     /// A placeholder `?` is used when a binding is found in a query
     PlaceHolder,
     /// No placeholder mask
+    #[default]
     None,
-}
-
-impl Default for EntryMasking {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Struct to pass along configuration values to codec
@@ -131,12 +103,4 @@ impl Debug for EntryCodecConfig {
         write!(f, "{:?}", self.masking)?;
         write!(f, "map_comment_context: fn")
     }
-}
-
-/// errors that occur when building a Reader
-#[derive(Error, Clone, Copy, Debug)]
-pub enum ReaderBuildError {
-    /// missing reader value
-    #[error("reader must be set to build Reader")]
-    MissingReader,
 }

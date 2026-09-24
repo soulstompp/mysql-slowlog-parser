@@ -1,52 +1,67 @@
 //! The relation graph of a parsed statement: which relations it names, where each one sits, and
 //! which ones are joined to which.
 //!
-//! ⭐⭐ THIS IS THE STRUCTURE `objects()` THROWS AWAY. That accessor folds the whole parse into a
-//! `BTreeSet` of names, which discards four different things at once: how many times a relation is
-//! touched, what position it was touched in, how deep it was nested, and every edge. A self-join
-//! arrives as one name, a table named inside a `CREATE VIEW` body arrives looking exactly like a
-//! table that was scanned, and a CTE reference arrives looking like a physical table.
+//! What it reads: every relation occurrence in the statement, the naming scope each one sits in,
+//! the role it plays there, the relationships the statement wrote between them, the comparisons in
+//! each scope's boolean tree, and the row-reducing stages, locking clauses, index hints, partition
+//! restrictions and optimizer-hint comments each scope carries. `objects()` folds the same parse
+//! into a set of names: a self-join arrives as one name there, a table named inside a
+//! `CREATE VIEW` body looks like a table that was scanned, and a CTE reference looks like a
+//! physical table.
 //!
-//! ⛔ AND IT CANNOT BE BUILT WITH A VISITOR. `sqlparser`'s visitor fires on `ObjectName`,
-//! `TableFactor`, `Expr`, `Query`, `Statement` and `Value`, and on nothing else. There is no
-//! `visit(with = ...)` annotation anywhere on `Join`, `JoinOperator`, `JoinConstraint`,
-//! `TableWithJoins`, `Cte` or `With`, so a visitor sees join *operands* as an undifferentiated
-//! stream and never sees the join *operator* or its predicate at all. The edges have to be walked
-//! by hand.
+//! It is walked by hand rather than by a visitor, because `sqlparser`'s visitor fires on
+//! `ObjectName`, `TableFactor`, `Expr`, `Query`, `Statement` and `Value` and on nothing else.
+//! Nothing on `Join`, `JoinOperator`, `JoinConstraint`, `TableWithJoins`, `Cte` or `With` is
+//! annotated for it, so a visitor sees join *operands* as an undifferentiated stream and never
+//! sees the join *operator* or its predicate.
 //!
 //! ## What a node is
 //!
-//! ⭐ AN OCCURRENCE, NEVER A TABLE. `FROM employee e1 JOIN employee e2` is two nodes, because the
-//! statement said it twice and a filing carries the document's value rather than the reader's.
-//! Collapsing the two onto one table name is a claim about a catalogue this crate has never seen,
-//! so it belongs to whoever holds the catalogue. [`RelationOccurrence::alias`] is the identity;
+//! An occurrence and never a table. `FROM employee e1 JOIN employee e2` is two nodes, because the
+//! statement said it twice; collapsing the two onto one table name is a claim about a catalogue
+//! this crate has never seen, and belongs to whoever holds the catalogue.
+//! [`RelationOccurrence::alias`] is the identity, and
 //! [`RelationOccurrence::object_name`] is what a later reader would collapse *by*.
+//!
+//! ## What the walk refuses, and what it declines to interpret
+//!
+//! Text `sqlparser` builds and MySQL cannot write is not filed as though the server ran it: the
+//! landing arms [`JoinOp::NotMySql`], [`PredicateOp::NotMySql`], [`SetOperator::NotMySql`],
+//! [`LockStrength::NotMySql`] and [`Stages::not_mysql`] say that the grammar accepted something
+//! this server has no syntax for. A claim about MySQL's behaviour holds inside a server
+//! version, and these arms are where the two regimes are kept apart.
+//!
+//! Some constructs are read and deliberately not decomposed. An optimizer hint is carried as the
+//! author's own bytes, because `sqlparser` hands the whole comment body over unstructured and
+//! naming each hint and its target would be this walk lexing where everything else parses. `SHOW
+//! INDEX FROM t` and `SHOW TABLE STATUS FROM db` arrive as token lists rather than as structures,
+//! so no relation is read out of them for the same reason. The figures a relation occurrence
+//! would carry are not here at all: a slow log measures statements, so the incidence is complete
+//! and every per-relation cost is absent.
 //!
 //! ## What the walker does not see
 //!
-//! ⚠️ [`Builder::walk_expr`] names the `Expr` forms it descends into and does nothing with the
-//! rest, so a subquery hidden inside a form not listed there is a relation this graph does not
-//! hold. That gap is not left to a reader to notice: [`StatementGraph::nested_query_count`]
-//! counts the same subqueries by a second route — `sqlparser`'s own `visit_expressions` — and
-//! `tests::the_two_routes_to_a_subquery_agree` holds them together.
+//! `Builder::walk_expr` names the `Expr` forms it descends into and does nothing with the rest, so
+//! a subquery hidden inside a form not listed there is a relation this graph does not hold. That
+//! gap is checkable rather than latent: [`StatementGraph::nested_query_count`] counts the same
+//! subqueries by a second route — `sqlparser`'s own `visit_expressions` — and a test holds the two
+//! together.
 
 use bytes::Bytes;
 use sqlparser::ast::{
-    ShowCreateObject,
     Cte, Delete, Distinct, Expr, FromTable, GroupByExpr, Insert, JoinConstraint, JoinOperator,
     LockClause, LockTableType, LockType, NonBlock, ObjectName, ObjectNamePart, ObjectType,
-    OnInsert, OptimizerHintStyle, OrderByKind, Query, Select, SetExpr, TableIndexHintForClause,
-    TableIndexHintType,
-    TableIndexType,
-    Statement, TableFactor, TableObject, TableWithJoins, UpdateTableFromKind, visit_expressions,
+    OnInsert, OptimizerHintStyle, OrderByKind, Query, Select, SetExpr, ShowCreateObject, Statement,
+    TableFactor, TableIndexHintForClause, TableIndexHintType, TableIndexType, TableObject,
+    TableWithJoins, UpdateTableFromKind, visit_expressions,
 };
 use std::ops::ControlFlow;
 
 /// Where in its statement a relation occurrence sits.
 ///
-/// ⭐ THE TARGET ARMS ARE WHY THIS IS NOT A SET. `objects()` puts the table an `UPDATE` writes to
-/// and the tables it reads from into one collection with nothing separating them, so a reader
-/// summing anything over "the tables this statement touched" sums a write and a read together.
+/// The target arms are why a set of names will not do: `objects()` puts the table an `UPDATE`
+/// writes to and the tables it reads from into one collection with nothing separating them, so a
+/// reader summing over "the tables this statement touched" sums a write and a read together.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub enum RelationRole {
     /// the first relation of a `FROM` clause
@@ -63,59 +78,56 @@ pub enum RelationRole {
     CreateTarget,
     /// the relation an `ALTER TABLE` changes the definition of
     ///
-    /// ⭐⭐ NOT `CreateTarget`, AND THE DIFFERENCE IS THE WHOLE POINT OF FILING IT. A `CREATE`
-    /// names a relation that did not exist, so nothing was reading it and nothing could be
-    /// blocked. An `ALTER` names one that does exist and takes `MDL_EXCLUSIVE` on it, which
-    /// blocks every reader of it for the duration. Filing both as "a DDL target" would put the
-    /// one DDL that cannot block anybody under the same name as the one that blocks everybody.
+    /// Kept apart from [`RelationRole::CreateTarget`]: a `CREATE` names a relation that did not
+    /// exist, so nothing was reading it and nothing could be blocked, while an `ALTER` names one
+    /// that does exist and takes `MDL_EXCLUSIVE` on it, which blocks every reader for the
+    /// duration. One name for both would put the DDL that cannot block anybody under the same
+    /// name as the one that blocks everybody.
     AlterTarget,
     /// the relation a `DROP` removes
     DropTarget,
     /// the relation a `TRUNCATE` empties
     ///
-    /// ⚠️ Not a `DELETE`. InnoDB implements `TRUNCATE TABLE` by dropping and recreating the
-    /// tablespace, so it takes `MDL_EXCLUSIVE` where a `DELETE FROM t` takes row locks — the two
-    /// statements a reader would most expect to be alike are the two furthest apart here.
+    /// Not a `DELETE`: InnoDB implements `TRUNCATE TABLE` by dropping and recreating the
+    /// tablespace, so it takes `MDL_EXCLUSIVE` where a `DELETE FROM t` takes row locks.
     TruncateTarget,
     /// a relation `LOCK TABLES … WRITE` holds
     ///
-    /// ⭐⭐⭐ THE STATEMENT THAT TAKES THE LOCK THE LOG MEASURES THE WAIT FOR. `Lock_time` in a
-    /// slow log is table-level and metadata lock wait; `LOCK TABLES` is how a client asks for
-    /// exactly that, and `LockTables.tables` carries no `visit_relation` annotation, so the
-    /// tables it holds were absent from `objects()` and from every artifact downstream of it.
+    /// The statement that takes the lock a slow log measures the wait for: `Lock_time` is
+    /// table-level and metadata lock wait, and `LOCK TABLES` is how a client asks for exactly
+    /// that. `LockTables.tables` carries no `visit_relation` annotation, so the tables it holds
+    /// reach `objects()` not at all and are only in the graph because this walk reads them.
     LockExclusiveTarget,
     /// a relation `LOCK TABLES … READ` holds
     ///
-    /// ⚠️ Filed apart from [`RelationRole::LockExclusiveTarget`] because the modes exclude
-    /// different things: a read lock admits other readers and shuts out writers, a write lock
-    /// shuts out both. One role for both would be the `ddl`/`write` fusion one statement over.
+    /// Filed apart from [`RelationRole::LockExclusiveTarget`] because the modes exclude different
+    /// things: a read lock admits other readers and shuts out writers, and a write lock shuts out
+    /// both.
     LockSharedTarget,
     /// the relation an `ANALYZE TABLE` samples
     AnalyzeTarget,
     /// Named by a statement that opens the table, takes a **shared** metadata lock and reads no
     /// rows: `EXPLAIN t`, `DESCRIBE t`, `SHOW CREATE TABLE t`, `SHOW COLUMNS FROM t`.
     ///
-    /// ⭐ Not `From`. These read the data **dictionary** rather than the table, so a reader taking
-    /// `rows_examined` against them is right to see a zero, and a reader asking who held a
-    /// metadata lock is right to see them. Folding them into `From` would make the first
-    /// unreadable; dropping them made the second, which is what this arm repairs.
+    /// Not [`RelationRole::From`]: these read the data dictionary rather than the table, so a
+    /// reader taking `rows_examined` against them is right to see a zero while a reader asking who
+    /// held a metadata lock is right to see them. Folding them into `From` would make the first
+    /// unreadable, and dropping them would make the second.
     MetadataTarget,
     /// `FLUSH TABLES t` — takes an **exclusive** metadata lock and closes the table.
     ///
-    /// ⚠️ Filed apart from [`RelationRole::MetadataTarget`] because the lock is the opposite one:
-    /// this excludes every reader, exactly as a DDL does, and that is a different claim about
-    /// MySQL from the one above.
+    /// Filed apart from [`RelationRole::MetadataTarget`] because the lock is the opposite one:
+    /// this excludes every reader, as a DDL does, which is a different claim about MySQL from the
+    /// one above.
     FlushTarget,
 }
 
 /// The kind of naming scope a relation occurrence was found in.
 ///
-/// ⭐ THIS IS WHAT SEPARATES A TABLE SCANNED FROM A TABLE NAMED. A relation under a
+/// This is what separates a table scanned from a table named. A relation under a
 /// [`ScopeKind::ViewBody`] is mentioned in a definition that ran once and read nothing; a relation
-/// under [`ScopeKind::Statement`] was actually visited. `objects()` spells them the same, and on
-/// the corpus this crate is tested against *every* multi-relation statement is a `CREATE VIEW`,
-/// so a sum over tables weighted by query time is drawn entirely from statements that never
-/// touched them.
+/// under [`ScopeKind::Statement`] was visited. `objects()` spells the two the same, so a sum over
+/// tables weighted by query time can be drawn entirely from statements that never touched them.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub enum ScopeKind {
     /// the statement's own top level
@@ -147,36 +159,27 @@ pub enum JoinOp {
     Straight,
     /// a comma in a `FROM` list
     Comma,
-    /// ⭐ not a join operator at all: a comparison written in a predicate clause — `WHERE`,
+    /// Not a join operator at all: a comparison written in a predicate clause — `WHERE`,
     /// `HAVING`, or an expression in the projection — whose two sides name different relations.
     ///
-    /// ⛔ THIS WAS CALLED `Correlation` AND THAT NAME WAS TRUE OF TWO THIRDS OF THEM. A
-    /// correlation is specifically the **cross-scope** case, and this variant also holds the
-    /// ordinary same-scope predicate — which for a comma join is the join condition itself,
-    /// since old-style SQL puts it in the `WHERE` where there is no `ON` to put it in. Whether
-    /// an edge crosses a scope is [`JoinEdge::crosses_scope`] and was already filed beside it,
-    /// so the two facts stay two columns:
-    ///
-    /// > a correlation is `op == Predicate && crosses_scope`, and it is a **reading**.
-    ///
-    /// Making it a variant instead would define `op` out of `crosses_scope` and file one
-    /// witness twice.
+    /// This is not the same thing as a correlation. A correlation is the cross-scope case, and
+    /// this arm also holds the ordinary same-scope predicate — which for a comma join is the join
+    /// condition itself, since old-style SQL has no `ON` to put it in. Whether an edge crosses a
+    /// scope is [`Edge::crosses_scope`], so the two facts stay two fields and a correlation is
+    /// the reading `op == Predicate && crosses_scope`. A variant for it would define `op` out of
+    /// `crosses_scope`.
     Predicate,
-    /// ⛔⛔ A JOIN OPERATOR MYSQL CANNOT WRITE.
+    /// A join operator MySQL cannot write.
     ///
     /// `sqlparser` is a multi-dialect parser and `MySqlDialect` gates very little, so it will
     /// build `FULL OUTER JOIN`, `SEMI`/`ANTI JOIN`, `CROSS`/`OUTER APPLY` and `ASOF JOIN` out of
-    /// text MySQL has no syntax for. **This crate reads MySQL slow logs**, so a server that
-    /// wrote one of those lines is not the server this parser is for.
+    /// text MySQL has no syntax for. This crate reads MySQL slow logs, so one arm covers all of
+    /// them rather than naming five cases that cannot occur in front of every consumer and every
+    /// match.
     ///
-    /// ⭐ They used to be five named arms. Naming them made the vocabulary a union of every
-    /// dialect `sqlparser` knows, and put five cases that **cannot occur** in front of every
-    /// consumer, every match and every coverage law. One arm instead: the grammar we worry about
-    /// is MySQL's.
-    ///
-    /// ⚠️ A row carrying this is a **diagnostic and not data** — either the input was not a
-    /// MySQL slow log, or `sqlparser` built a tree the server could not have run. The author's
-    /// bytes are on the entry either way.
+    /// An edge carrying this is a diagnostic and not data: either the input was not a MySQL slow
+    /// log, or `sqlparser` built a tree the server could not have run. The author's bytes are on
+    /// the entry either way.
     NotMySql,
 }
 
@@ -350,13 +353,13 @@ pub struct Predicate {
     ///
     /// `clause` says a split sat in an `ON`, and with two joins in one statement that is not
     /// enough to say **which**. This names the join: it is the occurrence on the right of the
-    /// join operator, which is what [`Edge::rhs_occ`] carries, so the pair joins on it and the
+    /// join operator, which is what [`Edge::rhs`] carries, so the pair joins on it and the
     /// operator above the split becomes readable.
     ///
-    /// ⛔ That operator is not decoration. `A LEFT JOIN B ON p` is a **union** —
-    /// `(A ⋈ B) ∪ ((A − π_A(A ⋈ B)) × {NULL})` — so `p` restricts `B` and does not remove one
-    /// row of `A`, while the same `p` in a `WHERE` removes rows and nullifies the outerness.
-    /// `path` cannot see any of that: the join sits above the boolean tree it describes.
+    /// That operator is not decoration: under a `LEFT JOIN` an `ON` predicate restricts the
+    /// null-supplying side and removes no row of the preserved side, while the same predicate in a
+    /// `WHERE` removes rows and takes the outerness with it. [`Self::path`] cannot see that,
+    /// because the join sits above the boolean tree it describes.
     ///
     /// `None` on a `WHERE`, `HAVING` or projection split, which no join clause encloses.
     pub join_occ: Option<u32>,
@@ -532,15 +535,14 @@ pub struct Scope {
     pub name: Option<Bytes>,
     /// whether a `WITH` introducing this scope said `RECURSIVE`
     pub recursive: bool,
-    /// ⭐⭐⭐ The row-reducing and row-reordering STAGES this scope writes down.
+    /// The row-reducing and row-reordering stages this scope writes down.
     ///
-    /// A statement is a pipeline: each scope may filter, then group, then filter the groups,
-    /// then order, then cut. The walk already reads `selection` and `having` here and throws
-    /// them away; `group_by`, `distinct` and the query's `ORDER BY`/`LIMIT` it never touched.
+    /// A statement is a pipeline: each scope may filter, then group, then filter the groups, then
+    /// order, then cut.
     ///
-    /// ⛔ THE STRUCTURE IS THE AUTHOR'S AND THE COST IS NOBODY'S. A slow log carries one
-    /// `Query_time` for the whole pipeline and nothing per stage, so what a stage cost is not in
-    /// the document at any setting — the same standing a relation occurrence's figure has.
+    /// The structure is the author's and the cost is nobody's. A slow log carries one
+    /// `Query_time` for the whole pipeline and nothing per stage, so no per-stage cost is
+    /// available here at any setting.
     pub stages: Stages,
     /// The row lock this scope's own `FOR UPDATE` / `FOR SHARE` asks for.
     ///
@@ -572,37 +574,37 @@ fn locking_of(lock: &LockClause) -> (LockStrength, LockWait) {
 
 /// What one scope does to its rows, counted rather than judged.
 ///
-/// ⚠️ A SCOPE IS NOT ONE `Select`, so these ACCUMULATE. `INSERT ... SELECT ... WHERE` walks its
-/// source into the **same** scope as the insert target, and `UPDATE`/`DELETE` carry a `WHERE`
-/// with no `Select` at all. Assigning once would lose whichever came second.
+/// A scope is not one `Select`, so these counts accumulate: `INSERT ... SELECT ... WHERE` walks
+/// its source into the same scope as the insert target, and `UPDATE`/`DELETE` carry a `WHERE` with
+/// no `Select` at all. Assigning rather than accumulating would lose whichever came second.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stages {
-    /// Top-level `AND` conjuncts of this scope's `WHERE`. ⭐ `0` is a MEASURED zero: the parse
-    /// looked and there was no filter.
+    /// Top-level `AND` conjuncts of this scope's `WHERE`. `0` means the parse looked and there was
+    /// no filter, rather than that nobody looked.
     pub filter_terms: u32,
     /// `GROUP BY` terms.
     pub group_terms: u32,
     /// Of those, how many are **not** a plain or qualified column.
     ///
-    /// ⚠️ The count is the text's; *"an expression forces a temporary table"* is a claim about
+    /// The count is the text's. Whether an expression forces a temporary table is a claim about
     /// the server and is not made here.
     pub group_expression_terms: u32,
     /// Top-level `AND` conjuncts of `HAVING`.
     pub having_terms: u32,
     /// Calls to a built-in aggregate in `HAVING`, and in the projection.
     ///
-    /// ⚠️ A LOWER BOUND, and stated as one: matched against MySQL's built-in aggregate names,
-    /// so a `CREATE AGGREGATE FUNCTION` UDF is not on the list and is not counted.
+    /// A lower bound: matched against MySQL's built-in aggregate names, so a
+    /// `CREATE AGGREGATE FUNCTION` UDF is not on the list and is not counted.
     pub having_aggregate_calls: u32,
-    /// ⭐ `group_terms == 0 && projection_aggregate_calls > 0` **is** implicit grouping — the
-    /// whole result is one group — and a reading of `group_terms` alone would say there is no
-    /// grouping stage where there is one.
+    /// `group_terms == 0 && projection_aggregate_calls > 0` is implicit grouping — the whole
+    /// result is one group — so a reading of `group_terms` alone would say there is no grouping
+    /// stage where there is one.
     pub projection_aggregate_calls: u32,
-    /// Whether the scope wrote `SELECT DISTINCT`. ⛔ Leaving it out would not lose a
-    /// column, it would produce a WRONG KEY: `SELECT DISTINCT a` and `SELECT a` would share one.
+    /// Whether the scope wrote `SELECT DISTINCT`. `SELECT DISTINCT a` and `SELECT a` do different
+    /// work, so a consumer keying on these stages needs the two to differ.
     pub distinct_present: bool,
-    /// `ORDER BY` terms on the `Query` this scope heads. ⚠️ `ORDER BY` and `LIMIT` hang off
-    /// `Query` and not off `Select`.
+    /// `ORDER BY` terms on the `Query` this scope heads: `ORDER BY` and `LIMIT` hang off `Query`
+    /// and not off `Select`.
     pub sort_terms: u32,
     /// Whether the query this scope heads carried a `LIMIT`.
     pub limit_present: bool,
@@ -616,26 +618,27 @@ pub struct Stages {
     pub sort_directions: SortDirections,
     /// Which set operation this scope heads, where it heads one.
     pub set_operator: SetOperator,
-    /// ⛔ A construct this grammar reaches and MySQL has no syntax for: `PREWHERE`, `QUALIFY`,
-    /// `GROUP BY ALL`, `DISTINCT ON`, Hive's `SORT BY`/`CLUSTER BY`/`DISTRIBUTE BY`, `TOP`,
-    /// `CONNECT BY`, `ORDER BY ALL`.
+    /// The scope carried a construct this grammar reaches and MySQL has no syntax for: `PREWHERE`,
+    /// `QUALIFY`, `GROUP BY ALL`, `DISTINCT ON`, Hive's `SORT BY`/`CLUSTER BY`/`DISTRIBUTE BY`,
+    /// `TOP`, `CONNECT BY`, `ORDER BY ALL`.
     ///
-    /// ⚠️ ONE LANDING ARM AND NOT NINE NAMED ONES, exactly as [`JoinOp::NotMySql`]: naming
-    /// them would put nine cases that cannot occur in front of every consumer. A row carrying it
-    /// is a **diagnostic and not data**, and is held to zero on both corpora.
+    /// One flag rather than nine named ones, as with [`JoinOp::NotMySql`]: naming them would put
+    /// nine cases that cannot occur in front of every consumer. `true` is a diagnostic and not
+    /// data.
     pub not_mysql: bool,
 }
 
 /// Top-level `AND` conjuncts of a predicate.
 ///
-/// ⚠️ `AND` ONLY. `a = 1 OR b = 2` is ONE condition on two columns and splitting it would say
-/// the author wrote two filters where they wrote a disjunction — a different claim about how many
-/// row-reducing terms the scope carries.
+/// `AND` only. `a = 1 OR b = 2` is one condition on two columns, and splitting it would say the
+/// author wrote two filters where they wrote a disjunction.
 fn conjuncts(e: &Expr) -> u32 {
     match e {
-        Expr::BinaryOp { left, op: sqlparser::ast::BinaryOperator::And, right } => {
-            conjuncts(left) + conjuncts(right)
-        }
+        Expr::BinaryOp {
+            left,
+            op: sqlparser::ast::BinaryOperator::And,
+            right,
+        } => conjuncts(left) + conjuncts(right),
         Expr::Nested(inner) => conjuncts(inner),
         _ => 1,
     }
@@ -643,11 +646,24 @@ fn conjuncts(e: &Expr) -> u32 {
 
 /// MySQL's built-in aggregates, by name.
 ///
-/// ⚠️ A LOWER BOUND and stated as one: a `CREATE AGGREGATE FUNCTION` UDF is not on this list,
-/// and whether a function aggregates is not decidable from a log.
+/// A lower bound: a `CREATE AGGREGATE FUNCTION` UDF is not on this list, and whether a function
+/// aggregates is not decidable from a log.
 const AGGREGATES: [&str; 15] = [
-    "COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STD", "STDDEV", "STDDEV_POP",
-    "STDDEV_SAMP", "VARIANCE", "VAR_POP", "VAR_SAMP", "BIT_AND", "BIT_OR",
+    "COUNT",
+    "SUM",
+    "AVG",
+    "MIN",
+    "MAX",
+    "GROUP_CONCAT",
+    "STD",
+    "STDDEV",
+    "STDDEV_POP",
+    "STDDEV_SAMP",
+    "VARIANCE",
+    "VAR_POP",
+    "VAR_SAMP",
+    "BIT_AND",
+    "BIT_OR",
 ];
 
 fn aggregate_calls(e: &Expr) -> u32 {
@@ -675,26 +691,24 @@ pub struct RelationOccurrence {
     pub schema_name: Option<Bytes>,
     /// the relation's written name; `None` for a derived table, which has only an alias
     pub object_name: Option<Bytes>,
-    /// ⭐ the identity of this node. `None` where the statement gave none, in which case
+    /// the identity of this node. `None` where the statement gave none, in which case
     /// `object_name` is doing the work.
     pub alias: Option<Bytes>,
     /// where in the statement it sits
     pub role: RelationRole,
-    /// ⚠️ the scope of the CTE this name resolves to, where it resolves to one. A CTE reference
-    /// parses as an ordinary table and `objects()` files it as a physical relation that does not
-    /// exist.
+    /// the scope of the CTE this name resolves to, where it resolves to one. A CTE reference parses
+    /// as an ordinary table, so `objects()` files one as a physical relation that does not exist.
     pub resolves_to_cte: Option<u32>,
-    /// ⛔⛔ THE OCCURRENCE THIS ONE REFERS TO, where it refers to one rather than naming a
-    /// relation of its own. MySQL's multi-table `DELETE o, p FROM orders o JOIN payments p`
-    /// names its targets **by alias**, and sqlparser hands that list over as `ObjectName`s — so
-    /// the graph filed two relations called `o` and `p` that do not exist, while the write on
-    /// `orders` and on `payments` was recorded nowhere at all.
+    /// The occurrence this one refers to, where it refers to one rather than naming a relation of
+    /// its own. MySQL's multi-table `DELETE o, p FROM orders o JOIN payments p` names its targets
+    /// by alias and sqlparser hands that list over as `ObjectName`s, so without this an
+    /// occurrence called `o` would stand for a relation that does not exist while the write on
+    /// `orders` would be recorded nowhere.
     ///
-    /// ⭐ The mention is kept rather than dropped, because the statement did write those words.
-    /// What is recorded beside it is what they point at, exactly as [`Self::resolves_to_cte`]
-    /// records it for a CTE reference. A consumer asking which physical tables a statement
-    /// touched skips an occurrence that resolves, and one asking what the statement WROTE
-    /// carries the role over to the referent.
+    /// The mention is kept rather than dropped, because the statement wrote those words; what it
+    /// points at is recorded beside it, as [`Self::resolves_to_cte`] does for a CTE reference. A
+    /// consumer asking which physical tables a statement touched skips an occurrence that
+    /// resolves, and one asking what the statement wrote carries the role over to the referent.
     pub resolves_to_occ: Option<u32>,
 }
 
@@ -702,9 +716,9 @@ impl RelationOccurrence {
     /// The name a reader would collapse this occurrence *by*: its alias if it has one, else its
     /// written object name.
     ///
-    /// ⛔ THIS IS THE DOCUMENT'S VALUE AND NOT A CATALOGUE'S. Two occurrences agreeing here are
-    /// two occurrences the statement spelled the same way, which is a fact about the statement.
-    /// Whether they are one table is a different question and nothing in a slow log answers it.
+    /// This is the statement's own spelling and not a catalogue's. Two occurrences agreeing here
+    /// are two the statement spelled the same way; whether they are one table is a different
+    /// question, and nothing in a slow log answers it.
     pub fn identity(&self) -> Option<Bytes> {
         self.alias.clone().or_else(|| self.object_name.clone())
     }
@@ -721,7 +735,8 @@ pub struct Edge {
     pub op: JoinOp,
     /// what the join said about matching
     pub constraint: ConstraintKind,
-    /// ⭐ whether the endpoints sit in different scopes, i.e. whether this is a correlation
+    /// whether the endpoints sit in different scopes, which with [`JoinOp::Predicate`] is what a
+    /// correlation is
     pub crosses_scope: bool,
 }
 
@@ -757,14 +772,14 @@ impl StatementGraph {
         b.graph
     }
 
-    /// Nodes, edges and components of the graph as the statement wrote it: **one node per
-    /// occurrence**.
+    /// Nodes, edges and components of the graph as the statement wrote it: one node per
+    /// occurrence.
     ///
-    /// ⭐ AND THAT IS NOT A SIMPLIFICATION, IT IS WHAT AN ALIAS IS. An alias is scoped, so the
-    /// `fa` an outer query binds and the `fa` a subquery rebinds are two names and not one — the
-    /// same way two locals in two functions are. Within a single scope SQL itself forbids the
-    /// collision (`FROM a JOIN a` is "Not unique table/alias"), so one node per occurrence is
-    /// injective by the language's own rule rather than by an assumption made here.
+    /// One node per occurrence is what an alias is. An alias is scoped, so the `fa` an outer query
+    /// binds and the `fa` a subquery rebinds are two names and not one, the same way two locals in
+    /// two functions are. Within a single scope SQL itself forbids the collision (`FROM a JOIN a`
+    /// is "Not unique table/alias"), so the keying is injective by the language's own rule rather
+    /// than by an assumption made here.
     ///
     /// [`Self::measures_collapsed_by_name`] is the other reading, and it belongs to a reader.
     pub fn measures(&self) -> GraphMeasures {
@@ -774,15 +789,14 @@ impl StatementGraph {
     /// The same measures after collapsing every occurrence onto its written `[schema.]object`
     /// name.
     ///
-    /// ⛔ THIS IS A READER'S MAPPING AND NEVER THE DOCUMENT'S. Nothing in a slow log says
-    /// `sakila.film` and `film` are one relation; a catalogue says that, and this crate has never
-    /// seen one. The collapse ships as a second measure rather than as the only one so that the
-    /// difference between the two is a quantity — the loops the mapping created — instead of a
-    /// decision nobody recorded.
+    /// This is a reader's mapping and not the document's: nothing in a slow log says `sakila.film`
+    /// and `film` are one relation — a catalogue says that, and this crate has never seen one. It
+    /// is offered beside [`StatementGraph::measures`] rather than instead of it, so the difference
+    /// between the two readings is a quantity a caller can take.
     ///
-    /// ⚠️ A self-join becomes a **loop**, and a loop is an edge. `FROM employee e1 JOIN employee
-    /// e2` collapses to one node carrying one edge to itself: `m - n + c` is `1 - 1 + 1 = 1`, so
-    /// the cycle the collapse created is counted rather than dropped.
+    /// A self-join becomes a loop, and a loop is an edge: `FROM employee e1 JOIN employee e2`
+    /// collapses to one node carrying one edge to itself, so `m - n + c` is 1 and the cycle the
+    /// collapse created is counted rather than dropped.
     pub fn measures_collapsed_by_name(&self) -> GraphMeasures {
         self.measure_by(|o, occ| match (&o.schema_name, &o.object_name) {
             (Some(s), Some(n)) => [s.as_ref(), b".", n.as_ref()].concat(),
@@ -838,9 +852,9 @@ impl StatementGraph {
             nodes: n,
             edges: m,
             components: c,
-            // ⛔ `m - n + c` is the UNDIRECTED cycle space. On a graph with no loops it cannot go
-            // negative, because a component of `k` nodes carries at least `k - 1` edges; the
-            // saturating subtraction is hygiene rather than a case that arises.
+            // `m - n + c` is the undirected cycle space. It cannot go negative, because a
+            // component of `k` nodes carries at least `k - 1` edges; the saturating subtraction is
+            // hygiene rather than a case that arises.
             cycle_space: (m + c).saturating_sub(n),
             incidences: self.edges.len(),
         }
@@ -848,7 +862,7 @@ impl StatementGraph {
 
     /// Whether an occurrence sits anywhere beneath the body of a `CREATE VIEW`.
     ///
-    /// ⭐ A relation this is true of was NAMED and not READ. See [`ScopeKind::ViewBody`].
+    /// A relation this is true of was named and not read. See [`ScopeKind::ViewBody`].
     pub fn in_view_body(&self, occ: u32) -> bool {
         let mut at = self.occurrences.get(occ as usize).map(|o| o.scope);
         while let Some(id) = at {
@@ -871,10 +885,10 @@ impl StatementGraph {
     /// Subqueries in expression position, counted by `sqlparser`'s own `visit_expressions`
     /// rather than by this module's walk.
     ///
-    /// ⛔ THIS EXISTS TO BE DISAGREED WITH. [`Builder::walk_expr`] descends into a named list of
-    /// `Expr` forms and does nothing with the rest, so a subquery inside a form it does not name
-    /// would be silently absent. A count taken by a route that shares no code with the walk is
-    /// what turns that from an invisible omission into a failing test.
+    /// This exists to be compared against the walk. `Builder::walk_expr` descends into a named
+    /// list of `Expr` forms and does nothing with the rest, so a subquery inside a form it does
+    /// not name would be silently absent. A count taken by a route that shares no code with the
+    /// walk turns that from an invisible omission into a failing test.
     pub fn nested_query_count(statement: &Statement) -> usize {
         let mut n = 0usize;
         let _ = visit_expressions(statement, |e| {
@@ -895,15 +909,15 @@ impl StatementGraph {
 pub struct GraphMeasures {
     /// distinct node identities
     pub nodes: usize,
-    /// distinct unordered edges. ⚠️ **Loops are edges and are counted**, which is not an
-    /// oversight: under [`StatementGraph::measures_collapsed_by_name`] a self-join becomes one
-    /// node carrying an edge to itself, and dropping it would hide the cycle the mapping made.
+    /// distinct unordered edges. Loops are edges and are counted: under
+    /// [`StatementGraph::measures_collapsed_by_name`] a self-join becomes one node carrying an
+    /// edge to itself, and dropping it would hide the cycle the mapping made.
     pub edges: usize,
     /// connected components
     pub components: usize,
-    /// ⭐ `m - n + c`, the dimension of the UNDIRECTED cycle space. Zero means the graph is a
-    /// forest. A statement whose join graph is a tree reaches every relation one way; one whose
-    /// is not reaches some relation by two routes, and the second route is a double count.
+    /// `m - n + c`, the dimension of the undirected cycle space. Zero means the graph is a forest.
+    /// A statement whose join graph is a tree reaches every relation one way; one whose graph is
+    /// not reaches some relation by two routes, and the second route is a double count.
     pub cycle_space: usize,
     /// edges before deduplication, i.e. how many relationships the statement wrote down
     pub incidences: usize,
@@ -955,7 +969,7 @@ impl Builder {
             Some(n) => split_name(n),
             None => (None, None),
         };
-        // ⭐ Resolved against the scopes that ENCLOSE this one, innermost first, because a CTE
+        // Resolved against the scopes that enclose this one, innermost first, because a CTE
         // shadows a physical table of the same name and a reader who misses that files a relation
         // the server never opened.
         let resolves_to_cte = object_name
@@ -972,27 +986,25 @@ impl Builder {
             role,
             resolves_to_cte,
             // Filled by `resolve_references` once the whole statement has been walked: a target
-            // list is written BEFORE the `FROM` it refers to, so nothing to resolve against
+            // list is written before the `FROM` it refers to, so nothing to resolve against
             // exists yet at this point.
             resolves_to_occ: None,
         });
         occ
     }
 
-    /// ⛔⛔ A TARGET LIST NAMES RELATIONS THE STATEMENT ALREADY INTRODUCED, AND NAMES THEM BY
-    /// ALIAS. `DELETE o, p FROM orders o JOIN payments p ON ...` wrote four relation mentions
-    /// and opened two tables. Without this the graph said it opened four, two of them called
-    /// `o` and `p`, and the only two the server actually wrote to were filed as reads.
+    /// Resolves a target list against the relations the statement already introduced, because a
+    /// multi-table `DELETE` names its targets by alias: `DELETE o, p FROM orders o JOIN payments p
+    /// ON ...` writes four relation mentions and opens two tables.
     ///
-    /// ⚠️ MATCHED ON [`RelationOccurrence::identity`] AND NOT ON THE WRITTEN NAME, because that
-    /// is the rule MySQL itself enforces: a relation given an alias must be referred to by that
-    /// alias and may not be referred to by its table name. So `identity()` is exactly the set of
-    /// names a target list is allowed to use, and matching anything else would invent a
-    /// resolution the server would have rejected.
+    /// Matched on [`RelationOccurrence::identity`] and not on the written name, because that is
+    /// the rule MySQL enforces: a relation given an alias must be referred to by that alias and
+    /// may not be referred to by its table name. So `identity()` is exactly the set of names a
+    /// target list is allowed to use, and matching anything else would invent a resolution the
+    /// server would have rejected.
     ///
-    /// ⚠️ Scope-local, and that is not a simplification: a target list and the `FROM` it refers
-    /// to are the same statement level by the grammar. A correlated name from an enclosing scope
-    /// cannot be a delete target.
+    /// Scope-local, because a target list and the `FROM` it refers to are the same statement level
+    /// by the grammar: a correlated name from an enclosing scope cannot be a delete target.
     fn resolve_references(&mut self) {
         for i in 0..self.graph.occurrences.len() {
             let o = &self.graph.occurrences[i];
@@ -1049,8 +1061,8 @@ impl Builder {
 
     /// Finds the occurrence a qualifier names, searching the given scope and then outwards.
     ///
-    /// ⛔ INNERMOST WINS, because that is what SQL does. `actor_info` reuses `fa` and `fc` inside
-    /// its correlated subquery for different relations than the outer query binds them to.
+    /// Innermost wins, because that is what SQL does: a correlated subquery may rebind an alias
+    /// the outer query already bound to a different relation.
     fn resolve(&self, qualifier: &Bytes, scope: u32) -> Option<u32> {
         let mut at = Some(scope);
         while let Some(id) = at {
@@ -1081,8 +1093,8 @@ impl Builder {
                 if let TableObject::TableName(name) = table {
                     self.push_occurrence(scope, Some(name), None, RelationRole::InsertTarget);
                 }
-                // ⭐ `INSERT ... SELECT` is a write edge and a whole read subgraph at once, and
-                // `objects()` puts both sides in one undifferentiated set.
+                // `INSERT ... SELECT` is a write and a whole read subgraph at once, which
+                // `objects()` puts in one undifferentiated set.
                 if let Some(q) = source {
                     self.walk_query(q, scope);
                 }
@@ -1096,9 +1108,13 @@ impl Builder {
             }
             Statement::Update(u) => {
                 let (table, from, selection) = (&u.table, &u.from, &u.selection);
-                // ⚠️ MySQL's multi-table `UPDATE a JOIN b` puts a whole join graph in the TARGET
+                // MySQL's multi-table `UPDATE a JOIN b` puts a whole join graph in the target
                 // position, so this is a `TableWithJoins` and not a name.
-                let ids = self.collect_from(std::slice::from_ref(table), scope, RelationRole::UpdateTarget);
+                let ids = self.collect_from(
+                    std::slice::from_ref(table),
+                    scope,
+                    RelationRole::UpdateTarget,
+                );
                 self.join_edges(std::slice::from_ref(table), scope, &ids);
                 if let Some(UpdateTableFromKind::BeforeSet(f) | UpdateTableFromKind::AfterSet(f)) =
                     from
@@ -1111,9 +1127,8 @@ impl Builder {
                 for a in &u.assignments {
                     self.walk_expr(&a.value, scope);
                 }
-                // ⭐⭐ AN `UPDATE`/`DELETE` WHERE IS A FILTER STAGE WITH NO `Select` AT ALL, so
-                // it is recorded here or nowhere. A scope is not one `Select` and this is the
-                // clearest case of it.
+                // An `UPDATE`/`DELETE` `WHERE` is a filter stage with no `Select` at all, so
+                // it is recorded here or nowhere: a scope is not one `Select`.
                 if let Some(e) = selection {
                     self.graph.scopes[scope as usize].stages.filter_terms += conjuncts(e);
                 }
@@ -1130,7 +1145,7 @@ impl Builder {
                 ..
             }) => {
                 for name in tables {
-                    // ⛔ Never visited by `visit_relations`: `Delete.tables` carries no
+                    // Never visited by `visit_relations`: `Delete.tables` carries no
                     // `visit_relation` annotation, so MySQL's `DELETE t1, t2 FROM ...` target
                     // list is absent from `objects()` entirely.
                     self.push_occurrence(scope, Some(name), None, RelationRole::DeleteTarget);
@@ -1151,9 +1166,8 @@ impl Builder {
                     let ids = self.collect_from(u, scope, RelationRole::From);
                     self.join_edges(u, scope, &ids);
                 }
-                // ⭐⭐ AN `UPDATE`/`DELETE` WHERE IS A FILTER STAGE WITH NO `Select` AT ALL, so
-                // it is recorded here or nowhere. A scope is not one `Select` and this is the
-                // clearest case of it.
+                // An `UPDATE`/`DELETE` `WHERE` is a filter stage with no `Select` at all, so
+                // it is recorded here or nowhere: a scope is not one `Select`.
                 if let Some(e) = selection {
                     self.graph.scopes[scope as usize].stages.filter_terms += conjuncts(e);
                 }
@@ -1164,7 +1178,7 @@ impl Builder {
             }
             Statement::CreateView(cv) => {
                 let (name, query) = (&cv.name, &cv.query);
-                // ⛔ `CreateView.name` carries no `visit_relation` annotation either, so the view
+                // `CreateView.name` carries no `visit_relation` annotation either, so the view
                 // a statement brings into being is missing from `objects()` while every relation
                 // in its body is present.
                 self.push_occurrence(scope, Some(name), None, RelationRole::CreateTarget);
@@ -1178,57 +1192,50 @@ impl Builder {
                     self.walk_query(q, body);
                 }
             }
-            // ⛔⛔ A READER NEEDS THEM AS NODES NOW, AND THIS ARM USED TO SAY SO AND LEAVE THEM.
-            // `demand.parquet` separates a `ddl` from a `write` because a DDL takes
-            // `MDL_EXCLUSIVE` and blocks every reader of its table while a row write does not —
-            // and the only two statements that reached that role were `CREATE VIEW` and
-            // `CREATE TABLE`, neither of which can block a reader of an existing table, because
-            // the table did not exist. The 32 `ALTER TABLE`s and 11 `DROP`s in the shipped log
-            // contributed no occurrence at all, so the strongest claim that artifact makes about
-            // MySQL applied to nothing in it.
-            //
-            // ⚠️ `AlterTable.name` carries `visit_relation`, so it was at least in `objects()`.
-            // `Drop.names` carries no annotation, so a dropped table was absent from every
-            // artifact in both crates.
-            // ⚠️ `ALTER VIEW` files the same way: it redefines a relation that already exists.
+            // An `ALTER` and a `DROP` name a relation that already exists and take
+            // `MDL_EXCLUSIVE` on it, so they block every reader of it — which a `CREATE` cannot
+            // do, the table not having existed. A consumer separating a DDL from a row write
+            // needs these as occurrences, so they are walked here: `AlterTable.name` carries
+            // `visit_relation` and so reaches `objects()`, while `Drop.names` carries none and
+            // reaches nothing else. `ALTER VIEW` files the same way, redefining a relation that
+            // already exists.
             Statement::AlterTable(at) => {
                 self.push_occurrence(scope, Some(&at.name), None, RelationRole::AlterTarget);
             }
             Statement::AlterView { name, .. } => {
                 self.push_occurrence(scope, Some(name), None, RelationRole::AlterTarget);
             }
-            // ⭐ AN INDEX IS NOT A RELATION, AND THE TABLE IS THE ONE THAT GETS LOCKED.
-            // `CREATE INDEX idx ON invoice (year)` is filed as an alter of `invoice`; `idx` is
-            // named by the statement and is not a thing another statement can contend for, so
-            // it gets no occurrence and no role of its own.
+            // An index is not a relation, and the table is what gets locked:
+            // `CREATE INDEX idx ON invoice (year)` files as an alter of `invoice`. `idx` is named
+            // by the statement and is not something another statement can contend for, so it gets
+            // no occurrence and no role of its own.
             Statement::CreateIndex(ci) => {
                 self.push_occurrence(scope, Some(&ci.table_name), None, RelationRole::AlterTarget);
             }
             Statement::Truncate(tr) => {
                 for t in &tr.table_names {
-                    self.push_occurrence(
-                        scope,
-                        Some(&t.name),
-                        None,
-                        RelationRole::TruncateTarget,
-                    );
+                    self.push_occurrence(scope, Some(&t.name), None, RelationRole::TruncateTarget);
                 }
             }
-            // ⛔ A RENAME IS A DROP AND A CREATE, AND THAT IS A CLAIM THIS FILE MAKES ON PURPOSE.
-            // It is false about the data — MySQL moves the table rather than rebuilding it — and
-            // exact about the NAMES, which is what a relation graph is about: after
-            // `RENAME TABLE a TO b` nothing can open `a` and `b` is openable where it was not.
-            // Both ends take `MDL_EXCLUSIVE`, so both reach the same class downstream.
+            // A rename is filed as a drop and a create, which is a claim about the names rather
+            // than about the data: MySQL moves the table rather than rebuilding it, and after
+            // `RENAME TABLE a TO b` nothing can open `a` while `b` is openable where it was not.
+            // Both ends take `MDL_EXCLUSIVE`.
             Statement::RenameTable(renames) => {
                 for r in renames {
                     self.push_occurrence(scope, Some(&r.old_name), None, RelationRole::DropTarget);
-                    self.push_occurrence(scope, Some(&r.new_name), None, RelationRole::CreateTarget);
+                    self.push_occurrence(
+                        scope,
+                        Some(&r.new_name),
+                        None,
+                        RelationRole::CreateTarget,
+                    );
                 }
             }
-            // ⭐⭐ `LockTables.tables` CARRIES NO `visit_relation` ANNOTATION, so a table a client
-            // locked explicitly was invisible to `objects()` and to everything built on it.
-            // ⚠️ The alias is the author's and is kept as the occurrence's identity, exactly as
-            // in a `FROM` clause: `LOCK TABLES invoice AS i READ` names `i`.
+            // `LockTables.tables` carries no `visit_relation` annotation, so a table a client
+            // locked explicitly reaches `objects()` not at all. The alias is the author's and is
+            // kept as the occurrence's identity, as in a `FROM` clause: `LOCK TABLES invoice AS i
+            // READ` names `i`.
             Statement::LockTables { tables } => {
                 for t in tables {
                     let role = match t.lock_type {
@@ -1236,18 +1243,18 @@ impl Builder {
                         LockTableType::Read { .. } => RelationRole::LockSharedTarget,
                     };
                     let alias = t.alias.as_ref().map(ident_bytes);
-                    // ⛔ `LockTable.table` IS AN `Ident` AND NOT AN `ObjectName`, so this
-                    // grammar cannot express `LOCK TABLES shop.invoice WRITE` at all — MySQL
-                    // accepts it and `sqlparser` refuses it. The name is lifted into an
-                    // `ObjectName` of one part so it files like every other relation, and a
-                    // lock on a qualified table is a statement this reader files as `invalid`.
+                    // `LockTable.table` is an `Ident` and not an `ObjectName`, so this grammar
+                    // cannot express `LOCK TABLES shop.invoice WRITE` at all: MySQL accepts that
+                    // and `sqlparser` refuses it, which reaches a caller as an invalid statement.
+                    // The unqualified name is lifted into an `ObjectName` of one part so it files
+                    // like every other relation.
                     let name = ObjectName(vec![ObjectNamePart::Identifier(t.table.clone())]);
                     self.push_occurrence(scope, Some(&name), alias, role);
                 }
             }
-            // ⚠️ `Analyze.table_name` IS AN `Option` SINCE sqlparser 0.63 — a dialect can write
-            // `ANALYZE` with no table. MySQL cannot, so `None` names nothing and files nothing
-            // rather than being unwrapped into a panic on a statement the server never sent.
+            // `Analyze.table_name` is an `Option`, because a dialect can write `ANALYZE` with no
+            // table. MySQL cannot, so `None` names nothing and files nothing rather than being
+            // unwrapped.
             Statement::Analyze(an) => {
                 if let Some(name) = &an.table_name {
                     self.push_occurrence(scope, Some(name), None, RelationRole::AnalyzeTarget);
@@ -1272,52 +1279,32 @@ impl Builder {
             } => {
                 self.push_occurrence(scope, Some(name), None, RelationRole::AlterTarget);
             }
-            // ⚠️ WHAT IS STILL NOT WALKED, AND WHY, because "every other form names nothing" was
-            // wrong twice already:
+            // `EXPLAIN <statement>` wraps a whole statement, so it is descended into rather than
+            // given a role of its own: the relations inside it take their ordinary roles, the
+            // statement plans without executing and so examines no rows, and the statement's own
+            // kind already says it was an `EXPLAIN`. A role here would assert something those do
+            // not. `EXPLAIN t` is a different node and is handled below.
             //
-            // | form | names a relation | state |
-            // |---|---|---|
-            // | `FLUSH TABLES t` | `Flush.tables`, **unannotated** | ⛔ not walked — takes a metadata lock and is invisible |
-            // | `SHOW CREATE TABLE t` | `ShowCreate.obj_name`, unannotated | ⛔ not walked — reads the dictionary, opens nothing |
-            // | `EXPLAIN t` / `DESCRIBE t` | `ExplainTable.table_name`, annotated | ⛔ not walked — reads the dictionary |
-            // | `EXPLAIN SELECT … FROM t` | `Explain.statement`, a whole `Statement` | ⛔⛔ not walked — and this row did not exist. The form above is `ExplainTable`; THIS one wraps an entire query whose `FROM` names a relation the walk drops. `EXPLAIN` plans without executing: it opens the table and takes a shared metadata lock, and reads **no rows**. Filing it as a read would put a demand on `demand.parquet` for a statement that examined nothing; filing nothing loses a metadata-lock holder. The second is chosen because the first invents a figure, and `rows_examined = 0` is what the record has to show for it. |
-            // | `OPTIMIZE` / `CHECK` / `REPAIR TABLE` | — | ⛔ `sqlparser` refuses them outright |
-            // | `LOAD DATA INFILE … INTO TABLE t` | — | ⛔ `sqlparser` refuses MySQL's form |
-            // | `a CROSS JOIN b ON …` | — | ⛔ `sqlparser` refuses it; in MySQL `JOIN`, `CROSS JOIN` and `INNER JOIN` are **syntactic equivalents** and all three take an `ON` |
-            //
-            // ⛔ The annotated ones are held by a law rather than by this comment:
-            // `nothing objects() found may be missing from the graph` fires the moment one
-            // appears in a corpus, which is what makes the row above a decision and not a gap.
-            // ⭐⭐ `EXPLAIN <statement>` WRAPS A WHOLE STATEMENT AND THE WALK DROPPED ALL OF IT.
-            //
-            // `EXPLAIN SELECT id FROM t WHERE id = 5` named `t` in no artifact and filed the
-            // split in none -- while the literal scan is a separate visitor and ran anyway, so
-            // the record said *the author went for `id = 5`* and `relation_source = unmeasured`
-            // in a statement naming exactly one relation. That `unmeasured` was this walk's own
-            // gap wearing an absence arm, which is the one thing the absence vocabulary exists
-            // to prevent.
-            //
-            // ⭐ Descended into rather than given a role of its own. The relations take their
-            // ordinary roles, `rows_examined` is the measured zero `EXPLAIN` earns, and
-            // `sql_type` already says the statement was an `EXPLAIN` -- so a reader holding all
-            // three has what a role would have told them, without this walk asserting it.
+            // `OPTIMIZE`, `CHECK` and `REPAIR TABLE` and `LOAD DATA INFILE … INTO TABLE t` are
+            // valid MySQL that `sqlparser` will not parse, so they never reach this walk at all
+            // and arrive at a caller as invalid statements with the author's bytes intact.
             Statement::Explain { statement, .. } => self.walk_statement(statement, scope),
             // `EXPLAIN t` / `DESCRIBE t` -- a name and no statement.
             Statement::ExplainTable { table_name, .. } => {
                 self.push_occurrence(scope, Some(table_name), None, RelationRole::MetadataTarget);
             }
             Statement::ShowCreate { obj_type, obj_name } => {
-                // ⚠️ Only the two that name a relation. `SHOW CREATE FUNCTION|PROCEDURE|EVENT|
+                // Only the two that name a relation: `SHOW CREATE FUNCTION|PROCEDURE|EVENT|
                 // TRIGGER` names a routine, which is not a relation and has nowhere to go here.
                 if matches!(obj_type, ShowCreateObject::Table | ShowCreateObject::View) {
                     self.push_occurrence(scope, Some(obj_name), None, RelationRole::MetadataTarget);
                 }
             }
             Statement::ShowColumns { show_options, .. } => {
-                // ⛔ `SHOW COLUMNS FROM t` puts `t` in `show_in.parent_name`, and so does
-                // `SHOW TABLES FROM db` -- where the name is a **schema**. The clause is what
-                // tells them apart, and reading the name without it is the defect `objects()`
-                // has: it files `mysql` from `SHOW TABLES FROM mysql` as though it were a table.
+                // `SHOW COLUMNS FROM t` puts `t` in `show_in.parent_name`, and so does
+                // `SHOW TABLES FROM db` -- where the name is a schema. The clause is what tells
+                // them apart, and reading the name without it is what makes `objects()` file
+                // `mysql` from `SHOW TABLES FROM mysql` as though it were a table.
                 if let Some(show_in) = &show_options.show_in {
                     if let Some(name) = &show_in.parent_name {
                         self.push_occurrence(scope, Some(name), None, RelationRole::MetadataTarget);
@@ -1329,18 +1316,18 @@ impl Builder {
                     self.push_occurrence(scope, Some(name), None, RelationRole::FlushTarget);
                 }
             }
-            // ⛔ WHAT IS STILL DECLINED, AND WHY IT IS A DECISION RATHER THAN A GAP:
+            // What is declined here, and why each is a decision rather than a gap:
             //
             // | statement | names | declined because |
             // |---|---|---|
-            // | `SHOW TABLES FROM db` | a **schema** | not a relation. `objects()` files it as one, which is the single exception its own law records |
-            // | `GRANT SELECT ON db.* TO …` | a **privilege scope** | `db.*` is a wildcard over a schema; the statement opens no table and takes no lock on one |
+            // | `SHOW TABLES FROM db` | a schema | not a relation, and the name sits in the same field `SHOW COLUMNS FROM t` uses |
+            // | `GRANT SELECT ON db.* TO …` | a privilege scope | `db.*` is a wildcard over a schema; the statement opens no table and takes no lock on one |
             // | `REVOKE … ON db.* FROM …` | the same | the same |
-            // | `CREATE|DROP DATABASE db` | a schema | a relation artifact has nowhere to put one |
+            // | `CREATE`/`DROP DATABASE db` | a schema | a relation graph has nowhere to put one |
             // | `SET`, `KILL`, `FLUSH` with no table list, `SAVEPOINT`, `USE` | nothing | no relation is named at all |
             //
-            // ⚠️ The first four name something; the last names nothing, and those are two
-            // different reasons that happen to reach the same filing.
+            // The first four name something and the last names nothing, which are two different
+            // reasons reaching one filing.
             _ => {}
         }
     }
@@ -1348,16 +1335,16 @@ impl Builder {
     fn walk_query(&mut self, query: &Query, scope: u32) {
         if let Some(with) = &query.with {
             for Cte { alias, query, .. } in &with.cte_tables {
-                // ⛔ A CTE's name is an `Ident` on its alias and NOT an `ObjectName`, so the
+                // A CTE's name is an `Ident` on its alias and not an `ObjectName`, so the
                 // definition site is invisible to `visit_relations` while every reference to it
                 // parses as an ordinary table and is visited. That is how a name that is not a
-                // relation ends up filed as one.
+                // relation ends up filed as one by `objects()`.
                 let name = Some(ident_bytes(&alias.name));
                 let cte = self.push_scope(Some(scope), ScopeKind::Cte, name, with.recursive);
                 self.walk_query(query, cte);
             }
         }
-        // ⚠️ ORDER BY AND LIMIT HANG OFF THE `Query`, NOT OFF THE `Select`, so they are read
+        // `ORDER BY` and `LIMIT` hang off the `Query` and not off the `Select`, so they are read
         // here and filed on the scope the query heads.
         let mut ordered: Vec<Expr> = Vec::new();
         let st = &mut self.graph.scopes[scope as usize].stages;
@@ -1370,7 +1357,7 @@ impl Builder {
                     st.not_mysql |= not_mysql;
                     ordered = terms.iter().map(|t| t.expr.clone()).collect();
                 }
-                // ⛔ `ORDER BY ALL` is not MySQL.
+                // `ORDER BY ALL` is not MySQL.
                 OrderByKind::All(_) => st.not_mysql = true,
             },
             None => {}
@@ -1403,10 +1390,9 @@ impl Builder {
         match body {
             SetExpr::Select(s) => self.walk_select(s, scope),
             SetExpr::Query(q) => self.walk_query(q, scope),
-            // ⛔ `SetExpr::Merge` ARRIVED IN sqlparser 0.63 AND MYSQL HAS NO `MERGE`. Walked
-            // rather than ignored, because the statement inside it names relations whatever
-            // dialect wrote it — and an arm that silently dropped them would be the "behaviour
-            // absent from an artifact" case this record separates from "workload never did it".
+            // MySQL has no `MERGE`, but the statement inside one names relations whatever dialect
+            // wrote it, so it is walked rather than dropped: a relation missing from the graph
+            // must mean the statement did not name it.
             SetExpr::Merge(s) => self.walk_statement(s, scope),
             SetExpr::SetOperation {
                 left,
@@ -1436,7 +1422,7 @@ impl Builder {
         }
     }
 
-    /// ⭐⭐⭐ What this scope does to its rows, recorded rather than judged.
+    /// What this scope does to its rows, recorded rather than judged.
     ///
     /// Accumulates, because a scope is not one `Select`: `INSERT ... SELECT ... WHERE` walks its
     /// source into the same scope as the insert target, so assigning once would lose one of them.
@@ -1447,13 +1433,11 @@ impl Builder {
                 g = terms.len() as u32;
                 gx = terms
                     .iter()
-                    .filter(|e| {
-                        !matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
-                    })
+                    .filter(|e| !matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_)))
                     .count() as u32;
                 nm |= !modifiers.is_empty();
             }
-            // ⛔ `GROUP BY ALL` is not MySQL.
+            // `GROUP BY ALL` is not MySQL.
             GroupByExpr::All(_) => nm = true,
         }
         nm |= select.prewhere.is_some()
@@ -1493,9 +1477,9 @@ impl Builder {
                 line_comment: matches!(h.style, OptimizerHintStyle::SingleLine { .. }),
             });
         }
-        // ⭐ TWO PASSES, AND THE ORDER IS THE POINT. Every occurrence has to exist before any
-        // predicate is resolved, because a join's `ON` clause routinely names a relation the
-        // parser has not reached yet and a one-pass walk would drop that edge.
+        // Two passes, and the order matters: every occurrence has to exist before any predicate
+        // is resolved, because a join's `ON` clause routinely names a relation the walk has not
+        // reached yet and a one-pass walk would drop that edge.
         let ids = self.collect_from(&select.from, scope, RelationRole::From);
         self.join_edges(&select.from, scope, &ids);
 
@@ -1523,8 +1507,8 @@ impl Builder {
             );
         }
         for item in &select.projection {
-            // ⭐ `actor_info`'s correlated subquery lives inside a `GROUP_CONCAT` inside a
-            // `CONCAT` in the projection, which is why the projection is walked at all.
+            // A correlated subquery can sit inside a function call inside another function call
+            // in the projection, which is why the projection is walked at all.
             for e in select_item_exprs(item) {
                 self.walk_expr(e, scope);
                 let mut path = Vec::new();
@@ -1565,11 +1549,11 @@ impl Builder {
 
     /// Pass two: the edges, read out of the join predicates rather than out of the order.
     ///
-    /// ⛔ `TableWithJoins.joins` IS A FLAT LEFT-DEEP CHAIN, NOT A TREE. Joining each relation to
-    /// its predecessor would draw `sales_by_store` as a seven-link chain when it is a branch:
-    /// `store` is joined to `address` and to `staff` both. The branch exists only in the `ON`
-    /// clauses, so that is where it is read from, and the chain is the fallback for a join that
-    /// says nothing this walk can resolve.
+    /// `TableWithJoins.joins` is a flat left-deep chain and not a tree, so joining each relation
+    /// to its predecessor would draw a branching join as a chain — one relation joined to two
+    /// others reads as two links in a row. The branch exists only in the `ON` clauses, so that is
+    /// where it is read from, and the chain is the fallback for a join that says nothing this walk
+    /// can resolve.
     fn join_edges(&mut self, from: &[TableWithJoins], scope: u32, ids: &[Vec<u32>]) {
         for (twj, ids) in from.iter().zip(ids) {
             // A comma in a `FROM` list is a cross join between whole `TableWithJoins`, which is
@@ -1653,10 +1637,10 @@ impl Builder {
             TableFactor::Derived {
                 subquery, alias, ..
             } => {
-                // ⭐ A derived table is a node in the OUTER scope with no object name at all, and
+                // A derived table is a node in the outer scope with no object name at all, and
                 // `visit_relations` cannot see it: `TableFactor::Derived` carries no `ObjectName`,
-                // so only the base tables inside its subquery are ever visited and the thing the
-                // rest of the query joins to is absent.
+                // so only the base tables inside its subquery are visited and the thing the rest
+                // of the query joins to is absent from `objects()`.
                 let a = alias.as_ref().map(|a| ident_bytes(&a.name));
                 let occ = self.push_occurrence(scope, None, a, role);
                 let inner = self.push_scope(Some(scope), ScopeKind::Derived, None, false);
@@ -1669,12 +1653,16 @@ impl Builder {
             } => {
                 let a = alias.as_ref().map(|a| ident_bytes(&a.name));
                 let occ = self.push_occurrence(scope, None, a, role);
-                let ids = self.collect_from(std::slice::from_ref(table_with_joins), scope, RelationRole::From);
+                let ids = self.collect_from(
+                    std::slice::from_ref(table_with_joins),
+                    scope,
+                    RelationRole::From,
+                );
                 self.join_edges(std::slice::from_ref(table_with_joins), scope, &ids);
                 occ
             }
             TableFactor::Function { name, alias, .. } => {
-                // ⛔ Also unannotated, so also absent from `objects()`.
+                // Also unannotated, so also absent from `objects()`.
                 let a = alias.as_ref().map(|a| ident_bytes(&a.name));
                 self.push_occurrence(scope, Some(name), a, role)
             }
@@ -1687,9 +1675,9 @@ impl Builder {
 
     /// Descends into an expression looking for subqueries.
     ///
-    /// ⚠️ The forms named here are the ones this walk descends into. Anything else is a leaf as
-    /// far as this module is concerned, and [`StatementGraph::nested_query_count`] is the second
-    /// route that makes such an omission fail a test rather than pass quietly.
+    /// The forms named here are the ones this walk descends into. Anything else is a leaf as far
+    /// as this module is concerned, and [`StatementGraph::nested_query_count`] is the second route
+    /// that makes such an omission fail a test rather than pass quietly.
     fn walk_expr(&mut self, expr: &Expr, scope: u32) {
         match expr {
             Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => {
@@ -1698,11 +1686,9 @@ impl Builder {
                 self.walk_query(q, inner);
             }
             outer @ Expr::InSubquery { expr, subquery, .. } => {
-                // ⭐⭐ `InSubquery.subquery` WAS A `SetExpr` AND IS A `Query` SINCE sqlparser
-                // 0.63 — so it carries a `with` clause now and `IN (WITH … SELECT …)` reaches
-                // the CTE walk like `EXISTS` and a scalar subquery already did. This file used
-                // to record the asymmetry as a limitation of the grammar; the grammar closed it,
-                // and the walk goes through `walk_query` for all three.
+                // `InSubquery.subquery` is a `Query`, so it carries a `with` clause and
+                // `IN (WITH … SELECT …)` reaches the CTE walk as `EXISTS` and a scalar subquery
+                // do. All three go through `walk_query` for that reason.
                 self.walk_expr(expr, scope);
                 let inner = self.push_scope(Some(scope), ScopeKind::Subquery, None, false);
                 self.note_subquery_scope(outer, inner);
@@ -1776,14 +1762,23 @@ impl Builder {
 
     /// Draws edges between the occurrences a predicate names on either side of a comparison.
     ///
-    /// ⛔ A CONNECTIVE IS NOT A COMPARISON, AND CONFLATING THEM MANUFACTURES EDGES. Read
-    /// `a.x = b.x AND c.y = d.y` as one operator with two sides and the qualifiers on each side
-    /// cross-multiply: four edges, of which `a–d` and `c–b` were never written down. Only the
-    /// comparison arms carry an edge; `AND`, `OR` and `XOR` are descended through and contribute
-    /// none of their own.
+    /// A connective is not a comparison, and treating one as a comparison manufactures edges:
+    /// read `a.x = b.x AND c.y = d.y` as one operator with two sides and the qualifiers on each
+    /// side cross-multiply into four edges, of which `a–d` and `c–b` were never written down. Only
+    /// the comparison arms carry an edge; `AND`, `OR` and `XOR` are descended through and
+    /// contribute none of their own.
     fn predicate_edges(&mut self, expr: &Expr, scope: u32, op: JoinOp, constraint: ConstraintKind) {
         let mut path = Vec::new();
-        self.walk_condition(expr, scope, op, constraint, Clause::Where, true, None, &mut path);
+        self.walk_condition(
+            expr,
+            scope,
+            op,
+            constraint,
+            Clause::Where,
+            true,
+            None,
+            &mut path,
+        );
     }
 
     /// Walks one condition, emitting the edges it draws and the splits it writes.
@@ -1819,12 +1814,19 @@ impl Builder {
                     B::Xor => Connective::Xor,
                     _ => Connective::And,
                 };
-                path.push(PathStep { connective, branch: 0 });
-                self.walk_condition(left, scope, op, constraint, clause, emit_edges, join_occ, path);
+                path.push(PathStep {
+                    connective,
+                    branch: 0,
+                });
+                self.walk_condition(
+                    left, scope, op, constraint, clause, emit_edges, join_occ, path,
+                );
                 if let Some(last) = path.last_mut() {
                     last.branch = 1;
                 }
-                self.walk_condition(right, scope, op, constraint, clause, emit_edges, join_occ, path);
+                self.walk_condition(
+                    right, scope, op, constraint, clause, emit_edges, join_occ, path,
+                );
                 path.pop();
             }
             Expr::BinaryOp { left, right, op: b } => {
@@ -1847,7 +1849,9 @@ impl Builder {
                         Some(_) => (RhsKind::Subquery, PredicateOp::Scalar),
                         None => (rhs_kind_of(right), pop),
                     };
-                    self.push_predicate(scope, clause, path, pop, left, right, rhs_kind, rhs_scope, join_occ);
+                    self.push_predicate(
+                        scope, clause, path, pop, left, right, rhs_kind, rhs_scope, join_occ,
+                    );
                 }
             }
             Expr::UnaryOp {
@@ -1874,8 +1878,8 @@ impl Builder {
                     e,
                     RhsKind::None,
                     None,
-                join_occ,
-            );
+                    join_occ,
+                );
             }
             Expr::IsNotNull(e) => {
                 self.push_predicate(
@@ -1887,10 +1891,12 @@ impl Builder {
                     e,
                     RhsKind::None,
                     None,
-                join_occ,
-            );
+                    join_occ,
+                );
             }
-            Expr::InList { expr: e, negated, .. } => {
+            Expr::InList {
+                expr: e, negated, ..
+            } => {
                 let pop = if *negated {
                     PredicateOp::NotInList
                 } else {
@@ -1905,10 +1911,12 @@ impl Builder {
                     e,
                     RhsKind::Literal,
                     None,
-                join_occ,
-            );
+                    join_occ,
+                );
             }
-            Expr::Between { expr: e, negated, .. } => {
+            Expr::Between {
+                expr: e, negated, ..
+            } => {
                 let pop = if *negated {
                     PredicateOp::NotBetween
                 } else {
@@ -1923,8 +1931,8 @@ impl Builder {
                     e,
                     RhsKind::Literal,
                     None,
-                join_occ,
-            );
+                    join_occ,
+                );
             }
             Expr::Like {
                 expr: e, negated, ..
@@ -1946,8 +1954,8 @@ impl Builder {
                     e,
                     RhsKind::Literal,
                     None,
-                join_occ,
-            );
+                    join_occ,
+                );
             }
             // MySQL's regex predicate. It is a filter on a column like any other, and it can
             // use no index at all, which is why the shape it seeks is not a region this walk
@@ -2000,7 +2008,9 @@ impl Builder {
                     );
                 }
             }
-            Expr::InSubquery { expr: e, negated, .. } => {
+            Expr::InSubquery {
+                expr: e, negated, ..
+            } => {
                 let rhs_scope = self.subquery_scope_of(expr, scope);
                 let pop = if *negated {
                     PredicateOp::NotInSubquery
@@ -2076,7 +2086,6 @@ impl Builder {
         rhs_kind: RhsKind,
         rhs_scope: Option<u32>,
         join_occ: Option<u32>,
-
     ) {
         let lhs = self.side_of(left, scope);
         let rhs = if std::ptr::eq(left, right) {
@@ -2084,7 +2093,9 @@ impl Builder {
         } else {
             self.side_of(right, scope)
         };
-        self.push_predicate_sides(scope, clause, path, op, lhs, rhs, rhs_kind, rhs_scope, join_occ);
+        self.push_predicate_sides(
+            scope, clause, path, op, lhs, rhs, rhs_kind, rhs_scope, join_occ,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2099,7 +2110,6 @@ impl Builder {
         rhs_kind: RhsKind,
         rhs_scope: Option<u32>,
         join_occ: Option<u32>,
-
     ) {
         self.graph.predicates.push(Predicate {
             scope,
@@ -2134,7 +2144,8 @@ impl Builder {
     /// `Statement`. A positional rule — "the last subquery scope under this parent" — is wrong
     /// the moment a scope holds two of them, and `WHERE a IN (…) AND b IN (…)` is ordinary.
     fn note_subquery_scope(&mut self, expr: &Expr, inner: u32) {
-        self.subquery_scopes.insert(std::ptr::from_ref(expr) as usize, inner);
+        self.subquery_scopes
+            .insert(std::ptr::from_ref(expr) as usize, inner);
     }
 
     /// The scope a subquery on this side was walked into, where there is one.
@@ -2146,8 +2157,8 @@ impl Builder {
 
     /// The occurrences named by the qualifiers of every `alias.column` in an expression.
     ///
-    /// ⛔ Does not descend into a nested subquery: a qualifier written inside one is resolved in
-    /// that subquery's own scope when the walk reaches it, and pulling it up here would draw the
+    /// Does not descend into a nested subquery: a qualifier written inside one is resolved in that
+    /// subquery's own scope when the walk reaches it, and pulling it up here would draw the
     /// correlation twice.
     fn resolved_qualifiers(&self, expr: &Expr, scope: u32) -> Vec<u32> {
         let mut out = Vec::new();
@@ -2353,20 +2364,23 @@ fn classify(op: &JoinOperator) -> (JoinOp, ConstraintKind) {
         J::Left(c) | J::LeftOuter(c) => (JoinOp::Left, kind(c)),
         J::Right(c) | J::RightOuter(c) => (JoinOp::Right, kind(c)),
         J::StraightJoin(c) => (JoinOp::Straight, kind(c)),
-        // ⭐ `CrossJoin` CARRIES A CONSTRAINT SINCE sqlparser 0.63, AND MYSQL ALLOWS ONE.
-        // `CROSS JOIN`, `INNER JOIN` and `JOIN` are synonyms in MySQL and all three accept an
-        // `ON` clause, so a cross join that writes one now files it instead of being forced to
-        // `none`. ⚠️ Both of `structure.log`'s cross joins are bare, so no artifact moves — the
-        // capability is recorded rather than demonstrated.
+        // `CrossJoin` carries a constraint, and MySQL allows one: `CROSS JOIN`, `INNER JOIN` and
+        // `JOIN` are synonyms there and all three accept an `ON` clause, so a cross join that
+        // writes one files it rather than being forced to `none`.
         J::CrossJoin(c) => (JoinOp::Cross, kind(c)),
-        // ⛔ MySQL has no syntax for any of these. See [`JoinOp::NotMySql`].
-        J::FullOuter(c) | J::Semi(c) | J::LeftSemi(c) | J::RightSemi(c) | J::Anti(c)
-        | J::LeftAnti(c) | J::RightAnti(c) => (JoinOp::NotMySql, kind(c)),
+        // MySQL has no syntax for any of these. See [`JoinOp::NotMySql`].
+        J::FullOuter(c)
+        | J::Semi(c)
+        | J::LeftSemi(c)
+        | J::RightSemi(c)
+        | J::Anti(c)
+        | J::LeftAnti(c)
+        | J::RightAnti(c) => (JoinOp::NotMySql, kind(c)),
         J::AsOf { constraint, .. } => (JoinOp::NotMySql, kind(constraint)),
-        // ⭐ AND THREE MORE ARRIVED WITH sqlparser 0.63 — ClickHouse's `ARRAY JOIN`. They land
-        // on `not_mysql` without anyone deciding anything, which is the whole argument for
-        // having one landing arm rather than naming every dialect's operators: the enum grew by
-        // three and this crate's vocabulary did not.
+        // Another dialect's operators, `ARRAY JOIN` among them. They land on the one arm without
+        // anyone deciding anything, which is the argument for having a landing arm rather than
+        // naming every dialect's operators: upstream's enum can grow and this crate's vocabulary
+        // does not.
         J::CrossApply | J::OuterApply | J::ArrayJoin | J::LeftArrayJoin | J::InnerArrayJoin => {
             (JoinOp::NotMySql, ConstraintKind::None)
         }
@@ -2407,23 +2421,22 @@ fn ident_bytes(i: &sqlparser::ast::Ident) -> Bytes {
 }
 
 fn split_name(n: &ObjectName) -> (Option<Bytes>, Option<Bytes>) {
-    let parts: Vec<Bytes> = n
-        .0
-        .iter()
-        .filter_map(|p| match p {
-            ObjectNamePart::Identifier(i) => Some(ident_bytes(i)),
-            // ⛔ `ObjectNamePart::Function` ARRIVED IN sqlparser 0.63 for dialects that let a
-            // function produce an identifier. MySQL has no such syntax, so a part of that shape
-            // names no relation this crate can file — and dropping it is the same filing
-            // `JoinOp::NotMySql` gets, rather than a name invented out of a call.
-            ObjectNamePart::Function(_) => None,
-        })
-        .collect();
+    let parts: Vec<Bytes> =
+        n.0.iter()
+            .filter_map(|p| match p {
+                ObjectNamePart::Identifier(i) => Some(ident_bytes(i)),
+                // `ObjectNamePart::Function` is for dialects that let a function produce an
+                // identifier. MySQL has no such syntax, so a part of that shape names no relation this
+                // crate can file, and it is dropped rather than turned into a name invented out of a
+                // call.
+                ObjectNamePart::Function(_) => None,
+            })
+            .collect();
     match parts.len() {
         0 => (None, None),
         1 => (None, Some(parts[0].clone())),
-        // ⚠️ Three parts is `catalog.schema.object`; the catalogue is dropped and the last two
-        // kept, which is the same reading `objects()` has always taken.
+        // Three parts is `catalog.schema.object`: the catalogue is dropped and the last two kept,
+        // which is the reading `objects()` takes.
         _ => (
             Some(parts[parts.len() - 2].clone()),
             Some(parts[parts.len() - 1].clone()),
@@ -2590,7 +2603,8 @@ mod tests {
                 .map(|o| {
                     (
                         o.role,
-                        String::from_utf8_lossy(o.object_name.as_deref().unwrap_or(b"")).into_owned(),
+                        String::from_utf8_lossy(o.object_name.as_deref().unwrap_or(b""))
+                            .into_owned(),
                     )
                 })
                 .collect();
@@ -2651,7 +2665,11 @@ mod tests {
             .collect();
         assert_eq!(joins.len(), 4, "two splits in each of two join clauses");
         let distinct: std::collections::BTreeSet<Option<u32>> = joins.iter().copied().collect();
-        assert_eq!(distinct.len(), 2, "the two clauses name two joins: {joins:?}");
+        assert_eq!(
+            distinct.len(),
+            2,
+            "the two clauses name two joins: {joins:?}"
+        );
         assert!(joins.iter().all(|j| j.is_some()));
         // And a `WHERE` names none, which is the other half of the two-sided claim.
         let g2 = graph("SELECT id FROM t WHERE id = 1");
@@ -2666,18 +2684,39 @@ mod tests {
     #[test]
     fn a_negated_comparison_is_not_the_comparison() {
         let cases = [
-            ("SELECT a FROM t WHERE a BETWEEN 1 AND 9", PredicateOp::Between),
-            ("SELECT a FROM t WHERE a NOT BETWEEN 1 AND 9", PredicateOp::NotBetween),
+            (
+                "SELECT a FROM t WHERE a BETWEEN 1 AND 9",
+                PredicateOp::Between,
+            ),
+            (
+                "SELECT a FROM t WHERE a NOT BETWEEN 1 AND 9",
+                PredicateOp::NotBetween,
+            ),
             ("SELECT a FROM t WHERE a IN (1, 2)", PredicateOp::InList),
-            ("SELECT a FROM t WHERE a NOT IN (1, 2)", PredicateOp::NotInList),
+            (
+                "SELECT a FROM t WHERE a NOT IN (1, 2)",
+                PredicateOp::NotInList,
+            ),
             ("SELECT a FROM t WHERE a LIKE 'x%'", PredicateOp::Like),
-            ("SELECT a FROM t WHERE a NOT LIKE 'x%'", PredicateOp::NotLike),
+            (
+                "SELECT a FROM t WHERE a NOT LIKE 'x%'",
+                PredicateOp::NotLike,
+            ),
             ("SELECT a FROM t WHERE a IS NULL", PredicateOp::IsNull),
-            ("SELECT a FROM t WHERE a IS NOT NULL", PredicateOp::IsNotNull),
+            (
+                "SELECT a FROM t WHERE a IS NOT NULL",
+                PredicateOp::IsNotNull,
+            ),
             ("SELECT a FROM t WHERE a REGEXP '^x'", PredicateOp::Regexp),
-            ("SELECT a FROM t WHERE a NOT REGEXP '^x'", PredicateOp::NotRegexp),
+            (
+                "SELECT a FROM t WHERE a NOT REGEXP '^x'",
+                PredicateOp::NotRegexp,
+            ),
             ("SELECT a FROM t WHERE a RLIKE '^x'", PredicateOp::Regexp),
-            ("SELECT a FROM t WHERE MATCH(a) AGAINST ('x')", PredicateOp::MatchAgainst),
+            (
+                "SELECT a FROM t WHERE MATCH(a) AGAINST ('x')",
+                PredicateOp::MatchAgainst,
+            ),
         ];
         for (sql, want) in cases {
             let ops: Vec<PredicateOp> = splits(sql).into_iter().map(|(_, _, o)| o).collect();
@@ -2726,7 +2765,8 @@ mod tests {
 
         // One row per name rather than a list on the occurrence, so a reader asking which
         // statements restricted to a given partition joins rather than splitting a string.
-        let g = graph("SELECT a.id FROM t PARTITION (p0) a JOIN u PARTITION (q1, q2) b ON a.id = b.id");
+        let g =
+            graph("SELECT a.id FROM t PARTITION (p0) a JOIN u PARTITION (q1, q2) b ON a.id = b.id");
         assert_eq!(g.partitions.len(), 3);
         assert_eq!(g.partitions[0].occ, 0);
         assert_eq!(g.partitions[1].occ, 1);
@@ -2766,7 +2806,11 @@ mod tests {
         assert_eq!(g.optimizer_hints.len(), 1);
         assert!(g.optimizer_hints[0].scope > 0);
 
-        assert!(graph("SELECT id FROM t WHERE x = 1").optimizer_hints.is_empty());
+        assert!(
+            graph("SELECT id FROM t WHERE x = 1")
+                .optimizer_hints
+                .is_empty()
+        );
     }
 
     /// An index hint is the author naming an index, filed against the occurrence it was written on.
@@ -2786,9 +2830,21 @@ mod tests {
 
         // The three kinds and the three `FOR` clauses, each a different claim on the optimiser.
         for (sql, kind, scope) in [
-            ("SELECT id FROM t a FORCE INDEX FOR ORDER BY (i1)", IndexHintKind::Force, IndexHintScope::OrderBy),
-            ("SELECT id FROM t a IGNORE INDEX FOR JOIN (i1)", IndexHintKind::Ignore, IndexHintScope::Join),
-            ("SELECT id FROM t a USE KEY FOR GROUP BY (i1)", IndexHintKind::Use, IndexHintScope::GroupBy),
+            (
+                "SELECT id FROM t a FORCE INDEX FOR ORDER BY (i1)",
+                IndexHintKind::Force,
+                IndexHintScope::OrderBy,
+            ),
+            (
+                "SELECT id FROM t a IGNORE INDEX FOR JOIN (i1)",
+                IndexHintKind::Ignore,
+                IndexHintScope::Join,
+            ),
+            (
+                "SELECT id FROM t a USE KEY FOR GROUP BY (i1)",
+                IndexHintKind::Use,
+                IndexHintScope::GroupBy,
+            ),
         ] {
             let g = graph(sql);
             assert_eq!(g.index_hints[0].kind, kind, "{sql}");
@@ -2800,7 +2856,10 @@ mod tests {
         let g = graph("SELECT id FROM a USE INDEX (ia) JOIN b FORCE INDEX (ib) ON a.i = b.i");
         let pairs: Vec<(u32, IndexHintKind)> =
             g.index_hints.iter().map(|h| (h.occ, h.kind)).collect();
-        assert_eq!(pairs, vec![(0, IndexHintKind::Use), (1, IndexHintKind::Force)]);
+        assert_eq!(
+            pairs,
+            vec![(0, IndexHintKind::Use), (1, IndexHintKind::Force)]
+        );
 
         // And a statement naming no index files none, which is a measured zero.
         assert!(graph("SELECT id FROM t WHERE x = 1").index_hints.is_empty());
@@ -2818,11 +2877,7 @@ mod tests {
             "DELETE FROM invoice USING invoice JOIN line ON line.iid = invoice.id",
         ] {
             let g = graph(sql);
-            assert_eq!(
-                g.occurrences[0].role,
-                RelationRole::DeleteTarget,
-                "{sql}"
-            );
+            assert_eq!(g.occurrences[0].role, RelationRole::DeleteTarget, "{sql}");
         }
         // The multi-table form still names its targets by alias and its sources in the `FROM`.
         let g = graph("DELETE o, p FROM orders o JOIN payments p ON p.oid = o.id");
@@ -2991,7 +3046,9 @@ mod tests {
     /// the query's `ORDER BY`/`LIMIT` it never touched at all.
     #[test]
     fn a_scope_records_what_it_does_to_its_rows() {
-        let a = st("SELECT a FROM t WHERE x = 1 AND y = 2 GROUP BY a HAVING COUNT(*) > 3 ORDER BY a LIMIT 5");
+        let a = st(
+            "SELECT a FROM t WHERE x = 1 AND y = 2 GROUP BY a HAVING COUNT(*) > 3 ORDER BY a LIMIT 5",
+        );
         assert_eq!(a.filter_terms, 2, "top-level AND conjuncts");
         assert_eq!(a.group_terms, 1);
         assert_eq!(a.having_terms, 1);
@@ -3012,7 +3069,10 @@ mod tests {
     #[test]
     fn a_disjunction_is_one_filter_term_and_not_two() {
         assert_eq!(st("SELECT a FROM t WHERE x = 1 OR y = 2").filter_terms, 1);
-        assert_eq!(st("SELECT a FROM t WHERE (x = 1 AND y = 2) AND z = 3").filter_terms, 3);
+        assert_eq!(
+            st("SELECT a FROM t WHERE (x = 1 AND y = 2) AND z = 3").filter_terms,
+            3
+        );
     }
 
     /// ⭐⭐ IMPLICIT GROUPING, which `group_terms` alone calls no grouping at all.
@@ -3037,7 +3097,11 @@ mod tests {
         let a = st("SELECT YEAR(d), COUNT(*) FROM t GROUP BY YEAR(d)");
         assert_eq!((a.group_terms, a.group_expression_terms), (1, 1));
         let b = st("SELECT a, COUNT(*) FROM t GROUP BY t.a");
-        assert_eq!((b.group_terms, b.group_expression_terms), (1, 0), "a qualified column is a column");
+        assert_eq!(
+            (b.group_terms, b.group_expression_terms),
+            (1, 0),
+            "a qualified column is a column"
+        );
     }
 
     /// ⭐⭐ A SCOPE IS NOT ONE `Select`, SO THE STAGES ACCUMULATE.
@@ -3047,10 +3111,16 @@ mod tests {
     /// than accumulating would lose whichever arrived second.
     #[test]
     fn a_scope_is_not_one_select_so_the_stages_accumulate() {
-        assert_eq!(st("UPDATE t SET a = 1 WHERE x = 2 AND y = 3").filter_terms, 2);
+        assert_eq!(
+            st("UPDATE t SET a = 1 WHERE x = 2 AND y = 3").filter_terms,
+            2
+        );
         assert_eq!(st("DELETE FROM t WHERE x = 2").filter_terms, 1);
         // ⛔ The insert target and the source select share one scope, so one filter lands there.
-        assert_eq!(st("INSERT INTO t (a) SELECT b FROM u WHERE x = 1").filter_terms, 1);
+        assert_eq!(
+            st("INSERT INTO t (a) SELECT b FROM u WHERE x = 1").filter_terms,
+            1
+        );
     }
 
     /// ⛔⛔ ONE LANDING ARM FOR WHAT MYSQL HAS NO SYNTAX FOR, exactly as [`JoinOp::NotMySql`].
@@ -3067,7 +3137,10 @@ mod tests {
             "SELECT a FROM t CLUSTER BY a",
         ] {
             let g = StatementGraph::of(&one(sql));
-            assert!(g.scopes[0].stages.not_mysql, "{sql} should land on the diagnostic arm");
+            assert!(
+                g.scopes[0].stages.not_mysql,
+                "{sql} should land on the diagnostic arm"
+            );
         }
         // ⭐ And ordinary MySQL never does.
         for sql in [
@@ -3099,19 +3172,71 @@ mod tests {
         // ⭐ Reachable from MySQL itself. Each of these is valid text for the server that wrote
         // the log, so each is a hole a fixture can and should fill.
         let mysql: &[(&str, JoinOp, ConstraintKind)] = &[
-            ("SELECT 1 FROM a JOIN b ON a.i = b.i", JoinOp::Inner, ConstraintKind::On),
-            ("SELECT 1 FROM a INNER JOIN b ON a.i = b.i", JoinOp::Inner, ConstraintKind::On),
-            ("SELECT 1 FROM a LEFT JOIN b ON a.i = b.i", JoinOp::Left, ConstraintKind::On),
-            ("SELECT 1 FROM a LEFT OUTER JOIN b ON a.i = b.i", JoinOp::Left, ConstraintKind::On),
-            ("SELECT 1 FROM a RIGHT JOIN b ON a.i = b.i", JoinOp::Right, ConstraintKind::On),
-            ("SELECT 1 FROM a RIGHT OUTER JOIN b ON a.i = b.i", JoinOp::Right, ConstraintKind::On),
-            ("SELECT 1 FROM a CROSS JOIN b", JoinOp::Cross, ConstraintKind::None),
-            ("SELECT 1 FROM a STRAIGHT_JOIN b ON a.i = b.i", JoinOp::Straight, ConstraintKind::On),
-            ("SELECT 1 FROM a STRAIGHT_JOIN b", JoinOp::Straight, ConstraintKind::None),
-            ("SELECT 1 FROM a JOIN b USING (i)", JoinOp::Inner, ConstraintKind::Using),
-            ("SELECT 1 FROM a NATURAL JOIN b", JoinOp::Inner, ConstraintKind::Natural),
-            ("SELECT 1 FROM a NATURAL LEFT JOIN b", JoinOp::Left, ConstraintKind::Natural),
-            ("SELECT 1 FROM a NATURAL RIGHT JOIN b", JoinOp::Right, ConstraintKind::Natural),
+            (
+                "SELECT 1 FROM a JOIN b ON a.i = b.i",
+                JoinOp::Inner,
+                ConstraintKind::On,
+            ),
+            (
+                "SELECT 1 FROM a INNER JOIN b ON a.i = b.i",
+                JoinOp::Inner,
+                ConstraintKind::On,
+            ),
+            (
+                "SELECT 1 FROM a LEFT JOIN b ON a.i = b.i",
+                JoinOp::Left,
+                ConstraintKind::On,
+            ),
+            (
+                "SELECT 1 FROM a LEFT OUTER JOIN b ON a.i = b.i",
+                JoinOp::Left,
+                ConstraintKind::On,
+            ),
+            (
+                "SELECT 1 FROM a RIGHT JOIN b ON a.i = b.i",
+                JoinOp::Right,
+                ConstraintKind::On,
+            ),
+            (
+                "SELECT 1 FROM a RIGHT OUTER JOIN b ON a.i = b.i",
+                JoinOp::Right,
+                ConstraintKind::On,
+            ),
+            (
+                "SELECT 1 FROM a CROSS JOIN b",
+                JoinOp::Cross,
+                ConstraintKind::None,
+            ),
+            (
+                "SELECT 1 FROM a STRAIGHT_JOIN b ON a.i = b.i",
+                JoinOp::Straight,
+                ConstraintKind::On,
+            ),
+            (
+                "SELECT 1 FROM a STRAIGHT_JOIN b",
+                JoinOp::Straight,
+                ConstraintKind::None,
+            ),
+            (
+                "SELECT 1 FROM a JOIN b USING (i)",
+                JoinOp::Inner,
+                ConstraintKind::Using,
+            ),
+            (
+                "SELECT 1 FROM a NATURAL JOIN b",
+                JoinOp::Inner,
+                ConstraintKind::Natural,
+            ),
+            (
+                "SELECT 1 FROM a NATURAL LEFT JOIN b",
+                JoinOp::Left,
+                ConstraintKind::Natural,
+            ),
+            (
+                "SELECT 1 FROM a NATURAL RIGHT JOIN b",
+                JoinOp::Right,
+                ConstraintKind::Natural,
+            ),
         ];
         // ⛔ Text MySQL cannot write. Parsed here so the arm is known to be live code rather
         // than assumed to be, and so nobody files the absence of a corpus witness as a gap in
@@ -3135,7 +3260,10 @@ mod tests {
                 .find(|e| e.op == *want_op)
                 .unwrap_or_else(|| panic!("{sql}: no {want_op:?} edge in {:?}", g.edges));
             assert_eq!(e.constraint, *want_con, "{sql}");
-            assert!(!e.crosses_scope, "{sql}: a FROM-list join stays in its scope");
+            assert!(
+                !e.crosses_scope,
+                "{sql}: a FROM-list join stays in its scope"
+            );
             seen.insert(format!("{want_op:?}"));
         }
         for sql in not_mysql {
@@ -3191,9 +3319,16 @@ mod tests {
     fn a_predicate_edge_is_a_correlation_only_when_it_crosses_a_scope() {
         // Same scope: the comma join's condition. This is the case the old name denied.
         let g = graph("SELECT 1 FROM a, b WHERE a.i = b.i");
-        let p: Vec<_> = g.edges.iter().filter(|e| e.op == JoinOp::Predicate).collect();
+        let p: Vec<_> = g
+            .edges
+            .iter()
+            .filter(|e| e.op == JoinOp::Predicate)
+            .collect();
         assert_eq!(p.len(), 1, "{:?}", g.edges);
-        assert!(!p[0].crosses_scope, "a WHERE over two FROM-list tables stays put");
+        assert!(
+            !p[0].crosses_scope,
+            "a WHERE over two FROM-list tables stays put"
+        );
 
         // ⚠️ And the comma join writes ONE relationship that arrives as TWO edges: the adjacency
         // from the FROM list, and the condition from the WHERE. They join the same pair, which is
@@ -3211,9 +3346,16 @@ mod tests {
         // Crossing a scope: the real correlation, and the edge that makes a descent stop being
         // a tree.
         let g = graph("SELECT 1 FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.i = a.i)");
-        let p: Vec<_> = g.edges.iter().filter(|e| e.op == JoinOp::Predicate).collect();
+        let p: Vec<_> = g
+            .edges
+            .iter()
+            .filter(|e| e.op == JoinOp::Predicate)
+            .collect();
         assert_eq!(p.len(), 1, "{:?}", g.edges);
-        assert!(p[0].crosses_scope, "the inner WHERE names the outer relation");
+        assert!(
+            p[0].crosses_scope,
+            "the inner WHERE names the outer relation"
+        );
     }
 
     fn one(sql: &str) -> Statement {
@@ -3232,9 +3374,9 @@ mod tests {
             .collect()
     }
 
-    /// ⭐ THE CASE `objects()` CANNOT EXPRESS AT ALL. Its `BTreeSet` returns one name, and
-    /// `PLAN-2026-09-22-02-fusion.md`'s T1.10 records that as `k = 1` — which is true of the set
-    /// and false of the statement. Two occurrences is what the statement said.
+    /// ⭐ THE CASE `objects()` CANNOT EXPRESS AT ALL. Its `BTreeSet` returns one name, so a flat
+    /// set of names records this statement as naming one relation — which is true of the set and
+    /// false of the statement. Two occurrences is what the statement said.
     #[test]
     fn a_self_join_is_two_nodes() {
         let g = graph("SELECT * FROM employee e1 JOIN employee e2 ON e1.manager_id = e2.id");
@@ -3245,7 +3387,11 @@ mod tests {
 
         // Both occurrences carry the same written name, so a reader holding a catalogue can
         // still collapse them. The collapse is theirs to make and this crate does not make it.
-        let names: Vec<_> = g.occurrences.iter().map(|o| o.object_name.clone()).collect();
+        let names: Vec<_> = g
+            .occurrences
+            .iter()
+            .map(|o| o.object_name.clone())
+            .collect();
         assert_eq!(names[0], names[1]);
     }
 
@@ -3335,9 +3481,9 @@ mod tests {
         );
     }
 
-    /// ⭐⭐ THE WITNESS THE `process-modulus` CORPUS DOES NOT HAVE. `rank/composition_closure.sqlc`
-    /// computes a fusion's kernel two ways and says the two "agree exactly where the descent is a
-    /// tree". Every layer graph in that corpus is a forest, so the disagreeing case is unreached.
+    /// ⭐⭐ THE WITNESS A FOREST-ONLY CORPUS DOES NOT HAVE. Two routes to one kernel "agree
+    /// exactly where the descent is a tree", so where every graph in a corpus is a forest the
+    /// disagreeing case is unreached.
     /// `actor_info` reaches it: `film_category` and `film_actor` are each named twice, once in the
     /// outer join chain and once inside the correlated subquery, and the two correlation edges
     /// close a cycle.
@@ -3397,10 +3543,17 @@ mod tests {
             .find(|o| o.role == RelationRole::CreateTarget)
             .expect("⛔ CreateView.name is unannotated, so objects() never sees the view at all");
         assert_eq!(view.object_name.as_deref(), Some(b"customer_list".as_ref()));
-        assert!(!g.in_view_body(view.occ), "the view is not inside its own body");
+        assert!(
+            !g.in_view_body(view.occ),
+            "the view is not inside its own body"
+        );
 
         for o in g.occurrences.iter().filter(|o| o.occ != view.occ) {
-            assert!(g.in_view_body(o.occ), "{:?} was named, not scanned", ids(&g));
+            assert!(
+                g.in_view_body(o.occ),
+                "{:?} was named, not scanned",
+                ids(&g)
+            );
         }
     }
 
@@ -3443,7 +3596,11 @@ mod tests {
             .filter(|o| o.role == RelationRole::DropTarget)
             .filter_map(|o| o.object_name.clone())
             .collect();
-        assert_eq!(dropped.len(), 2, "⛔ `Drop.names` is unannotated: {dropped:?}");
+        assert_eq!(
+            dropped.len(),
+            2,
+            "⛔ `Drop.names` is unannotated: {dropped:?}"
+        );
         assert_eq!(dropped[0].as_ref(), b"film_text");
 
         // ⚠️ And the schema survives, which is what lets a dropped table join a demand layer.
@@ -3555,7 +3712,10 @@ mod tests {
         // ⛔ THE SCHEMA SURVIVES WHERE THE GRAMMAR CARRIES ONE, which is what lets these join a
         // demand layer rather than degenerating to a bare name.
         let g = graph("CREATE INDEX idx_year ON shop.invoice (year)");
-        assert_eq!(g.occurrences[0].schema_name.as_deref(), Some(b"shop".as_ref()));
+        assert_eq!(
+            g.occurrences[0].schema_name.as_deref(),
+            Some(b"shop".as_ref())
+        );
     }
 
     /// ⛔ `Delete.tables` carries no `visit_relation` annotation, so MySQL's multi-table delete
@@ -3610,11 +3770,12 @@ mod tests {
         // ⭐ NON-VACUITY FROM THE OTHER SIDE: a target list written with the table names rather
         // than aliases resolves too, because then the table name IS the identity.
         let g2 = graph("DELETE t1, t2 FROM t1 JOIN t2 ON t1.id = t2.t1_id");
-        assert!(g2
-            .occurrences
-            .iter()
-            .filter(|o| o.role == RelationRole::DeleteTarget)
-            .all(|o| o.resolves_to_occ.is_some()));
+        assert!(
+            g2.occurrences
+                .iter()
+                .filter(|o| o.role == RelationRole::DeleteTarget)
+                .all(|o| o.resolves_to_occ.is_some())
+        );
 
         // ⛔ AND A RELATION THAT NAMES ITSELF RESOLVES TO NOTHING, which is what stops this from
         // marking every occurrence as a reference. A single-table delete has no target list.
@@ -3626,7 +3787,10 @@ mod tests {
     fn a_union_puts_each_side_in_its_own_scope() {
         let g = graph("SELECT a FROM t1 UNION SELECT b FROM t2");
         assert_eq!(
-            g.scopes.iter().filter(|s| s.kind == ScopeKind::SetOp).count(),
+            g.scopes
+                .iter()
+                .filter(|s| s.kind == ScopeKind::SetOp)
+                .count(),
             2
         );
         let m = g.measures();

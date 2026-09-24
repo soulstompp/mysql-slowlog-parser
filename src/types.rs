@@ -121,17 +121,16 @@ impl EntrySqlStatement {
     /// The statement's relation graph: every relation it names, where each one sits, and every
     /// relationship between them that the statement wrote down.
     ///
-    /// ⭐ THIS IS WHAT [`Self::objects`] DISCARDS. That accessor folds the parse into a set of
-    /// names, losing multiplicity, position, nesting depth and every edge at once. See
-    /// [`StatementGraph`].
+    /// [`Self::objects`] folds the same parse into a set of names; this keeps the multiplicity,
+    /// the position, the nesting depth and the edges. See [`StatementGraph`].
     pub fn relation_graph(&self) -> StatementGraph {
         StatementGraph::of(&self.statement)
     }
 
     /// returns the relations this statement names, deduplicated and sorted
     ///
-    /// ⚠️ A SET, so multiplicity, position, nesting depth and every relationship between the
-    /// relations are gone. [`Self::relation_graph`] is the same parse without those losses.
+    /// A set, so multiplicity, position, nesting depth and the relationships between the
+    /// relations are not carried. [`Self::relation_graph`] is the same parse with them.
     pub fn objects(&self) -> Vec<EntrySqlStatementObject> {
         let mut visited = BTreeSet::new();
 
@@ -174,11 +173,8 @@ impl EntrySqlStatement {
             Statement::CreateIndex { .. } => EntrySqlType::CreateIndex,
             Statement::CreateView { .. } => EntrySqlType::CreateView,
             Statement::AlterTable { .. } => EntrySqlType::AlterTable,
-            // ⛔ `DROP VIEW v` AND `DROP DATABASE d` BOTH DISPLAYED AS "DROP TABLE". One arm
-            // covered every object type and its spelling asserted the one it is not: the shipped
-            // log's 11 rows typed `DROP TABLE` include a `DROP DATABASE`, and `graph.rs` walks a
-            // drop target only for `Table | View`, so the record disagreed with itself about what
-            // the tenth one dropped.
+            // One arm per object type, because the label is what a consumer matches on and
+            // `DROP TABLE` asserts the object a `DROP VIEW` or a `DROP DATABASE` is not.
             Statement::Drop {
                 object_type: ObjectType::View,
                 ..
@@ -209,23 +205,16 @@ impl EntrySqlStatement {
             Statement::Explain { .. } => EntrySqlType::Explain,
             Statement::Savepoint { .. } => EntrySqlType::Savepoint,
             Statement::LockTables { .. } => EntrySqlType::LockTables,
-            // ⛔⛔ THIS READ `EntrySqlType::LockTables` AND THE `UnlockTables` ARM WAS DEAD. The
-            // statement that RELEASES a lock was recorded as the statement that takes one, so
-            // the shipped log's 32 rows typed `LOCK TABLES` are 16 locks and 16 unlocks and a
-            // reader counting lock-takers got exactly double. `Lock_time` is the wait for
-            // precisely this lock, which makes it the worst column in the record to double.
+            // The statement that releases a table lock, kept apart from the one that takes it:
+            // `Lock_time` is the wait for that lock, so a consumer counting lock-takers must not
+            // meet the two under one name.
             Statement::UnlockTables => EntrySqlType::UnlockTables,
             Statement::Flush { .. } => EntrySqlType::Flush,
-            // ⭐⭐ THREE STATEMENTS `graph.rs` WALKS IN FULL AND THIS FUNCTION HAD NO ARM FOR.
-            // `relations.parquet` gave them `truncate_target`, `drop_target` + `create_target`
-            // and `analyze_target`; `raw.parquet` said their type was unknown. One record, two
-            // artifacts, contradicting each other about the same three statements.
-            //
-            // ⚠️ The rule for when an arm is OWED, since `sqlparser` has hundreds of statement
-            // forms and this enum cannot have one each: **wherever another artifact in this
-            // record already says something specific about the statement.** `CALL`, `EXECUTE`
-            // and `DEALLOCATE` parse fine here and get no role from the walk, so `Unknown` is
-            // coherent for them and they stay there.
+            // `sqlparser` has hundreds of statement forms and this enum cannot have one arm
+            // each. An arm is owed where the relation graph already gives the statement a role:
+            // these three take a truncate target, a drop and a create target, and an analyze
+            // target there. `CALL`, `EXECUTE` and `DEALLOCATE` parse and take no role from the
+            // walk, so `Unknown` is what this enum says about them.
             Statement::Truncate { .. } => EntrySqlType::Truncate,
             Statement::RenameTable { .. } => EntrySqlType::RenameTable,
             Statement::Analyze { .. } => EntrySqlType::Analyze,
@@ -324,7 +313,7 @@ impl EntryStatement {
 
     /// returns the relation graph of this statement, where it has one
     ///
-    /// ⛔ `None` exactly where [`Self::objects`] is `None`, and for the same reason: an admin
+    /// `None` exactly where [`Self::objects`] is `None`, and for the same reason: an admin
     /// command and an unparseable statement have no AST to walk. The two remain distinct in the
     /// enum itself; this accessor says only that neither has a graph.
     pub fn relation_graph(&self) -> Option<StatementGraph> {
@@ -384,11 +373,10 @@ pub enum EntrySqlType {
     DropFunction,
     /// SET
     Set,
-    /// ⚠️ `SHOW <anything this enum has no arm for>`. Upstream's `Statement::ShowVariable` is
-    /// a **catch-all**, not a variable: `SHOW WARNINGS`, `SHOW ENGINE INNODB STATUS`,
-    /// `SHOW GRANTS` and `SHOW CHARACTER SET` all land here. It displays as `SHOW` for that
-    /// reason — it used to display as `SHOW VARIABLE`, which the shipped log's one such row
-    /// (`SHOW /*!40100 ENGINE*/ INNODB STATUS`) is not.
+    /// `SHOW <anything this enum has no arm for>`. Upstream's `Statement::ShowVariable` is a
+    /// catch-all rather than a variable: `SHOW WARNINGS`, `SHOW ENGINE INNODB STATUS`,
+    /// `SHOW GRANTS` and `SHOW CHARACTER SET` all land here, which is why it displays as `SHOW`
+    /// and not as `SHOW VARIABLE`.
     ShowVariable,
     /// SHOW VARIABLES
     ShowVariables,
@@ -436,15 +424,14 @@ pub enum EntrySqlType {
     RenameTable,
     /// ANALYZE TABLE
     Analyze,
-    /// ⛔ Parsed, and this enum has no MySQL name for it. **Not an absence** — see the
-    /// `Display`, which spells it `UNKNOWN` and used to spell it `NULL`.
+    /// The statement parsed and this enum has no MySQL name for it. Not an absence: `Display`
+    /// spells it `UNKNOWN`, so a consumer can tell it from a line that had no statement at all.
     ///
-    /// ⭐ Two kinds of statement land here and both belong here. One is ordinary MySQL this
-    /// enum has no arm for — `CALL`, `EXECUTE`, `DEALLOCATE` — which `graph.rs` gives no role,
-    /// so nothing else in the record says anything specific about them. The other is text
-    /// `sqlparser` accepts and MySQL cannot write, such as `ALTER INDEX`: **this crate reads
-    /// MySQL slow logs**, so naming those separately would make the vocabulary a union of every
-    /// dialect `sqlparser` knows and put cases that cannot occur in front of every consumer.
+    /// Two kinds land here. One is ordinary MySQL this enum has no arm for — `CALL`, `EXECUTE`,
+    /// `DEALLOCATE` — which the relation graph gives no role either. The other is text
+    /// `sqlparser` accepts and MySQL cannot write, such as `ALTER INDEX`; this crate reads MySQL
+    /// slow logs, so naming those would make the vocabulary a union of every dialect
+    /// `sqlparser` knows and put cases that cannot occur in front of every consumer.
     Unknown,
 }
 
@@ -488,12 +475,9 @@ impl Display for EntrySqlType {
             Self::Truncate => "TRUNCATE TABLE",
             Self::RenameTable => "RENAME TABLE",
             Self::Analyze => "ANALYZE TABLE",
-            // ⛔⛔ THIS SPELLED ITSELF "NULL" INTO A NULLABLE COLUMN. `sql_type = 'NULL'` (four
-            // characters, a statement this enum has no arm for) and `sql_type IS NULL` (an
-            // administrator command or an unparseable line) are different facts, and every text
-            // rendering of the parquet spelled them the same. The record's own documentation
-            // told a reader that NULL there means "not SQL" — so the three rows saying it about
-            // a TRUNCATE, a RENAME and an ANALYZE were read as unparseable.
+            // A name and never the word `NULL`: a statement this enum has no arm for and a line
+            // that carried no statement are different facts, and a consumer writing this label
+            // into a nullable column has to be able to tell them apart.
             Self::Unknown => "UNKNOWN",
         };
 
@@ -589,24 +573,24 @@ pub struct EntrySqlAttributes {
     /// The reader's rendering: for a parsed statement this is the AST rendered back to text,
     /// for an admin command the command word, for an unparseable statement the log's bytes.
     ///
-    /// ⚠️ THREE DIFFERENT THINGS, and [`Self::statement`]'s arm is what says which.
+    /// Three different things, and [`Self::statement`]'s arm is what says which.
     pub sql: Bytes,
-    /// ⭐⭐ THE AUTHOR'S OWN BYTES, exactly as the log carried them, `;` included.
+    /// The author's own bytes, exactly as the log carried them, `;` included.
     ///
     /// `None` only for an administrator command, where a different parser consumed the line and
     /// its framing -- and there `sql` is already the log's own bytes, so nothing is lost.
     ///
-    /// This is the ONLY record of keyword case, line layout, in-statement comments and the
-    /// author's unmasked literals. `sql` above discards all of it for exactly the statements
-    /// that parsed.
+    /// This is the only record of keyword case, line layout, in-statement comments and the
+    /// author's unmasked literals: `sql` above discards all of it for the statements that
+    /// parsed.
     pub sql_raw: Option<Bytes>,
     /// Every literal the author wrote, in traversal order, whether or not masking is on.
     pub literals: Vec<EntryLiteral>,
     /// The database the log said was current, where it said so.
     ///
-    /// ⚠️ `USE` is sticky per connection and MySQL writes it only when the database CHANGES, so
+    /// `USE` is sticky per connection and MySQL writes it only when the database changes, so
     /// this is `None` on every entry that did not itself carry one. Carrying it forward along a
-    /// thread is a reader's inference.
+    /// thread is a reader's inference and belongs to whoever draws it.
     pub use_database: Option<Bytes>,
     /// the `EntryStatement for this entry
     pub statement: EntryStatement,
@@ -714,7 +698,6 @@ impl From<StatsLine> for EntryStats {
     }
 }
 
-
 #[cfg(test)]
 mod every_sql_type_arm {
     use super::*;
@@ -723,8 +706,8 @@ mod every_sql_type_arm {
     use std::collections::BTreeSet;
 
     fn typed(sql: &str) -> EntrySqlType {
-        let mut s = Parser::parse_sql(&MySqlDialect {}, sql)
-            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let mut s =
+            Parser::parse_sql(&MySqlDialect {}, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
         assert_eq!(s.len(), 1, "{sql}");
         EntrySqlStatement::from(s.remove(0)).sql_type()
     }
@@ -778,8 +761,14 @@ mod every_sql_type_arm {
             ("SET autocommit = 0", EntrySqlType::Set),
             // ⚠️ Every `SET TRANSACTION` spelling lands on `Set`, which is why `connection.rs`
             // reads the isolation level off the author's bytes rather than off this enum.
-            ("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", EntrySqlType::Set),
-            ("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED", EntrySqlType::Set),
+            (
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+                EntrySqlType::Set,
+            ),
+            (
+                "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+                EntrySqlType::Set,
+            ),
             ("SHOW WARNINGS", EntrySqlType::ShowVariable),
             ("SHOW ENGINE INNODB STATUS", EntrySqlType::ShowVariable),
             ("SHOW VARIABLES LIKE 'long%'", EntrySqlType::ShowVariables),
@@ -826,7 +815,10 @@ mod every_sql_type_arm {
         // dialects. It had its own arm, which made the vocabulary a union of every dialect
         // `sqlparser` knows — **this crate reads MySQL slow logs**, so the case that cannot
         // occur does not get a name of its own.
-        assert_eq!(typed("ALTER INDEX idx RENAME TO idx2"), EntrySqlType::Unknown);
+        assert_eq!(
+            typed("ALTER INDEX idx RENAME TO idx2"),
+            EntrySqlType::Unknown
+        );
 
         // ⛔ THE GUARD. Written out rather than derived, because the enum cannot be iterated —
         // so a new arm without a case has to fail here. This sweep removed two: `SetTransaction`,
@@ -861,18 +853,44 @@ mod every_sql_type_arm {
         // ⭐ Every label distinct, so no two arms collapse in the parquet the way `Drop` and
         // `DropView` did and the way `LockTables` and `UnlockTables` did.
         let labels: Vec<String> = [
-            EntrySqlType::Query, EntrySqlType::Insert, EntrySqlType::Update,
-            EntrySqlType::Delete, EntrySqlType::CreateTable, EntrySqlType::CreateIndex,
-            EntrySqlType::CreateView, EntrySqlType::AlterTable, EntrySqlType::Drop, EntrySqlType::DropView, EntrySqlType::DropDatabase,
-            EntrySqlType::DropFunction, EntrySqlType::Set, EntrySqlType::ShowVariable,
-            EntrySqlType::ShowVariables, EntrySqlType::ShowCreate, EntrySqlType::ShowColumns,
-            EntrySqlType::ShowTables, EntrySqlType::ShowCollation, EntrySqlType::Use,
-            EntrySqlType::StartTransaction, EntrySqlType::Commit, EntrySqlType::Rollback,
-            EntrySqlType::CreateSchema, EntrySqlType::CreateDatabase, EntrySqlType::Grant,
-            EntrySqlType::Revoke, EntrySqlType::Kill, EntrySqlType::ExplainTable,
-            EntrySqlType::Explain, EntrySqlType::Savepoint, EntrySqlType::LockTables,
-            EntrySqlType::UnlockTables, EntrySqlType::Flush, EntrySqlType::Truncate,
-            EntrySqlType::RenameTable, EntrySqlType::Analyze, EntrySqlType::Unknown,
+            EntrySqlType::Query,
+            EntrySqlType::Insert,
+            EntrySqlType::Update,
+            EntrySqlType::Delete,
+            EntrySqlType::CreateTable,
+            EntrySqlType::CreateIndex,
+            EntrySqlType::CreateView,
+            EntrySqlType::AlterTable,
+            EntrySqlType::Drop,
+            EntrySqlType::DropView,
+            EntrySqlType::DropDatabase,
+            EntrySqlType::DropFunction,
+            EntrySqlType::Set,
+            EntrySqlType::ShowVariable,
+            EntrySqlType::ShowVariables,
+            EntrySqlType::ShowCreate,
+            EntrySqlType::ShowColumns,
+            EntrySqlType::ShowTables,
+            EntrySqlType::ShowCollation,
+            EntrySqlType::Use,
+            EntrySqlType::StartTransaction,
+            EntrySqlType::Commit,
+            EntrySqlType::Rollback,
+            EntrySqlType::CreateSchema,
+            EntrySqlType::CreateDatabase,
+            EntrySqlType::Grant,
+            EntrySqlType::Revoke,
+            EntrySqlType::Kill,
+            EntrySqlType::ExplainTable,
+            EntrySqlType::Explain,
+            EntrySqlType::Savepoint,
+            EntrySqlType::LockTables,
+            EntrySqlType::UnlockTables,
+            EntrySqlType::Flush,
+            EntrySqlType::Truncate,
+            EntrySqlType::RenameTable,
+            EntrySqlType::Analyze,
+            EntrySqlType::Unknown,
         ]
         .iter()
         .map(|t| t.to_string())

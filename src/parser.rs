@@ -1,8 +1,27 @@
+//! The line and statement parsers a slow log is made of, and the pass that reads the author's
+//! literals out of a parsed statement.
+//!
+//! What it reads: the header block, the `# Time:`, `# User@Host:` and `# Query_time:` lines, the
+//! `USE` and `SET timestamp` commands, an administrator command, a `--` comment's key/value
+//! pairs, and the statement's own bytes up to its terminating `;`. [`parse_sql`] hands the text
+//! to `sqlparser` and walks the tree once to record every literal, masking them on the way where
+//! the caller asked for it.
+//!
+//! What it refuses: a line that does not match its shape, as a winnow backtrack; and text
+//! `sqlparser` will not parse, which [`crate::codec`] files as an invalid statement with the
+//! author's bytes intact.
+//!
+//! What it declines to interpret: the server version string, carried as the file spelled it,
+//! because `-log`, `-MariaDB` and `-percona` are three grammars for one field; a comment's keys,
+//! which are reported under the names the comment used rather than mapped onto names of this
+//! crate's choosing; and the column a value in a tuple assignment or a row constructor belongs
+//! to, which MySQL does not write down.
+
 use crate::EntryMasking;
 use bytes::{BufMut, Bytes, BytesMut};
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, Expr, ObjectName, SetExpr, Statement, Value, ValueWithSpan, VisitMut,
-    VisitorMut,
+    AssignmentTarget, BinaryOperator, Expr, ObjectName, SetExpr, Statement, Value, ValueWithSpan,
+    VisitMut, VisitorMut,
 };
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::{Parser as SQLParser, ParserError};
@@ -22,7 +41,7 @@ use winnow::combinator::{alt, trace};
 use winnow::combinator::{not, opt};
 use winnow::combinator::{preceded, terminated};
 use winnow::error::{ContextError, ErrMode, InputError, Needed};
-// ⚠️ Aliased: `sqlparser` exports a `ParserError` of its own and both are used in this file.
+// Aliased: `sqlparser` exports a `ParserError` of its own and both are used in this file.
 use winnow::error::ParserError as WinnowError;
 use winnow::stream::{AsBytes, StreamIsPartial};
 use winnow::token::{any, literal, take, take_till, take_until};
@@ -100,16 +119,12 @@ impl SessionLine {
     }
 }
 
-/// ⭐⭐⭐ THE REGIME THE FILE DECLARES, AND NOTHING HAS EVER READ IT.
+/// The server a slow log's first line declares.
 ///
-/// The first line of a slow log names the server that wrote it. Every claim a downstream reader
-/// makes about MySQL's *behaviour* — which statements block which, whether a DDL takes readers
-/// down with it — holds in a **regime**, and this is the only place the document states which
-/// one. `slow-test-queries.log` says `5.7.20`; a log written by 8.0 obeys different rules for
-/// the same statement text.
-///
-/// ⛔ All three fields were parsed and bound into a struct nothing read, the same shape as the
-/// `USE` database being bound to `_`.
+/// Every claim a reader makes about MySQL's *behaviour* — which statements block which, whether
+/// a DDL takes readers down with it, whether a `GROUP BY` sorts — holds only for a given server
+/// version, and this is the only place a log states one. The same statement text obeys different
+/// rules under 5.7 and under 8.0.
 #[derive(Debug, PartialEq, Default, Clone)]
 pub struct HeaderLines {
     version: Bytes,
@@ -121,8 +136,8 @@ impl HeaderLines {
     /// The server version string exactly as the file spelled it, e.g.
     /// `5.7.20-log (MySQL Community Server (GPL)).`
     ///
-    /// ⚠️ Unparsed on purpose. Turning it into a `(major, minor, patch)` is a *reading*, and one
-    /// that a distribution suffix (`-log`, `-MariaDB`, `-percona`) can break; whoever needs a
+    /// Unparsed on purpose: turning it into a `(major, minor, patch)` is a reading, and one that
+    /// a distribution suffix (`-log`, `-MariaDB`, `-percona`) can break. Whoever needs a
     /// comparison makes it, on the bytes the server wrote.
     pub fn version(&self) -> &Bytes {
         &self.version
@@ -169,39 +184,23 @@ pub fn log_header<'a>(i: &mut Stream<'_>) -> ModalResult<HeaderLines> {
 
 /// The statement's bytes, up to and including the first `;` that is not inside a quote.
 ///
-/// ⛔⛔⛔ THE QUOTE STATE WAS A **STACK**, AND SQL QUOTING DOES NOT NEST — SO AN APOSTROPHE
-/// INSIDE A DOUBLE-QUOTED STRING SWALLOWED THE REST OF THE LOG. `"it's here"` pushed `"`, then
-/// pushed `'` because it did not match the top, then pushed a second `"` for the same reason:
-/// the stack never emptied, no `;` ever terminated the statement, and the scan ran to the end
-/// of the file. The decoder then reports `bytes remaining on stream` — which the analyzer
-/// files as `Coverage::Truncated` — so **one apostrophe in one string silently truncates the
-/// corpus at that entry**. Measured: the statement above, in a two-entry log, loses both.
+/// SQL quoting does not nest, so the quote state is one `Option<u8>` and never a stack: inside a
+/// quote the only thing that can happen is the end of that quote. A doubled quote — `'don''t'` —
+/// falls out of that rule, since the second closes the span and the third opens a new one over
+/// the same bytes. A stack would treat an apostrophe inside a double-quoted string as a nested
+/// quote, never find its close, and run the scan to the end of the file.
 ///
-/// ⚠️ It is not an exotic input. `"O'Brien"`, `"don't"`, `'he said "no"'` — any English text in
-/// a string quoted the other way. What hid it is that both fixtures quote in one style per
-/// statement, and `'say "hi"'` happens to pass because its inner quotes are **balanced**: the
-/// stack pops as often as it pushes and lands empty for the wrong reason.
+/// Backslash escaping applies inside `'` and `"` and not inside a backtick, which is MySQL's own
+/// rule under the default `sql_mode`. `NO_BACKSLASH_ESCAPES` changes it; a slow log does not
+/// record the mode, so reading it this way is a decision and not a measurement.
 ///
-/// ⭐ Inside a quote the only thing that can happen is the end of that quote, so the state is
-/// one `Option<u8>` and not a stack. A doubled quote — `'don''t'` — falls out: the second
-/// closes and the third reopens, which is the same span. ⚠️ Backslash escaping applies inside
-/// `'` and `"` and **not** inside a backtick, which is MySQL's rule rather than a
-/// simplification — and it is the rule under the default `sql_mode`. `NO_BACKSLASH_ESCAPES`
-/// changes it, and this crate records that the mode is `unmeasured` rather than assuming it.
+/// The bytes are already contiguous in the buffer the decoder handed over, so the scan decides a
+/// length and `take` takes it in one copy.
 ///
-/// ⛔⛔ AND IT WAS A BYTE AT A TIME THROUGH `any()` INTO A `BytesMut` OF CAPACITY ZERO. Per byte
-/// of every statement: one `any()` call, one `put_slice(&[c])` call, and a doubling
-/// reallocation whenever the accumulator filled — 9.7% of this codec's instructions, its
-/// hottest function. The bytes are already contiguous in the buffer the decoder handed over,
-/// so the scan decides a length and `take` takes it: **one copy, into one allocation of the
-/// right size**, and the quote state no longer allocates at all.
-///
-/// ⚠️ THE REFUSAL IS WINNOW'S AND NOT THIS FUNCTION'S. Running out of input used to produce
-/// whatever `any()` produces, which is `Incomplete` on a partial stream and a backtrack on a
-/// complete one — a distinction the decoder's loop turns into "read more" against "panic". A
-/// hand-written `Incomplete` would be right for this crate's one caller and wrong for a
-/// `parse()` against a finished slice, so `any_`'s own two arms are reproduced rather than
-/// collapsed.
+/// The refusal is winnow's: running out of input is `Incomplete` on a partial stream and a
+/// backtrack on a complete one, which is the distinction the decoder's loop turns into "read
+/// more" against "stop". Both arms are reproduced here rather than collapsed into the one this
+/// crate's own caller needs, so a `parse()` against a finished slice still behaves.
 pub fn sql_lines(i: &mut Stream<'_>) -> ModalResult<Bytes> {
     trace("sql_lines", move |input: &mut Stream<'_>| {
         let end = statement_end(input.as_bytes());
@@ -375,17 +374,12 @@ pub fn entry_user(i: &mut Stream) -> ModalResult<SessionLine> {
 
 /// The key/value pairs parsed from the comment preceding a SQL statement.
 ///
-/// ⭐ WHATEVER THE COMMENT SAID, UNDER THE NAMES IT USED. This carried four named fields --
-/// `request_id`, `caller`, `function`, `line` -- and their own doc comments called them
-/// "example field, should just be part of a HashMap". They were worse than a placeholder:
-/// applications annotate with whatever keys they like, and four names admitted four of them.
-///
-/// ⛔ AND THE NAMES WERE NOT EVEN THE COMMENT'S. The reference mapper put the comment key
-/// `file` into a field called `caller` and `method` into one called `function`. That is a
-/// READER'S VOCABULARY compiled into the parser, and a reader who disagreed had no way to say
-/// so. A parser's job here is to report what the document wrote; deciding that `file` names
-/// the same thing as some other log's `caller` is a judgement that belongs to whoever is
-/// comparing them, where it can be seen and disagreed with.
+/// Whatever the comment said, under the names it used. Applications annotate with whatever keys
+/// they like, so a fixed set of fields would admit only those, and renaming a key — filing a
+/// comment's `file` under a field called `caller` — would compile a reader's vocabulary into the
+/// parser. Deciding that two logs' keys name the same thing is a judgement that belongs to
+/// whoever is comparing them, and [`crate::EntryCodecConfig::map_comment_context`] is where a
+/// caller says so.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SqlStatementContext {
     /// Every pair the comment carried, keys and values exactly as written.
@@ -577,17 +571,14 @@ pub fn admin_command<'a>(i: &mut Stream) -> ModalResult<EntryAdminCommand> {
         let command = seq!(
             _: literal("# administrator command:"),
             _: multispace1,
-            // ⭐ TO THE `;`, NOT ONE WORD. `alphanumerichyphen1` matches a single run of
-            // alphanumerics, so every administrator command whose name contains a space failed
-            // here and fell through to the SQL branch. MySQL has many: `Init DB`,
-            // `Register Slave`, `Binlog Dump`, `Table Dump`, `Change user`, `Close stmt`,
-            // `Reset stmt`, `Long Data`, `Set option`, `Field List`, `Create DB`, `Drop DB`,
-            // `Process info`, `Connect Out`, `Delayed insert`.
-            //
-            // ⛔ AND FAILING HERE WAS NOT FREE, WHICH IS WHY THE CALL SITE CHANGED TOO. See
-            // `codec.rs`: winnow does not rewind a parser that fails after consuming, so the
-            // stream resumed mid-line and the remainder -- `DB;`, `Slave;` -- was read as the
-            // statement's SQL. The command name was destroyed and a fragment filed in its place.
+            // To the `;` and not one word, because many of MySQL's administrator commands carry
+            // a space: `Init DB`, `Register Slave`, `Binlog Dump`, `Table Dump`, `Change user`,
+            // `Close stmt`, `Reset stmt`, `Long Data`, `Set option`, `Field List`, `Create DB`,
+            // `Drop DB`, `Process info`, `Connect Out`, `Delayed insert`. A parser that matched
+            // one alphanumeric run would fail here, and the caller in `codec.rs` wraps this in
+            // `opt` for that reason: winnow does not rewind a parser that failed after
+            // consuming, so a mid-line failure would leave the rest of the line to be read as
+            // the statement's SQL.
             take_till(1.., (b';', b'\r', b'\n')),
             _: literal(";"),
         )
@@ -639,23 +630,21 @@ pub fn start_timestamp_command(i: &mut Stream) -> ModalResult<u32> {
 
 /// One literal value the author wrote.
 ///
-/// ⭐⭐ THE AUTHOR'S SUBJECT, AND THE RECORD USED TO THROW IT AWAY. `WHERE tenant_id = 42` is a
-/// claim about which rows the statement was about. Masking replaces it with `?`, which is a
-/// READER's assertion that two authors' subjects are interchangeable. Filing the literal is what
-/// makes masking a grouping choice rather than an edit to somebody else's document.
+/// `WHERE tenant_id = 42` is the author's claim about which rows the statement was about.
+/// Masking replaces the value with `?`, which is a reader's assertion that two authors' subjects
+/// are interchangeable; recording the literal here is what makes masking a grouping choice rather
+/// than an edit to the document.
 ///
-/// ⚠️ NO SOURCE POSITION, and the reason is not an oversight. The span lives on
-/// `sqlparser::ast::ValueWithSpan`, which derives `Visit` but carries no `visit(with = ...)`
-/// annotation -- so no visitor hook ever sees it. [`EntryLiteral::ordinal`] is the position, and
-/// it is exact rather than approximate because ONE pass both records and masks, so the two can
-/// never fall out of step.
+/// No source position: the span lives on `sqlparser::ast::ValueWithSpan`, and nothing this
+/// crate's visitor sees carries it. [`EntryLiteral::ordinal`] is the position, and it is exact
+/// because one pass both records and masks, so the two cannot fall out of step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EntryLiteral {
     /// Position in the statement's own value order, counting from zero.
     ///
-    /// ⛔ Deterministic: the traversal is depth-first in field-declaration order, emitted by
-    /// `sqlparser_derive` and pinned by that crate's own doctests. ⚠️ It is stable *within* a
-    /// `sqlparser` version and nothing promises it across one.
+    /// Deterministic: the traversal is depth-first in field-declaration order, emitted by
+    /// `sqlparser_derive`. It is stable within a `sqlparser` version, and nothing promises it
+    /// across one.
     pub ordinal: u32,
     /// The literal as the author wrote it, quoting and all.
     pub rendered: Bytes,
@@ -663,57 +652,49 @@ pub struct EntryLiteral {
     pub value: Bytes,
     /// Which kind of literal it is.
     pub kind: LiteralKind,
-    /// ⭐⭐ THE COLUMN THE AUTHOR COMPARED THIS VALUE AGAINST, where the syntax names one.
+    /// The column the author compared this value against, where the syntax names one. A value
+    /// means something only in a domain, and the domain is a column of a relation: without it
+    /// `42` the tenant and `42` the row limit are one value.
     ///
-    /// `WHERE tenant_id = 42` filed `42` and threw `tenant_id` away, so every literal in a
-    /// corpus sat in one undifferentiated pool and `42` the tenant was indistinguishable from
-    /// `42` the row limit. A value only means something **in a domain**, and the domain is a
-    /// column of a relation.
+    /// `None` is an absence the parse establishes and not a gap: a `CREATE TABLE` default, a
+    /// `LIMIT`, a `SET` value and a function argument are literals the author wrote in a position
+    /// that names no column, and they select no rows.
     ///
-    /// ⛔ `None` is a **measured** absence and not a gap: a `CREATE TABLE` default, a `LIMIT`,
-    /// a `SET` value and a function argument are literals the author wrote in a position that
-    /// names no column. They select no rows and take no lock. Measured: **252 of 302** on
-    /// `slow-test-queries.log` and **136 of 248** on `structure.log`.
-    ///
-    /// ⚠️ FOUR SHAPES, AND THEY ARE NOT ALL THE SAME CLAIM. A comparison, an `IN` list and a
-    /// `BETWEEN` bound name the column a value is **sought** in. `UPDATE … SET qty = 5` and
-    /// `INSERT … VALUES` name the column a value is **written** to, which is a key the statement
-    /// creates or changes rather than one it looks up. [`Self::sought`] is what tells them apart,
-    /// because a lock taken to find a row and a lock taken to write one are different locks.
+    /// Four syntactic shapes reach this, and they are not all the same claim. A comparison, an
+    /// `IN` list and a `BETWEEN` bound name the column a value is *sought* in; `UPDATE … SET qty
+    /// = 5` and `INSERT … VALUES` name the column a value is *written* to, which is a key the
+    /// statement creates or changes rather than one it looks up. [`Self::sought`] is what tells
+    /// them apart, because a lock taken to find a row and a lock taken to write one are
+    /// different locks.
     pub column: Option<LiteralColumn>,
     /// Whether the author was **looking for** this value or **writing** it.
     ///
-    /// ⛔ AND IT IS WHY THE SHIPPED CORPUS LOOKED EMPTY. `slow-test-queries.log` is a sandbox
-    /// startup and a `mysqldump` restore: **not one of its 302 literals sits in a predicate.**
-    /// Its 50 bound values are every one of them an `INSERT` column or a `SET` target. A rule
-    /// that read predicates alone would have measured zero there and called the corpus silent,
-    /// when what it actually is is a corpus that only ever wrote.
+    /// A log may contain no predicate at all — a restore only ever writes — so a consumer that
+    /// reads only sought values can find nothing where the author bound a great many.
     ///
-    /// ⚠️ `false` on an unbound literal, where it asserts nothing.
+    /// `false` on an unbound literal, where it asserts nothing.
     pub sought: bool,
-    /// ⭐⭐ The position in the row this value was written at, where the `INSERT` named no
-    /// columns: the `n`-th value reaches the table's `n`-th column.
+    /// The position in the row this value was written at, where the `INSERT` named no columns:
+    /// the `n`-th value reaches the table's `n`-th column.
     ///
-    /// ⛔ A DOMAIN, AND NOT THE SAME ONE AS [`Self::column`]. Which physical column `#n` is
-    /// lives in a catalogue no slow log carries, so a positional domain and a named domain over
-    /// one table are kept apart rather than fused on a guess.
+    /// A domain, and not the same one as [`Self::column`]. Which physical column `#n` is lives in
+    /// a catalogue no slow log carries, so a positional domain and a named domain over one table
+    /// are kept apart rather than fused on a guess.
     pub column_position: Option<u32>,
 }
 
 /// The column name an [`EntryLiteral`] was compared against, exactly as the author spelled it.
 ///
-/// ⚠️ THE WRITTEN NAME AND NOT A RELATION. `e1.dept_id` carries the qualifier the author used,
-/// which is an **alias** far more often than a table — and an alias is scoped, so resolving it
-/// to a relation is a second hop through the statement's own occurrences. That hop belongs to
-/// whoever holds the scope tree, which this struct deliberately does not.
+/// The written name and not a relation. `e1.dept_id` carries the qualifier the author used,
+/// which is an alias far more often than a table — and an alias is scoped, so resolving it to a
+/// relation is a second hop through the statement's own occurrences. That hop belongs to whoever
+/// holds the scope tree, which this struct does not.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiteralColumn {
     /// Everything before the last `.`, joined as written — an alias, a table, or a schema and a
     /// table. `None` where the author wrote a bare column name.
     ///
-    /// ⚠️ Measured: **0 of 50** bound literals on `slow-test-queries.log` carry one and **80 of
-    /// 125** on `structure.log` do. A bare name fixes a relation only where the statement names
-    /// exactly one.
+    /// A bare name fixes a relation only where the statement names exactly one.
     pub qualifier: Option<Bytes>,
     /// The column name itself.
     pub name: Bytes,
@@ -721,13 +702,13 @@ pub struct LiteralColumn {
 
 /// What kind of literal an [`EntryLiteral`] is.
 ///
-/// ⛔ `E'…'` had an arm and MySQL has no such literal — `MySqlDialect` refuses the text, so
-/// nothing could ever produce it. Removed rather than documented: **this crate reads MySQL slow
-/// logs**, and an arm no input reaches is one more case every consumer has to handle.
+/// Five arms, and no arm for `E'…'`: MySQL has no such literal, `MySqlDialect` refuses the text,
+/// and an arm no input can reach is one more case every consumer has to handle.
 ///
-/// ⚠️ `"…"` stays, and it is the one that is genuinely ambiguous: MySQL reads it as a string
-/// literal by default and as an **identifier** under `ANSI_QUOTES`. Which one it was is
-/// `sql_mode`, and a slow log does not record it — see `connection.rs`.
+/// [`Self::DoubleQuotedString`] is the ambiguous one. MySQL reads `"…"` as a string literal under
+/// its default `sql_mode` and as an identifier under `ANSI_QUOTES`; `MySqlDialect` is fixed and
+/// honours no mode, so this arm records the default reading. A slow log does not carry the mode,
+/// so nothing here can decide it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LiteralKind {
     /// a numeric literal
@@ -770,29 +751,27 @@ pub fn parse_sql(
     Ok((statements, pass.literals))
 }
 
-/// ⭐⭐⭐ Re-render a statement with a substitute in place of chosen literals.
+/// Re-render a statement with a substitute in place of chosen literals.
 ///
-/// `replacements[i]` is the new **payload** for the `i`-th literal [`parse_sql`] would record,
-/// in the same traversal order and under the same arm filter -- so an ordinal from
-/// [`EntryLiteral`] indexes this directly and the two can never drift apart. `None` leaves a
-/// literal alone, and a short slice leaves the tail alone.
+/// `replacements[i]` is the new payload for the `i`-th literal this crate records, in the same
+/// traversal order and under the same arm filter -- so an ordinal from [`EntryLiteral`] indexes
+/// this directly and the two cannot drift apart. `None` leaves a literal alone, and a short slice
+/// leaves the tail alone.
 ///
-/// ⛔⛔ THE KIND IS TAKEN FROM THE ORIGINAL AND NOT FROM THE CALLER, which is what makes the
-/// substitution **type-preserving** by construction rather than by convention. A number stays a
-/// number and a quoted string stays a quoted string: swap them and the statement stops being the
-/// statement, because MySQL compares an integer column against a string by coercing it and takes
-/// a different path through the index. The caller cannot get this wrong because it has no way to
-/// say it.
+/// The kind is taken from the original and never from the caller, which makes the substitution
+/// type-preserving by construction: a number stays a number and a quoted string stays a quoted
+/// string. Swapping them changes the statement, because MySQL compares an integer column against
+/// a string by coercing it and takes a different path through the index.
 ///
-/// ⚠️ Returns `None` where the text does not parse or is not exactly one statement. A caller
-/// with a surrogate to apply and nothing to apply it to must **withhold**, and the `None` is what
-/// says so -- silently returning the original would hand back the author's values under a name
-/// that promises it did not.
+/// Returns `None` where the text does not parse or is not exactly one statement. A caller with a
+/// substitute to apply and nothing to apply it to has to withhold, and the `None` is what says
+/// so; returning the original would hand back the author's values from a function that promises
+/// it did not.
 ///
-/// ⚠️ It re-parses rather than taking a tree, because the substitution a caller wants is
-/// corpus-scoped: the whole log has to be read before any surrogate is known, and by then the
-/// trees are long gone. The text it re-parses is the tree's own rendering, so the traversal it
-/// walks is the traversal that produced the ordinals.
+/// It re-parses rather than taking a tree, because the substitution a caller wants is usually
+/// corpus-scoped: the whole log is read before any substitute is known, and by then the trees are
+/// gone. The text it re-parses is the tree's own rendering, so the traversal it walks is the
+/// traversal that produced the ordinals.
 pub fn rewrite_literals(sql: &str, replacements: &[Option<String>]) -> Option<String> {
     let mut tokenizer = Tokenizer::new(&MySqlDialect {}, sql);
     let tokens = tokenizer.tokenize().ok()?;
@@ -810,29 +789,26 @@ pub fn rewrite_literals(sql: &str, replacements: &[Option<String>]) -> Option<St
     Some(statements[0].to_string())
 }
 
-/// ⭐⭐⭐ Does this text carry a value the author supplied? `None` where it cannot be tokenized.
+/// Does this text carry a value the author supplied? `None` where it cannot be tokenized.
 ///
-/// ⛔ FOR THE STATEMENTS THIS GRAMMAR REFUSES, AND ONLY THOSE. A statement that parsed has
-/// literals with a **position** — [`EntryLiteral::column`] says whether the author went for a row
-/// with it — and that is a far better question than this one. A statement with no parse has no
-/// positions, so the only thing left to ask is whether there is a value in it at all.
+/// For the statements this grammar refuses, and only those. A statement that parsed has literals
+/// with a position — [`EntryLiteral::column`] says whether the author went for a row with one —
+/// which is a sharper question than this. A statement with no parse has no positions, so the only
+/// thing left to ask is whether there is a value in it at all.
 ///
-/// ⚠️ IT OVER-APPROXIMATES, AND THE DIRECTION IS THE WHOLE ARGUMENT. `LIMIT 10` and
-/// `SET TIME_ZONE='+00:00'` both answer `true` while naming nobody. A caller withholding on this
-/// withholds a little more than it must, which costs **fidelity** and never costs privacy --
-/// the opposite of the tokenizer-level *masking* this crate removed, where `CHAR(60)` became
-/// `CHAR(?)` and destroyed 35 parses in silence. **Deciding is safe where editing was not.**
+/// It over-approximates, and the direction matters: `LIMIT 10` and `SET TIME_ZONE='+00:00'` both
+/// answer `true` while naming nobody. A caller withholding on this answer withholds a little more
+/// than it must, which costs fidelity and not confidentiality. Note that this *decides* and never
+/// edits — a tokenizer-level substitution cannot tell a value from a number the grammar requires,
+/// and turns `CHAR(60)` into `CHAR(?)`.
 ///
-/// ⛔⛔ AND IT OPENS THE VERSION GATES, WITHOUT WHICH IT UNDERCOUNTS. `sqlparser`'s tokenizer
-/// files `/*!40101 ... */` as one **comment** while MySQL *executes* it, so a literal inside a
-/// gate is invisible to a plain token scan: on `slow-test-queries.log` that is the difference
-/// between 130 statements answering `false` and the true figure of 122. The server's regime and
-/// the grammar's disagree about the construct, and this is the disagreement arriving as an
-/// off-by-eight.
+/// It opens MySQL version gates, because the two regimes disagree about them: `sqlparser`'s
+/// tokenizer files `/*!40101 … */` as one comment while the server executes what is inside it, so
+/// a literal inside a gate is invisible to a plain token scan.
 ///
-/// ⚠️ A value written as an **identifier** is invisible here and no token scan can see it:
-/// `DEFINER=`msandbox`@`%`` is a username and a host in backticks. A caller must say so rather
-/// than imply this covers it.
+/// A value written as an identifier is invisible here, and no token scan can see it: in
+/// ``DEFINER=`msandbox`@`%` `` a username and a host are backtick identifiers. A caller must not
+/// read a `false` as covering that case.
 pub fn carries_a_value(sql: &str) -> Option<bool> {
     fn scan(sql: &str, depth: u32) -> Option<bool> {
         if depth > 4 {
@@ -875,15 +851,15 @@ struct RewritePass<'a> {
 impl VisitorMut for RewritePass<'_> {
     type Break = ();
 
-    /// ⚠️ Still shadowed to the inner `Value`: every arm below is about what the author wrote,
-    /// and assigning through the inner value leaves the span alone — which is what the two
-    /// comments about `with_empty_span()` were already asking for and could not have.
+    /// The hook takes a `ValueWithSpan`, which carries the source span; the body shadows it to
+    /// the inner `Value`, because every arm below is about what the author wrote and assigning
+    /// through the inner value leaves the span alone.
     fn pre_visit_value(&mut self, value: &mut ValueWithSpan) -> ControlFlow<Self::Break> {
         let value = &mut value.value;
-        // ⛔ THE SAME ARMS AS `LiteralPass::pre_visit_value`, AND THAT IS LOAD-BEARING. A
-        // boolean, a NULL or a placeholder is recorded by neither, so neither advances its
-        // counter over one -- and an ordinal that meant a different literal in the two passes
-        // would substitute the author's value into the wrong slot.
+        // The same arms as `LiteralPass::pre_visit_value`, which is load-bearing: a boolean, a
+        // NULL or a placeholder is recorded by neither, so neither advances its counter over one.
+        // An ordinal that meant a different literal in the two passes would substitute into the
+        // wrong slot.
         if !matches!(
             value,
             Value::Number(..)
@@ -899,8 +875,8 @@ impl VisitorMut for RewritePass<'_> {
         let Some(Some(new)) = self.replacements.get(i) else {
             return ControlFlow::Continue(());
         };
-        // ⭐ Assigning through `&mut Value` leaves the `ValueWithSpan` wrapper alone, for the
-        // same reason masking does.
+        // Assigning through `&mut Value` leaves the `ValueWithSpan` wrapper alone, for the same
+        // reason masking does.
         *value = match &*value {
             Value::Number(_, long) => Value::Number(new.clone(), *long),
             Value::SingleQuotedString(_) => Value::SingleQuotedString(new.clone()),
@@ -913,56 +889,52 @@ impl VisitorMut for RewritePass<'_> {
     }
 }
 
-/// Records every literal in a statement, and replaces it where asked, in ONE traversal.
+/// Records every literal in a statement, and replaces it where asked, in one traversal.
 ///
-/// ⛔⛔ AFTER THE PARSE AND NEVER BEFORE IT. Replacing tokens first destroys statements that are
-/// perfectly well formed: a number inside a type declaration is not a value, and `CHAR(?)`,
-/// `DECIMAL(?,?)` and `INT(?)` are not SQL. That cost **35 of 163 parses** on this crate's own
-/// fixture -- every `CREATE TABLE` and `ALTER TABLE` -- and the consumer's default is to mask, so
-/// the default was the lossy one. After the parse the ambiguity is gone: a type parameter is not
-/// a `Value` and a literal is.
+/// After the parse and never before it. Replacing tokens first destroys well-formed statements,
+/// because a number inside a type declaration is not a value and `CHAR(?)`, `DECIMAL(?,?)` and
+/// `INT(?)` are not SQL. After the parse the ambiguity is gone: a type parameter is not a `Value`
+/// and a literal is.
 ///
-/// ⛔ `pre_visit_value` AND NOT `Expr::Value`, which is what this used to match on.
-/// `Expr::TypedString` (`DATE '2020-01-01'`) and `Expr::MatchAgainst` (MySQL's
-/// `AGAINST ('term')`) hold a `Value` without being one, so an `Expr`-shaped pass neither masked
-/// them nor could have recorded them.
+/// `pre_visit_value` and not `Expr::Value`: `Expr::TypedString` (`DATE '2020-01-01'`) and
+/// `Expr::MatchAgainst` (MySQL's `AGAINST ('term')`) hold a `Value` without being one, so an
+/// `Expr`-shaped pass would neither mask nor record them.
 ///
-/// ⚠️ It reaches a few `Value`s that are not row-selecting -- a `CEIL(x TO 2)` scale, a
-/// `TABLESAMPLE` seed. Those are grammar, not subject, and masking them is wrong in the same way
-/// masking a type parameter was. It cannot break a parse the way the old route did, because the
-/// tree already exists; `a_masked_statement_still_parses` is what holds that.
+/// It reaches a few `Value`s that select no rows -- a `CEIL(x TO 2)` scale, a `TABLESAMPLE` seed.
+/// Those are grammar rather than subject, and masking one is wrong in the same way masking a type
+/// parameter was, but it cannot break a parse: the tree already exists.
 struct LiteralPass {
     literals: Vec<EntryLiteral>,
     mask: bool,
     /// One entry per enclosing `Expr`, saying what a value **directly beneath it** is compared
     /// against.
     ///
-    /// ⭐ THE PARENT AND ONLY THE PARENT. `pre_visit_value` fires inside the `Expr::Value` node,
-    /// so the stack reads `[…, the comparison, Expr::Value]` and the binding is at `len - 2`.
+    /// The parent and only the parent. `pre_visit_value` fires inside the `Expr::Value` node, so
+    /// the stack reads `[…, the comparison, Expr::Value]` and the binding is at `len - 2`.
     /// Searching further up would let `WHERE a = f(g(1))` bind `1` to `a`, which is a claim the
     /// author did not make: the value is an argument, not a key.
     binds: Vec<Option<LiteralColumn>>,
     /// Values reached through a node that is **not** an `Expr`, by the address of the value.
     ///
-    /// ⛔⛔ `Assignment` AND AN INSERT COLUMN LIST ARE NOT EXPRESSIONS, so no hook on this
-    /// visitor ever sees the column beside the value — and on `slow-test-queries.log` those are
-    /// the ONLY bound literals there are. [`Self::binds`] cannot reach them at any depth.
+    /// An `Assignment` and an `INSERT` column list are not expressions, so no hook on this
+    /// visitor sees the column beside the value and [`Self::binds`] cannot reach them at any
+    /// depth. On a log that only ever wrote, these are the only bound literals there are.
     ///
-    /// ⚠️ Keyed on the value's address and never on its payload. `INSERT INTO t (a, b)
-    /// VALUES (5, 5)` writes one payload into two columns, and a payload-matched queue would
-    /// hand both to whichever it met first. The address is taken in `pre_visit_statement`, which
-    /// runs before the statement's children and therefore before anything is masked; masking
-    /// assigns *through* `&mut Value` and moves no node, so the address still names the same
-    /// slot when `pre_visit_value` reaches it. Nothing is ever dereferenced.
+    /// Keyed on the value's address and never on its payload: `INSERT INTO t (a, b) VALUES (5,
+    /// 5)` writes one payload into two columns, and a payload-matched queue would hand both to
+    /// whichever it met first. The address is taken in `pre_visit_statement`, which runs before
+    /// the statement's children and therefore before anything is masked; masking assigns through
+    /// `&mut Value` and moves no node, so the address still names the same slot when
+    /// `pre_visit_value` reaches it. Nothing is ever dereferenced.
     targets: HashMap<usize, LiteralColumn>,
-    /// ⭐⭐ Values written by an `INSERT` that named **no columns**, by address, with the
-    /// position in the row they were written at.
+    /// Values written by an `INSERT` that named no columns, by address, with the position in the
+    /// row they were written at.
     ///
-    /// The author's data, and the column IS recoverable -- positionally. An `INSERT` with no
-    /// column list writes in the table's own column order, so the `n`-th value reaches the
-    /// `n`-th column for every such statement against that table. Kept apart from
-    /// [`Self::targets`] because a positional domain and a named one are not known to be the
-    /// same domain: deciding that needs the catalogue.
+    /// The column is recoverable positionally: an `INSERT` with no column list writes in the
+    /// table's own column order, so the `n`-th value reaches the `n`-th column for every such
+    /// statement against that table. Kept apart from [`Self::targets`] because a positional
+    /// domain and a named one are not known to be the same domain; deciding that needs the
+    /// catalogue.
     positional: HashMap<usize, u32>,
 }
 
@@ -981,9 +953,10 @@ fn column_of_name(n: &ObjectName) -> Option<LiteralColumn> {
 
 /// Records the address of every literal a **non-expression** node pairs with a column.
 ///
-/// ⚠️ `UPDATE … SET (a, b) = (…)` -- `AssignmentTarget::Tuple` -- is deliberately not here. The
-/// tuple's right-hand side is one `Expr`, not a list, so which column each value inside it goes
-/// to is a positional reading of a subquery or a row constructor, and MySQL does not write it.
+/// `UPDATE … SET (a, b) = (…)` -- `AssignmentTarget::Tuple` -- is deliberately not here. The
+/// tuple's right-hand side is one `Expr` rather than a list, so which column each value inside it
+/// goes to is a positional reading of a subquery or a row constructor, and MySQL does not write
+/// it down.
 fn statement_targets(
     s: &Statement,
     out: &mut HashMap<usize, LiteralColumn>,
@@ -1008,31 +981,19 @@ fn statement_targets(
                 return;
             };
             for row in &vs.rows {
-                // ⛔⛔ AN INSERT WITH NO COLUMN LIST IS STILL WRITING THE AUTHOR'S DATA, and
-                // filing its values as "no column is named here" put them in the same bucket as
-                // a `LIMIT` and a `CREATE TABLE` default -- things that name nobody. They are not
-                // the same: `INSERT INTO t VALUES (1, 'kay')` writes a row, and on
-                // `slow-test-queries.log` that is **98 literals** a rule keyed on the bucket
-                // would have shipped in the clear.
-                //
-                // ⚠️ The column is genuinely not recoverable -- it is the table's `n`-th, and
-                // which one that is lives in a catalogue no slow log carries. So this says the
-                // value was WRITTEN and declines to name where, which are two different claims
-                // and were one.
+                // An `INSERT` with no column list is still writing the author's data, so its
+                // values must not be filed as naming no column at all -- the bucket a `LIMIT` and
+                // a `CREATE TABLE` default sit in.
                 if i.columns.is_empty() {
-                    // ⭐⭐ AND THE COLUMN IS RECOVERABLE AFTER ALL, POSITIONALLY. An `INSERT`
-                    // with no column list writes in the table's own column order, so the `n`-th
-                    // value goes to the `n`-th column -- for every such statement against that
-                    // table, which is exactly what makes `(relation, #n)` a domain rather than a
-                    // label. Two statements writing the same value at the same position really
-                    // did go for the same key.
+                    // The column is recoverable positionally: such an `INSERT` writes in the
+                    // table's own column order, so the `n`-th value goes to the `n`-th column for
+                    // every such statement against that table, which is what makes `(relation,
+                    // #n)` a domain rather than a label.
                     //
-                    // ⛔ IT IS NOT THE SAME DOMAIN AS A NAMED ONE and must never be fused with
-                    // it. `INSERT INTO t (b, a) VALUES (1, 2)` puts `1` in `b`, and
-                    // `INSERT INTO t VALUES (1, 2)` puts `1` in the table's first column, which
-                    // the log does not say is `b`. Deciding they are one needs the catalogue,
-                    // and a slow log carries none -- so `#0` and `b` stay apart, the same way
-                    // `_bare` and `_resolved` stay apart one grain up.
+                    // It is not the same domain as a named one and must not be fused with it.
+                    // `INSERT INTO t (b, a) VALUES (1, 2)` puts `1` in `b`, and `INSERT INTO t
+                    // VALUES (1, 2)` puts `1` in the table's first column, which the log does not
+                    // say is `b`. Deciding they are one needs the catalogue.
                     for (n, e) in row.content.iter().enumerate() {
                         if let Expr::Value(v) = e {
                             positional.insert(std::ptr::from_ref(&v.value).addr(), n as u32);
@@ -1040,10 +1001,9 @@ fn statement_targets(
                     }
                     continue;
                 }
-                // ⚠️ `Insert.columns` IS A `Vec<ObjectName>` SINCE sqlparser 0.63, WHERE IT WAS
-                // A `Vec<Ident>`. A column list entry can be qualified in some dialects; MySQL's
-                // cannot, so the last part is the column and `column_of_name` is the routine that
-                // already knows how to say so — reused rather than re-derived here.
+                // `Insert.columns` holds an `ObjectName` per column, because a column list entry
+                // can be qualified in some dialects. MySQL's cannot, so the last part is the
+                // column and `column_of_name` is what says so.
                 for (col, e) in i.columns.iter().zip(&row.content) {
                     put(column_of_name(col), e);
                 }
@@ -1055,10 +1015,9 @@ fn statement_targets(
 
 /// The column a value **directly beneath this expression** is sought in, where there is one.
 ///
-/// ⛔ COMPARISON OPERATORS ONLY, and the reason is not fussiness. `Expr::BinaryOp` covers `+`
-/// as well as `=`, so a rule that took any binary operator would bind the `1` in `qty + 1` to
-/// `qty` — filing arithmetic as a key lookup, in a column whose whole purpose is to say which
-/// rows a statement went for.
+/// Comparison operators only. `Expr::BinaryOp` covers `+` as well as `=`, so a rule that took any
+/// binary operator would bind the `1` in `qty + 1` to `qty` — filing arithmetic as a key lookup,
+/// in a field whose purpose is to say which rows a statement went for.
 fn binding_of(e: &Expr) -> Option<LiteralColumn> {
     let is_value = |x: &Expr| matches!(x, Expr::Value(_));
     match e {
@@ -1071,11 +1030,11 @@ fn binding_of(e: &Expr) -> Option<LiteralColumn> {
                 None
             }
         }
-        // ⭐ Every member of an `IN` list is sought in the same column, so one binding serves
-        // them all — and they are direct children, which is what makes that exact.
+        // Every member of an `IN` list is sought in the same column, so one binding serves them
+        // all — and they are direct children, which is what makes that exact.
         Expr::InList { expr, list, .. } if list.iter().any(is_value) => column_of(expr),
-        // ⭐ A range, which is where InnoDB's next-key locking actually lives: the bound is a
-        // claim about a stretch of the index rather than about one row.
+        // A range: the bound is a claim about a stretch of the index rather than about one row,
+        // which is where InnoDB's next-key locking applies.
         Expr::Between {
             expr, low, high, ..
         } if is_value(low) || is_value(high) => column_of(expr),
@@ -1088,8 +1047,8 @@ fn is_comparison(op: &BinaryOperator) -> bool {
     use BinaryOperator as B;
     matches!(
         op,
-        // ⚠️ `<=>` is MySQL's own NULL-safe equality and belongs here for the same reason `=`
-        // does: it names rows.
+        // `<=>` is MySQL's own NULL-safe equality and belongs here for the same reason `=` does:
+        // it names rows.
         B::Eq | B::NotEq | B::Lt | B::LtEq | B::Gt | B::GtEq | B::Spaceship
     )
 }
@@ -1128,8 +1087,8 @@ impl VisitorMut for LiteralPass {
     }
 
     fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
-        // ⚠️ Read BEFORE the value beneath is masked. `pre_visit_value` replaces the value with
-        // a placeholder, and a binding computed afterwards would see `?` on both sides.
+        // Read before the value beneath is masked: `pre_visit_value` replaces the value with a
+        // placeholder, and a binding computed afterwards would see `?` on both sides.
         self.binds.push(binding_of(expr));
         ControlFlow::Continue(())
     }
@@ -1139,9 +1098,8 @@ impl VisitorMut for LiteralPass {
         ControlFlow::Continue(())
     }
 
-    /// ⭐⭐ See [`RewritePass::pre_visit_value`]: the hook carries the span now. The body is
-    /// unchanged and works on the inner value, so `addr` is still the inner `Value`'s — which
-    /// is what `targets` and `positional` are keyed on, one function up.
+    /// Shadowed to the inner `Value`, as in [`RewritePass::pre_visit_value`], so `addr` below is
+    /// the inner `Value`'s — which is what `targets` and `positional` are keyed on.
     fn pre_visit_value(&mut self, value: &mut ValueWithSpan) -> ControlFlow<Self::Break> {
         let value = &mut value.value;
         let (kind, payload) = match value {
@@ -1150,21 +1108,20 @@ impl VisitorMut for LiteralPass {
             Value::DoubleQuotedString(v) => (LiteralKind::DoubleQuotedString, v.clone()),
             Value::NationalStringLiteral(v) => (LiteralKind::NationalString, v.clone()),
             Value::HexStringLiteral(v) => (LiteralKind::HexString, v.clone()),
-            // ⛔ A boolean, a NULL and a placeholder are not the author's subject: `TRUE` names
-            // no rows and `?` was never theirs. Recording them would put the reader's own
-            // placeholder into a column of the author's values.
+            // A boolean, a NULL and a placeholder are not the author's subject: `TRUE` names no
+            // rows, and a `?` already in the text was never the author's value.
             _ => return ControlFlow::Continue(()),
         };
 
-        // ⚠️ `len - 2` and never a search: see [`LiteralPass::binds`]. A value with no enclosing
+        // `len - 2` and never a search: see `LiteralPass::binds`. A value with no enclosing
         // expression at all -- which the traversal does reach -- binds to nothing.
         let sought = self
             .binds
             .len()
             .checked_sub(2)
             .and_then(|i| self.binds[i].clone());
-        // ⭐ The predicate first: a value can only be in one of the two positions, and where it
-        // is in neither both are `None`.
+        // The predicate first: a value can only be in one of the two positions, and where it is
+        // in neither both are `None`.
         let addr = std::ptr::from_ref(&*value).addr();
         let written = self.targets.get(&addr).cloned();
         let column_position = self.positional.get(&addr).copied();
@@ -1180,9 +1137,9 @@ impl VisitorMut for LiteralPass {
         });
 
         if self.mask {
-            // ⭐ The INNER value, not the wrapper. `Expr::value(..)` builds a fresh
-            // `ValueWithSpan` through `with_empty_span()`, which throws away a span this crate
-            // may one day populate. Assigning through `&mut Value` leaves the wrapper alone.
+            // The inner value and not the wrapper: `Expr::value(..)` would build a fresh
+            // `ValueWithSpan` through `with_empty_span()` and discard the source span. Assigning
+            // through `&mut Value` leaves the wrapper alone.
             *value = Value::Placeholder("?".to_string());
         }
         ControlFlow::Continue(())
@@ -2316,7 +2273,7 @@ mod quoting_does_not_nest {
     /// ⚠️ BACKSLASH ESCAPES INSIDE `'` AND `"` AND NOT INSIDE A BACKTICK, which is MySQL's own
     /// rule rather than a simplification. ⛔ Under `NO_BACKSLASH_ESCAPES` the first two change
     /// too — and this crate records `sql_mode` as `unmeasured` rather than assuming it, so the
-    /// default is a **reading** and is filed as one.
+    /// default is a **reading** and is filed as one. See [`LiteralKind::DoubleQuotedString`].
     #[test]
     fn the_escape_rule_is_the_servers_and_stops_at_a_backtick() {
         // The escaped quote does not close the string, so the terminator is the real one.

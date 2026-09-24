@@ -1,3 +1,24 @@
+//! The framing reader: bytes of a slow log in, one [`Entry`] at a time out.
+//!
+//! What it reads: the file's header block, then, per entry, the `# Time:`, `# User@Host:` and
+//! `# Query_time:` lines, an optional `USE <db>;`, the `SET timestamp=…;` line, and finally
+//! either an administrator command or the statement's own bytes. Each of those is a parser in
+//! [`crate::parser`]; this module is the state machine that orders them and the buffer
+//! arithmetic that lets a partial read resume.
+//!
+//! What it refuses: a malformed entry, which arrives as a winnow backtrack or cut and panics
+//! rather than being skipped, and leftover non-whitespace at end of file, which
+//! [`Decoder::decode_eof`] reports as an `io::Error` so a caller can tell a truncated log from a
+//! complete one.
+//!
+//! What it declines to interpret: the statement text, which is handed to `sqlparser` and filed
+//! as [`EntryStatement::InvalidStatement`] where that refuses it; the header's version string,
+//! which is carried as the server spelled it; and a `USE` database, which is filed on the entry
+//! that wrote it and never carried forward to the next entry on the same connection.
+//!
+//! Two scopes, and the distinction is load-bearing: [`EntryContext`] is cleared when an entry
+//! completes, [`FileScope`] is not.
+
 use crate::codec::EntryError::MissingField;
 use crate::parser::{
     HeaderLines, Stream, admin_command, details_comment, entry_user, log_header, parse_entry_stats,
@@ -40,11 +61,9 @@ pub enum CodecError {
     /// a problem from the IO layer below caused the error
     #[error("file read error: {0}")]
     IO(#[from] io::Error),
-    // ⛔ `IncompleteEntry(EntryError)` STOOD HERE AND NOTHING EVER BUILT ONE. Its message read
-    // *"found start of new entry before entry completed"*, a condition the state machine makes
-    // unreachable: `parse_next` reaches `complete()` only from the `Sql` arm, by which point
-    // every field is set, and the sole caller `unwrap`s. `EntryError` stays — it is `complete`'s
-    // return type and public API — and the variant that would have carried it does not.
+    // An IO error is the only failure a caller can see. A half-built entry is unreachable: the
+    // state machine reaches `EntryContext::complete` only from the `Sql` arm, by which point
+    // every field is set. `EntryError` is still `complete`'s return type and public API.
 }
 
 #[derive(Debug)]
@@ -79,18 +98,12 @@ impl Display for CodecExpect {
     }
 }
 
-/// The half-read entry. ⭐ **Everything here is cleared when an entry completes**, which is the
-/// contract that makes the two-scope model work — [`FileScope`] is what is not.
+/// The half-read entry. Everything here is cleared when an entry completes, which is the
+/// contract that makes the two-scope model work; [`FileScope`] is what survives.
 ///
-/// ⛔⛔ AND ONE OF THESE FIELDS WAS NOT AN ENTRY'S. The log header is a fact about the FILE —
-/// which server wrote it — and it lived here, so the first completed entry destroyed it. That
-/// is a scope error and not an oversight: a whole-of-file fact in a struct whose contract is
-/// "cleared between entries" cannot survive by any amount of reading it. It lives on the codec
-/// now, in [`FileScope`].
-///
-/// ⚠️ The clearing is [`EntryContext::complete`]'s `mem::take` and is no longer a separate
-/// `reset()` call after it. The two did the same thing, and doing it twice is what let five
-/// fields be **copied** on the way out of a struct that was about to be emptied.
+/// Nothing that is a fact about the *file* may be held here — the log header used to be, and the
+/// first completed entry destroyed it. The clearing is [`EntryContext::complete`]'s `mem::take`,
+/// so a field taken out of this struct is moved rather than copied.
 #[derive(Debug, Default)]
 struct EntryContext {
     expects: CodecExpect,
@@ -103,22 +116,15 @@ struct EntryContext {
 }
 
 impl EntryContext {
-    /// ⛔⛔ THIS CLONED FIVE FIELDS AND THEN THREW THE ORIGINALS AWAY, AND ONE OF THEM IS AN AST.
+    /// Takes the half-read entry's fields and builds the [`Entry`].
     ///
-    /// `attributes` carries a whole `sqlparser::ast::Statement`. Cloning it deep-copies every
-    /// node and every `String` in the tree, and the next line — `reset()` — dropped the tree it
-    /// had just copied. Measured on `slow-test-queries.log`: `Statement::clone` was called
-    /// **326 times for 163 parsed statements** and cost **7.4% of the codec's instructions**,
-    /// with the frees of the copies on top of that. Half of those calls were this one.
+    /// `mem::take` is also the reset: the fields are moved out and the default is left behind, so
+    /// nothing is copied on the way. `attributes` carries a whole `sqlparser::ast::Statement`,
+    /// which a clone would deep-copy node by node.
     ///
-    /// ⭐ `mem::take` **is** the reset: it hands over the fields and leaves the default behind,
-    /// which is what `reset()` did afterwards, so the same two operations become one move.
-    ///
-    /// ⚠️ It is destructive on the error arm, where the old code left the context standing.
-    /// Nothing observes that: the sole caller `unwrap`s, and `CodecError::IncompleteEntry` —
-    /// the variant this error would travel in — is **declared and never constructed**. The
-    /// state machine fills all five fields in order before `Sql` is reached, so the arm is
-    /// unreachable rather than merely unused.
+    /// The take happens before the fields are checked, so an error arm leaves the context empty.
+    /// Nothing observes that: the state machine fills all five fields in order before `Sql` is
+    /// reached, so an error here is unreachable and the sole caller `unwrap`s.
     fn complete(&mut self) -> Result<Entry, EntryError> {
         let ctx = std::mem::take(self);
 
@@ -139,27 +145,19 @@ impl EntryContext {
     }
 }
 
-/// ⭐⭐⭐ THE FILE SCOPE, AS A VALUE A SHARD CAN BE HANDED.
+/// Everything a codec holds that is a fact about the *file* rather than about one entry: the
+/// header block, how many header blocks have been seen, and how many entries have been decoded.
 ///
-/// `EntryContext` is cleared between entries and the codec's own fields are not — that is the
-/// two-scope model `EntryContext::reset` exists to state, and it is already load-bearing: the
-/// log header lived in the per-entry struct once and the first completed entry destroyed it.
+/// This is the state to hand to a codec reading a later shard of the same log. Only the first
+/// shard holds the header, so without it a second shard states no server version — and a claim
+/// about MySQL's behaviour only means something inside the regime a version names.
 ///
-/// ⛔⛔ **BUT A SCOPE THAT CANNOT BE SEEDED IS NOT A SCOPE THAT SURVIVES A SPLIT.** The codec
-/// carries the file scope across **buffer** boundaries, which is what a `Decoder` is for. It
-/// cannot carry it across a **shard** boundary, because a shard of a log is a different file
-/// and only the first one holds the header — so a second shard reports `version: None`,
-/// `header_count: 0`, and every downstream claim about MySQL's behaviour loses the regime it
-/// holds in.
+/// It is `O(1)`: one header block and two counters, whatever the file's size.
+/// [`EntryCodec::file_scope`] produces one and [`EntryCodec::resume`] takes one, so splitting a
+/// log and reading a log in two buffers are the same operation.
 ///
-/// ⭐ This is the state to hand over, and it is `O(1)`: one header block and two counters,
-/// whatever the file's size. [`EntryCodec::file_scope`] produces one and
-/// [`EntryCodec::resume`] takes one, so *"split a log and merge the halves"* and *"read the log
-/// in two buffers"* become the same operation.
-///
-/// ⛔ **Produced and never authored**, like everything else that crosses a seam in this record:
-/// the only way to get one is to have read the prefix. A caller who hand-built one would be
-/// declaring a server that never wrote the bytes in front of it.
+/// Produced and never authored: the only way to get one is to have read the prefix. A
+/// hand-built one would declare a server that never wrote the bytes in front of it.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct FileScope {
     headers: Option<HeaderLines>,
@@ -178,8 +176,8 @@ impl FileScope {
         self.headers_seen
     }
 
-    /// Entries decoded so far. ⚠️ A **count**, which is what recovers a shard's `entry_id`
-    /// offset — a coordinate, and the reason a coordinate is never information.
+    /// Entries decoded so far. A count, which is what a consumer adds to a later shard's own
+    /// positions to recover each entry's position in the whole log.
     pub fn processed(&self) -> usize {
         self.processed
     }
@@ -188,28 +186,26 @@ impl FileScope {
 /// struct holding contextual information used while decoding
 #[derive(Debug, Default)]
 pub struct EntryCodec {
-    /// ⭐ File-scoped state, in one place because it is one scope. See [`FileScope`].
+    /// File-scoped state, in one place because it is one scope. See [`FileScope`].
     file: FileScope,
     context: EntryContext,
     config: EntryCodecConfig,
 }
 
 impl EntryCodec {
-    /// ⭐⭐⭐ Hand me your carried state — everything this codec holds that is not an entry's.
+    /// The state this codec carries that is not one entry's: see [`FileScope`].
     ///
-    /// Valid at any point; a caller holding a `FramedRead` reaches it through `decoder()`.
-    /// ⚠️ It does **not** include [`EntryContext`], and that is the scope distinction rather
-    /// than an omission: a half-read entry is not a fact about the file, and a shard boundary
-    /// is an **entry** boundary by construction — a chunked reader that cut mid-entry would be
-    /// splitting a statement, which is a different and unsupported thing.
+    /// Valid at any point; a caller holding a `FramedRead` reaches it through `decoder()`. It
+    /// does not include the half-read entry, which is not a fact about the file — a shard
+    /// boundary is an entry boundary by construction, and a cut mid-entry is not supported.
     pub fn file_scope(&self) -> &FileScope {
         &self.file
     }
 
-    /// ⭐⭐⭐ Resume from the state a previous shard left.
+    /// Resume from the state a previous shard left.
     ///
-    /// A shard of a log carries no header of its own; this is how the regime travels with the
-    /// seam. ⛔ The state must have been **produced** by reading the prefix — see [`FileScope`].
+    /// A shard of a log carries no header of its own; this is how the server version reaches it.
+    /// The state must have been produced by reading the prefix — see [`FileScope`].
     pub fn resume(c: EntryCodecConfig, file: FileScope) -> Self {
         Self {
             file,
@@ -217,21 +213,21 @@ impl EntryCodec {
             ..Default::default()
         }
     }
-    /// ⭐ The header lines the file opened with, or `None` where it had none.
+    /// The header lines the file opened with, or `None` where it had none.
     ///
     /// Valid once the first entry has been decoded; a caller holding a `FramedRead` reaches it
-    /// through `decoder()`. ⛔ `None` is `unmeasured` and never "the default server": a slow log
-    /// that has been rotated or concatenated begins mid-stream and states no regime at all.
+    /// through `decoder()`. `None` means the file states no server, and never "the default
+    /// server": a rotated or concatenated slow log begins mid-stream and names none.
     pub fn headers(&self) -> Option<&HeaderLines> {
         self.file.headers.as_ref()
     }
 
-    /// ⭐⭐ How many header blocks the file carried, which is how many servers claimed it.
+    /// How many header blocks the file carried, which is how many servers claimed it.
     ///
-    /// ⛔ More than one means the file is a CONCATENATION and its regime is not one thing. The
-    /// entries before the second header were written by one server and those after it by
-    /// another, and nothing else in any artifact would distinguish them. [`EntryCodec::headers`]
-    /// returns the first; this says whether "the first" is also "the only".
+    /// More than one means the file is a concatenation and no single server version holds over
+    /// it: the entries before the second header were written by one server and those after it by
+    /// another, and nothing else on an entry distinguishes them. [`EntryCodec::headers`] returns
+    /// the first; this says whether the first is also the only.
     pub fn header_count(&self) -> usize {
         self.file.headers_seen
     }
@@ -251,22 +247,16 @@ impl EntryCodec {
 
                 let res = opt(log_header).parse_next(i)?;
                 self.context.expects = CodecExpect::Time;
-                // ⛔ `Option`, NOT `unwrap_or_default`. A log with no header and a log whose
-                // header carried an empty version were the same value, so the one thing that
-                // states the server's regime could not be told from its own absence — and a
-                // rotated or concatenated slow log genuinely has no header.
+                // `Option` and not `unwrap_or_default`: a log with no header and a log whose
+                // header carried an empty version must not be the same value, since a rotated or
+                // concatenated slow log genuinely has no header.
                 //
-                // ⛔⛔ AND IT MUST NOT BE AN ASSIGNMENT, WHICH IS WHAT IT WAS. `decode` resets
-                // the context after every completed entry, so `expects` returns to `Header` and
-                // this arm runs again between EVERY pair of entries. A plain `self.headers =
-                // res` therefore set the version once and then overwrote it with `None` 309
-                // times. It survived a test that read one entry and vanished on any real file.
-                //
-                // ⭐ That the arm runs repeatedly is not a defect: a slow log can be rotated and
-                // concatenated, and a second header block mid-file means the rest of the entries
-                // were written by a different server. The FIRST is kept and the COUNT is
-                // recorded, so a file that declares two regimes says so rather than quietly
-                // presenting one.
+                // This arm runs again between every pair of entries, because completing an entry
+                // returns `expects` to `Header`. So the header must be kept rather than
+                // assigned: a plain assignment would overwrite the first file's version with
+                // `None` on the next entry. A second header block mid-file means the entries
+                // after it were written by a different server, so the first is kept and the
+                // count is recorded, and a file declaring two servers says so.
                 if let Some(h) = res {
                     self.file.headers_seen += 1;
                     if self.file.headers.is_none() {
@@ -299,14 +289,9 @@ impl EntryCodec {
             }
             CodecExpect::UseDatabase => {
                 let _ = multispace0(i)?;
-                // ⛔⛔ THIS WAS `let _ =`. The author said which schema every unqualified
-                // relation in the entry belongs to, the parser read it, and the codec threw it
-                // on the floor -- so `film` filed with no schema while the log said
-                // `use sakila;` two lines earlier.
-                //
-                // ⚠️ AND IT IS FILED ONLY WHERE THE LOG SAID IT. `USE` is sticky per connection
-                // and MySQL writes it when the database CHANGES, so later entries on the same
-                // thread inherit a database this entry never mentions. Carrying it forward is a
+                // Filed only where the log said it. `USE` is sticky per connection and MySQL
+                // writes it when the database changes, so later entries on the same thread
+                // inherit a database this entry never mentions. Carrying it forward is a
                 // reader's inference over the thread, and it belongs to whoever draws it.
                 self.context.use_database = opt(use_database).parse_next(i)?;
 
@@ -323,20 +308,18 @@ impl EntryCodec {
             CodecExpect::Sql => {
                 let _ = multispace0(i)?;
 
-                // ⛔ `opt`, NOT A BARE CALL. winnow rewinds only where a combinator takes a
-                // checkpoint; a parser that fails after consuming leaves the stream where it
-                // stopped. `admin_command(i)` discarded on `Err` therefore resumed mid-line,
-                // and `sql_lines` below read the remainder as the statement -- filing
-                // `InvalidStatement("DB;")` for `# administrator command: Init DB;`. `opt`
-                // restores the checkpoint on a backtrack and still propagates `Incomplete`,
-                // which is what a partial stream needs.
+                // `opt` and not a bare call: winnow rewinds only where a combinator takes a
+                // checkpoint, so a parser that fails after consuming leaves the stream where it
+                // stopped and `sql_lines` below would read the remainder of the line as the
+                // statement. `opt` restores the checkpoint on a backtrack and still propagates
+                // `Incomplete`, which is what a partial stream needs.
                 if let Some(c) = opt(admin_command).parse_next(i)? {
                     self.context.attributes = Some(EntrySqlAttributes {
                         sql: (c.command.clone()),
-                        // ⚠️ `None`, because a different parser consumed the line and its
-                        // framing. `sql` above is still the log's own bytes here -- the command
-                        // word -- so nothing is lost; there is simply no *statement* text to
-                        // file. `statement_kind` says which rows these are.
+                        // `None`, because a different parser consumed the line and its framing.
+                        // `sql` above is still the log's own bytes here -- the command word -- so
+                        // nothing is lost; there is simply no statement text to file. The
+                        // `EntryStatement` arm is what says so.
                         sql_raw: None,
                         literals: Vec::new(),
                         use_database: self.context.use_database.clone(),
@@ -351,24 +334,17 @@ impl EntryCodec {
 
                     let mut sql_lines = sql_lines(i)?;
 
-                    // ⭐⭐ THE AUTHOR'S OWN BYTES, KEPT. `Bytes` is refcounted, so this costs an
-                    // atomic increment and no copy -- and without it line ~230 below overwrites
-                    // the only surviving record of what the author wrote. That reassignment made
-                    // PARSE SUCCESS the thing that destroys the document: the 131 statements
-                    // nobody could read keep their text, and the 163 that parsed do not.
-                    //
-                    // ⭐ It also carries every literal as text even when masking is on, because
-                    // masking happens inside `parse_sql` and touches only the tree.
+                    // The author's own bytes, kept before the render below overwrites
+                    // `sql_lines`. `Bytes` is refcounted, so this is an atomic increment and no
+                    // copy. It also carries every literal as text even when masking is on,
+                    // because masking happens inside `parse_sql` and touches only the tree.
                     let sql_raw = sql_lines.clone();
                     let mut literals = Vec::new();
 
-                    // ⚠️ `str::from_utf8` FIRST, AND `from_utf8_lossy` ONLY WHERE IT REFUSES.
-                    // The two validate the same bytes and disagree about how: the lossy form
-                    // walks `Utf8Chunks`, which was 1.5% of this codec's instructions, while
-                    // `from_utf8` runs the word-at-a-time ASCII path. A slow log is ASCII on
-                    // nearly every line, so the fallback is what is rare — and it is kept,
-                    // because a statement whose bytes are not UTF-8 still has to reach the
-                    // reader as `invalid` rather than stopping the file.
+                    // `str::from_utf8` first and `from_utf8_lossy` only where it refuses: the
+                    // borrowed path is what a slow log almost always takes, and the lossy
+                    // fallback is kept so that a statement whose bytes are not UTF-8 reaches the
+                    // caller as an invalid statement rather than stopping the file.
                     let text = match std::str::from_utf8(&sql_lines) {
                         Ok(s) => Cow::Borrowed(s),
                         Err(_) => String::from_utf8_lossy(&sql_lines),
@@ -377,34 +353,28 @@ impl EntryCodec {
                     let s = if let Ok((mut parsed, ls)) = parse_sql(&text, &self.config.masking) {
                         literals = ls;
                         if parsed.len() == 1 {
-                            // ⭐⭐ NO MAPPER NOW CARRIES THE COMMENT THROUGH, RATHER THAN
-                            // DISCARDING IT. `map_comment_context` defaults to `None`, and
-                            // while `None` meant "drop the context" every consumer taking the
-                            // default got four NULL columns and no way to tell that from an
-                            // application that annotates nothing. Parsing a comment and then
-                            // throwing it away because nobody registered a function is not a
-                            // default anybody wants; the hook survives for consumers that want
-                            // to filter or reject, and doing nothing yields what was written.
+                            // With no mapper registered the comment's own pairs are carried
+                            // through rather than dropped: `map_comment_context` defaults to
+                            // `None`, and a consumer taking the default gets what the comment
+                            // wrote. The hook stays for consumers that want to filter, rename or
+                            // reject pairs.
                             let context: Option<SqlStatementContext> =
                                 details.and_then(|d| match &self.config.map_comment_context {
                                     Some(f) => f(d),
                                     None => SqlStatementContext::new(d),
                                 });
 
-                            // ⭐ MOVED OUT OF THE VEC, NOT COPIED OUT OF IT. `s[0].clone()`
-                            // deep-copied the whole AST and then dropped the `Vec` holding the
-                            // original two lines later — the other half of the 326
-                            // `Statement::clone` calls per pass over the shipped log. The
-                            // length is checked one line up, so `pop` is the element.
+                            // Moved out of the `Vec` rather than cloned out of it: the whole AST
+                            // would be deep-copied and the original dropped two lines later. The
+                            // length is checked one line up, so `pop` is that element.
                             let s = EntrySqlStatement {
                                 statement: parsed.pop().expect("length checked above"),
                                 context,
                             };
 
-                            // ⭐ SIZED FROM THE AUTHOR'S BYTES. `to_string()` starts a
-                            // `String` at capacity zero and doubles it, so rendering a
-                            // statement reallocated once per doubling; the render is within a
-                            // few bytes of the text it came from, so one allocation does it.
+                            // Sized from the author's bytes: the render is within a few bytes of
+                            // the text it came from, so one allocation does it where
+                            // `to_string()` would start at zero and double.
                             let mut rendered = String::with_capacity(sql_raw.len());
                             let _ = write!(rendered, "{}", s.statement);
 
@@ -448,26 +418,15 @@ impl Decoder for EntryCodec {
 
     /// calls `parse_next` and manages state changes and buffer fill
     ///
-    /// ⛔⛔ THIS TOOK THE WHOLE BUFFER OUT AND COPIED THE REMAINDER BACK, ONCE PER ENTRY.
-    /// `src.split()` emptied `src` and `src.extend_from_slice(i.as_bytes())` refilled it with
-    /// everything the entry had not consumed — so a decoder reading a 310-entry log through
-    /// `FramedRead`'s 8 KiB buffer moved on the order of **24 times the file's own size**
-    /// through `memcpy`, and reallocated the buffer each time because `split` had left it with
-    /// no capacity. `memcpy` was the single hottest symbol in the profile at 11.8%.
+    /// The buffer is advanced past what was consumed rather than split and refilled, which it
+    /// can be because the parsers copy whatever they keep: every `Bytes` this codec produces is
+    /// built with `copy_from_slice` or accumulated into a `BytesMut`, and nothing borrows the
+    /// input. Both exits share the arithmetic — consumed is what the stream no longer holds,
+    /// measured after any reset.
     ///
-    /// ⭐ The parsers copy what they keep — every `Bytes` this codec produces is built with
-    /// `copy_from_slice` or accumulated into a `BytesMut`, and nothing borrows the input — so
-    /// the buffer can simply be **advanced** past what was consumed. `BytesMut::advance` moves
-    /// a pointer. What the two exits share is the arithmetic: consumed is what the stream no
-    /// longer holds, measured after any reset.
-    ///
-    /// ⛔ AND THE LENGTH MARKER IS GONE, WHICH WAS NOT A GUARD AT ALL. It read the first four
-    /// bytes of a **text** log as a little-endian `u32` — `"# Ti"` — and compared it against
-    /// `LENGTH_MAX`, a constant of 10_000_000_000 that a `u32` cannot reach: the comparison was
-    /// **false for every possible input**. A slow log is not a length-prefixed frame format,
-    /// and the check that was supposed to bound a frame could not fire once. The `src.len() <
-    /// 4` line above it existed only to read that marker; an empty buffer is what actually has
-    /// nothing to parse, and the tail of a well-formed log is one newline.
+    /// There is no frame-length guard, because a slow log is not a length-prefixed frame format:
+    /// the first bytes of the buffer are text. An empty buffer is what has nothing to parse, and
+    /// the tail of a well-formed log is one newline.
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if src.is_empty() {
             return Ok(None);
@@ -497,10 +456,10 @@ impl Decoder for EntryCodec {
                     }
                 }
                 Err(ErrMode::Incomplete(_)) => {
-                    // ⚠️ Back to the last **completed stage**, not to the start of the buffer.
-                    // The stages before it are committed: their values are in `self.context`
-                    // and their bytes are spent, which is what makes this a streaming decoder
-                    // rather than one that re-reads a partial entry on every poll.
+                    // Back to the last completed stage, not to the start of the buffer. The
+                    // stages before it are committed: their values are in `self.context` and
+                    // their bytes are spent, which is what makes this a streaming decoder rather
+                    // than one that re-reads a partial entry on every poll.
                     i.reset(&start);
 
                     break (None, i.len());
@@ -711,7 +670,10 @@ GROUP BY film2.film_id, category.name;
         // and unparseable statements, so the example moved rather than the assertion — and it
         // moved to `ALTER TABLE … DISABLE KEYS`, which is still refused and is the largest
         // refused family this corpus has.
-        assert_eq!(invalid, 1, "the mix is the subject, so the arm keeps a witness");
+        assert_eq!(
+            invalid, 1,
+            "the mix is the subject, so the arm keeps a witness"
+        );
     }
 
     #[tokio::test]
@@ -1010,11 +972,10 @@ mod graph_census {
             // ⛔⛔ AND THE COMPARISON HAS TO STRIP BACKTICKS, WHICH IS ITSELF A DEFECT.
             // `ObjectNamePart`'s `Display` renders the quote style and `objects()` builds its
             // names with `to_string()`, so `` `actor` `` and `actor` come out as two different
-            // relations. `PLAN-2026-09-22-02-fusion.md:161` records exactly that as measured
-            // data -- ``actor -> ['`actor`', 'actor', 'sakila.actor']`` -- and files all three
-            // under a reader's mapping of spellings onto tables. One of the three is not a
-            // spelling difference at all. The parse has carried the unquoted value the whole
-            // time; only the accessor threw it away.
+            // relations -- so a consumer mapping spellings onto tables sees `actor` in backticks,
+            // `actor` bare and `sakila.actor` as three, one of which is not a spelling difference
+            // at all. The parse has carried the unquoted value the whole time; only the accessor
+            // threw it away.
             for o in s.objects() {
                 let raw = o.object_name();
                 let bare = raw.trim_matches('`');
@@ -1066,21 +1027,19 @@ mod graph_census {
         assert_eq!(with_graph, 259, "statements with an AST to walk");
 
         // ⭐ The seven `CREATE VIEW`s are the whole of this log's structure, and all 39 relations
-        // they mention sit in a view body -- NAMED, never read. `PLAN-2026-09-22-02-fusion.md`
-        // measures an elimination of 1.80% against `query_time` over exactly these statements and
-        // says at :128 that "every k >= 2 statement in this fixture is a CREATE VIEW". The flat
-        // `objects` set cannot tell a table scanned from a table named in a DDL body, so that
-        // 1.80% is drawn entirely from statements that touched none of the tables it weights.
+        // they mention sit in a view body -- NAMED, never read. Every multi-relation statement in
+        // this fixture is a `CREATE VIEW`, so a total over tables weighted by `query_time` is
+        // drawn entirely from statements that touched none of the tables it weights: the flat
+        // `objects` set cannot tell a table scanned from a table named in a DDL body.
         assert_eq!(view_bodies, 7, "every multi-relation statement is a view");
         assert_eq!(named_only, 39, "relations named in a body, not scanned");
 
         // ⭐⭐ ONE non-tree descent in 259 statements, and it is `actor_info`: its correlated
         // subquery rebinds `fa` and `fc`, and the two correlation edges close a cycle.
-        // `rank/composition_closure.sqlc` computes a kernel two ways and says they "agree
-        // exactly where the descent is a tree"; every layer graph in that corpus is a forest, so
-        // the disagreeing case has never had a witness. This is one. A population of one is thin
-        // and it is not zero, which is the difference between a law that is suspended and a law
-        // that is vacuous.
+        // Two routes to the same kernel agree exactly where the descent is a tree, so a
+        // non-tree descent is the case that can tell them apart. This is the only one here. A
+        // population of one is thin and it is not zero, which is the difference between a law
+        // that is suspended and a law that is vacuous.
         assert_eq!(non_tree, 1, "actor_info, and nothing else");
 
         // ⛔⛔ TEN OF THESE DID NOT EXIST, AND THEY ARE THE ONLY DDL IN THIS LOG THAT CAN BLOCK
@@ -1241,8 +1200,8 @@ mod the_author_and_the_reader {
     /// a `Decoder` is. It could not carry it across a **shard** boundary, because a shard is a
     /// different file and only the first one holds the header. So a second shard read `version:
     /// None`, `header_count: 0`, and every downstream claim about MySQL's behaviour lost the
-    /// regime it holds in — while `mysql-slowlog-analyzer`'s merge laws all re-attached the
-    /// header to every shard and could not see it.
+    /// regime it holds in — and a consumer that re-attached the header to every shard before
+    /// reading it could not see that happening.
     ///
     /// ⭐ Three readings of one log, and the third is the repair:
     ///
