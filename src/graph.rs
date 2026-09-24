@@ -32,8 +32,12 @@
 
 use bytes::Bytes;
 use sqlparser::ast::{
+    ShowCreateObject,
     Cte, Delete, Distinct, Expr, FromTable, GroupByExpr, Insert, JoinConstraint, JoinOperator,
-    LockTableType, ObjectName, ObjectNamePart, ObjectType, OrderByKind, Query, Select, SetExpr,
+    LockClause, LockTableType, LockType, NonBlock, ObjectName, ObjectNamePart, ObjectType,
+    OnInsert, OptimizerHintStyle, OrderByKind, Query, Select, SetExpr, TableIndexHintForClause,
+    TableIndexHintType,
+    TableIndexType,
     Statement, TableFactor, TableObject, TableWithJoins, UpdateTableFromKind, visit_expressions,
 };
 use std::ops::ControlFlow;
@@ -88,6 +92,20 @@ pub enum RelationRole {
     LockSharedTarget,
     /// the relation an `ANALYZE TABLE` samples
     AnalyzeTarget,
+    /// Named by a statement that opens the table, takes a **shared** metadata lock and reads no
+    /// rows: `EXPLAIN t`, `DESCRIBE t`, `SHOW CREATE TABLE t`, `SHOW COLUMNS FROM t`.
+    ///
+    /// ⭐ Not `From`. These read the data **dictionary** rather than the table, so a reader taking
+    /// `rows_examined` against them is right to see a zero, and a reader asking who held a
+    /// metadata lock is right to see them. Folding them into `From` would make the first
+    /// unreadable; dropping them made the second, which is what this arm repairs.
+    MetadataTarget,
+    /// `FLUSH TABLES t` — takes an **exclusive** metadata lock and closes the table.
+    ///
+    /// ⚠️ Filed apart from [`RelationRole::MetadataTarget`] because the lock is the opposite one:
+    /// this excludes every reader, exactly as a DDL does, and that is a different claim about
+    /// MySQL from the one above.
+    FlushTarget,
 }
 
 /// The kind of naming scope a relation occurrence was found in.
@@ -236,12 +254,26 @@ pub enum PredicateOp {
     NullSafeEq,
     /// `IN (a, b, c)` — a finite set of points.
     InList,
+    /// `NOT IN (a, b, c)` — everything outside a finite set.
+    NotInList,
     /// `BETWEEN lo AND hi`
     Between,
+    /// `NOT BETWEEN lo AND hi` — everything outside a range, which is not a range.
+    NotBetween,
     /// `LIKE` or `ILIKE`.
     Like,
-    /// `IS NULL` or `IS NOT NULL`.
+    /// `NOT LIKE`.
+    NotLike,
+    /// `REGEXP` or `RLIKE`.
+    Regexp,
+    /// `NOT REGEXP` or `NOT RLIKE`.
+    NotRegexp,
+    /// `MATCH (…) AGAINST (…)` — a fulltext search, which uses a `FULLTEXT` index and no other.
+    MatchAgainst,
+    /// `IS NULL`.
     IsNull,
+    /// `IS NOT NULL`, which selects the complement of what [`Self::IsNull`] selects.
+    IsNotNull,
     /// `IN (SELECT …)`
     InSubquery,
     /// `NOT IN (SELECT …)`
@@ -314,6 +346,20 @@ pub struct Predicate {
     pub rhs_kind: RhsKind,
     /// The subquery's scope, where `rhs_kind` is [`RhsKind::Subquery`].
     pub rhs_scope: Option<u32>,
+    /// The occurrence the join brought in, where this split was written in a join clause.
+    ///
+    /// `clause` says a split sat in an `ON`, and with two joins in one statement that is not
+    /// enough to say **which**. This names the join: it is the occurrence on the right of the
+    /// join operator, which is what [`Edge::rhs_occ`] carries, so the pair joins on it and the
+    /// operator above the split becomes readable.
+    ///
+    /// ⛔ That operator is not decoration. `A LEFT JOIN B ON p` is a **union** —
+    /// `(A ⋈ B) ∪ ((A − π_A(A ⋈ B)) × {NULL})` — so `p` restricts `B` and does not remove one
+    /// row of `A`, while the same `p` in a `WHERE` removes rows and nullifies the outerness.
+    /// `path` cannot see any of that: the join sits above the boolean tree it describes.
+    ///
+    /// `None` on a `WHERE`, `HAVING` or projection split, which no join clause encloses.
+    pub join_occ: Option<u32>,
 }
 
 /// Which set operation combined two queries.
@@ -355,6 +401,122 @@ pub enum SortDirections {
     NotApplicable,
 }
 
+/// The row lock a scope's `FOR UPDATE` / `FOR SHARE` clause asks for.
+///
+/// A scope with `None` here is an ordinary read, whose isolation from a concurrent write is
+/// decided by the transaction isolation level. The other two are taken whatever that level is.
+#[derive(Copy, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum LockStrength {
+    /// no locking clause
+    #[default]
+    None,
+    /// `FOR SHARE`: other readers admitted, writers excluded
+    Shared,
+    /// `FOR UPDATE`: readers of the same rows under a locking read excluded, and writers
+    Exclusive,
+    /// A locking clause MySQL has no syntax for — `FOR UPDATE OF t`, which names the table to
+    /// lock. A diagnostic and not data, held to zero on a MySQL corpus.
+    NotMySql,
+}
+
+/// What a locking scope does when the rows it wants are already locked.
+///
+/// `Wait` is the default and is what `Lock_time` measures. Under the other two a statement
+/// reports no lock wait by construction, so a zero there is not evidence of no contention.
+#[derive(Copy, Clone, Debug, Default, Eq, Hash, PartialEq)]
+pub enum LockWait {
+    /// block until the lock is available, or until `innodb_lock_wait_timeout`
+    #[default]
+    Wait,
+    /// `NOWAIT`: fail immediately instead of waiting
+    NoWait,
+    /// `SKIP LOCKED`: omit the locked rows from the result instead of waiting
+    SkipLocked,
+}
+
+/// What an index hint tells the optimiser to do with the indexes it names.
+///
+/// MySQL's own ordering: `USE` is a suggestion the optimiser may decline, `FORCE` is a `USE` that
+/// also makes a table scan maximally expensive, and `IGNORE` removes the named indexes from
+/// consideration.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum IndexHintKind {
+    /// `USE INDEX (…)`
+    Use,
+    /// `FORCE INDEX (…)`
+    Force,
+    /// `IGNORE INDEX (…)`
+    Ignore,
+}
+
+/// Which part of the statement an index hint applies to.
+///
+/// `Any` is a hint written without a `FOR` clause, which MySQL applies to every part. It is a
+/// written absence and not a blank: the author wrote a hint and named no scope for it.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum IndexHintScope {
+    /// no `FOR` clause
+    Any,
+    /// `FOR JOIN`
+    Join,
+    /// `FOR ORDER BY`
+    OrderBy,
+    /// `FOR GROUP BY`
+    GroupBy,
+}
+
+/// An index hint the author wrote against one relation occurrence.
+///
+/// This is the only construct in a slow log that names an index. Every other claim this crate
+/// makes about access paths is a claim about the region a predicate sought, because the index
+/// that would serve it is schema and a slow log carries none — so the rows here are the
+/// exception, and they are the author's own words rather than a reader's inference.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IndexHint {
+    /// the occurrence the hint was written against
+    pub occ: u32,
+    /// what the hint tells the optimiser to do
+    pub kind: IndexHintKind,
+    /// which part of the statement it applies to
+    pub scope: IndexHintScope,
+    /// the index names, as the author spelled them
+    pub names: Vec<Bytes>,
+    /// whether the author wrote `KEY` rather than `INDEX`. The two are synonyms in MySQL, and
+    /// this records which word was used rather than asserting they differ.
+    pub spelled_key: bool,
+}
+
+/// A partition the author restricted an occurrence to.
+///
+/// `FROM t PARTITION (p0, p1)` is the author naming which partitions may be read. A partitioned
+/// table carries a local index per partition, so a restriction here decides which index trees exist
+/// to be walked — and two statements restricted to disjoint partitions touch no page in common.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Partition {
+    /// the occurrence the restriction was written against
+    pub occ: u32,
+    /// the partition name, as the author spelled it
+    pub name: Bytes,
+}
+
+/// One optimizer-hint comment the author wrote, carried as the author's own bytes.
+///
+/// `/*+ NO_ICP(t idx) NO_MRR(t) */` names index access methods outright, which makes it the same
+/// family as an index hint. One row per **comment** and not per hint: `sqlparser` hands the whole
+/// comment body over as raw text without separating the hints inside it, so naming each hint, its
+/// target table and its target index would be this walk lexing where everything else parses.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OptimizerHintText {
+    /// the scope the hint was written in
+    pub scope: u32,
+    /// the hint's own text, without the comment markers
+    pub text: Bytes,
+    /// a prefix between the comment marker and `+`, empty for a standard `/*+ ... */`
+    pub prefix: Bytes,
+    /// whether the author wrote the hint as a block comment or a line comment
+    pub line_comment: bool,
+}
+
 /// A naming scope: the statement itself, or something nested inside it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Scope {
@@ -380,6 +542,32 @@ pub struct Scope {
     /// `Query_time` for the whole pipeline and nothing per stage, so what a stage cost is not in
     /// the document at any setting — the same standing a relation occurrence's figure has.
     pub stages: Stages,
+    /// The row lock this scope's own `FOR UPDATE` / `FOR SHARE` asks for.
+    ///
+    /// Per scope, because MySQL locks the tables of the block the clause is written in: a
+    /// subquery under a locking outer select is not itself locked unless it says so.
+    pub locking: LockStrength,
+    /// What this scope does when the rows it wants are already locked. `Wait` where
+    /// [`Self::locking`] is [`LockStrength::None`], since nothing is being waited for.
+    pub lock_wait: LockWait,
+}
+
+/// The lock a `FOR UPDATE` / `FOR SHARE` clause asks for, and what it does when it cannot have
+/// it.
+fn locking_of(lock: &LockClause) -> (LockStrength, LockWait) {
+    let strength = match (&lock.of, &lock.lock_type) {
+        // `FOR UPDATE OF t` names the table to lock. MySQL has no such clause, so a tree
+        // carrying one is not a tree this server could have run.
+        (Some(_), _) => LockStrength::NotMySql,
+        (None, LockType::Share) => LockStrength::Shared,
+        (None, LockType::Update) => LockStrength::Exclusive,
+    };
+    let wait = match lock.nonblock {
+        None => LockWait::Wait,
+        Some(NonBlock::Nowait) => LockWait::NoWait,
+        Some(NonBlock::SkipLocked) => LockWait::SkipLocked,
+    };
+    (strength, wait)
 }
 
 /// What one scope does to its rows, counted rather than judged.
@@ -551,6 +739,12 @@ pub struct StatementGraph {
     pub edges: Vec<Edge>,
     /// every comparison the statement wrote, with its place in the boolean tree
     pub predicates: Vec<Predicate>,
+    /// the index hints the author wrote, which is the only place a slow log names an index
+    pub index_hints: Vec<IndexHint>,
+    /// the partitions the author restricted an occurrence to
+    pub partitions: Vec<Partition>,
+    /// the optimizer hints the author wrote, as their own bytes
+    pub optimizer_hints: Vec<OptimizerHintText>,
 }
 
 impl StatementGraph {
@@ -744,6 +938,8 @@ impl Builder {
             name,
             recursive,
             stages: Stages::default(),
+            locking: LockStrength::None,
+            lock_wait: LockWait::Wait,
         });
         id
     }
@@ -879,7 +1075,9 @@ impl Builder {
     fn walk_statement(&mut self, statement: &Statement, scope: u32) {
         match statement {
             Statement::Query(q) => self.walk_query(q, scope),
-            Statement::Insert(Insert { table, source, .. }) => {
+            Statement::Insert(Insert {
+                table, source, on, ..
+            }) => {
                 if let TableObject::TableName(name) = table {
                     self.push_occurrence(scope, Some(name), None, RelationRole::InsertTarget);
                 }
@@ -888,18 +1086,30 @@ impl Builder {
                 if let Some(q) = source {
                     self.walk_query(q, scope);
                 }
+                // `ON DUPLICATE KEY UPDATE x = (SELECT …)` reads a relation that is not the
+                // insert target, in a clause nothing else here reaches.
+                if let Some(OnInsert::DuplicateKeyUpdate(assignments)) = on {
+                    for a in assignments {
+                        self.walk_expr(&a.value, scope);
+                    }
+                }
             }
             Statement::Update(u) => {
                 let (table, from, selection) = (&u.table, &u.from, &u.selection);
                 // ⚠️ MySQL's multi-table `UPDATE a JOIN b` puts a whole join graph in the TARGET
                 // position, so this is a `TableWithJoins` and not a name.
-                let ids = self.collect_from(std::slice::from_ref(table), scope, true);
+                let ids = self.collect_from(std::slice::from_ref(table), scope, RelationRole::UpdateTarget);
                 self.join_edges(std::slice::from_ref(table), scope, &ids);
                 if let Some(UpdateTableFromKind::BeforeSet(f) | UpdateTableFromKind::AfterSet(f)) =
                     from
                 {
-                    let ids = self.collect_from(f, scope, false);
+                    let ids = self.collect_from(f, scope, RelationRole::From);
                     self.join_edges(f, scope, &ids);
+                }
+                // `SET n = (SELECT … FROM other)` reads `other`. `objects()` sees it, because
+                // `Assignment.value` carries the `visit_relation` annotation.
+                for a in &u.assignments {
+                    self.walk_expr(&a.value, scope);
                 }
                 // ⭐⭐ AN `UPDATE`/`DELETE` WHERE IS A FILTER STAGE WITH NO `Select` AT ALL, so
                 // it is recorded here or nowhere. A scope is not one `Select` and this is the
@@ -926,10 +1136,19 @@ impl Builder {
                     self.push_occurrence(scope, Some(name), None, RelationRole::DeleteTarget);
                 }
                 let (FromTable::WithFromKeyword(f) | FromTable::WithoutKeyword(f)) = from;
-                let ids = self.collect_from(f, scope, false);
+                // `tables` is populated only by the multi-table `DELETE a, b FROM …` form.
+                // With it empty the `FROM` names the relation being deleted from — whether or
+                // not a `USING` clause supplies the source — so the target role is decided here
+                // and nowhere else.
+                let base = if tables.is_empty() {
+                    RelationRole::DeleteTarget
+                } else {
+                    RelationRole::From
+                };
+                let ids = self.collect_from(f, scope, base);
                 self.join_edges(f, scope, &ids);
                 if let Some(u) = using {
-                    let ids = self.collect_from(u, scope, false);
+                    let ids = self.collect_from(u, scope, RelationRole::From);
                     self.join_edges(u, scope, &ids);
                 }
                 // ⭐⭐ AN `UPDATE`/`DELETE` WHERE IS A FILTER STAGE WITH NO `Select` AT ALL, so
@@ -1043,6 +1262,16 @@ impl Builder {
                     self.push_occurrence(scope, Some(name), None, RelationRole::DropTarget);
                 }
             }
+            // `DROP INDEX idx ON t` alters `t` rather than dropping it, which is what MySQL does
+            // with it, and it takes the same exclusive metadata lock `CREATE INDEX` does. The
+            // index is named in `names` and the relation in `table`; only the relation is filed.
+            Statement::Drop {
+                object_type: ObjectType::Index,
+                table: Some(name),
+                ..
+            } => {
+                self.push_occurrence(scope, Some(name), None, RelationRole::AlterTarget);
+            }
             // ⚠️ WHAT IS STILL NOT WALKED, AND WHY, because "every other form names nothing" was
             // wrong twice already:
             //
@@ -1053,13 +1282,65 @@ impl Builder {
             // | `EXPLAIN t` / `DESCRIBE t` | `ExplainTable.table_name`, annotated | ⛔ not walked — reads the dictionary |
             // | `EXPLAIN SELECT … FROM t` | `Explain.statement`, a whole `Statement` | ⛔⛔ not walked — and this row did not exist. The form above is `ExplainTable`; THIS one wraps an entire query whose `FROM` names a relation the walk drops. `EXPLAIN` plans without executing: it opens the table and takes a shared metadata lock, and reads **no rows**. Filing it as a read would put a demand on `demand.parquet` for a statement that examined nothing; filing nothing loses a metadata-lock holder. The second is chosen because the first invents a figure, and `rows_examined = 0` is what the record has to show for it. |
             // | `OPTIMIZE` / `CHECK` / `REPAIR TABLE` | — | ⛔ `sqlparser` refuses them outright |
-            // | `DROP INDEX idx ON t` | — | ⛔ `sqlparser` refuses MySQL's form |
             // | `LOAD DATA INFILE … INTO TABLE t` | — | ⛔ `sqlparser` refuses MySQL's form |
             // | `a CROSS JOIN b ON …` | — | ⛔ `sqlparser` refuses it; in MySQL `JOIN`, `CROSS JOIN` and `INNER JOIN` are **syntactic equivalents** and all three take an `ON` |
             //
             // ⛔ The annotated ones are held by a law rather than by this comment:
             // `nothing objects() found may be missing from the graph` fires the moment one
             // appears in a corpus, which is what makes the row above a decision and not a gap.
+            // ⭐⭐ `EXPLAIN <statement>` WRAPS A WHOLE STATEMENT AND THE WALK DROPPED ALL OF IT.
+            //
+            // `EXPLAIN SELECT id FROM t WHERE id = 5` named `t` in no artifact and filed the
+            // split in none -- while the literal scan is a separate visitor and ran anyway, so
+            // the record said *the author went for `id = 5`* and `relation_source = unmeasured`
+            // in a statement naming exactly one relation. That `unmeasured` was this walk's own
+            // gap wearing an absence arm, which is the one thing the absence vocabulary exists
+            // to prevent.
+            //
+            // ⭐ Descended into rather than given a role of its own. The relations take their
+            // ordinary roles, `rows_examined` is the measured zero `EXPLAIN` earns, and
+            // `sql_type` already says the statement was an `EXPLAIN` -- so a reader holding all
+            // three has what a role would have told them, without this walk asserting it.
+            Statement::Explain { statement, .. } => self.walk_statement(statement, scope),
+            // `EXPLAIN t` / `DESCRIBE t` -- a name and no statement.
+            Statement::ExplainTable { table_name, .. } => {
+                self.push_occurrence(scope, Some(table_name), None, RelationRole::MetadataTarget);
+            }
+            Statement::ShowCreate { obj_type, obj_name } => {
+                // ⚠️ Only the two that name a relation. `SHOW CREATE FUNCTION|PROCEDURE|EVENT|
+                // TRIGGER` names a routine, which is not a relation and has nowhere to go here.
+                if matches!(obj_type, ShowCreateObject::Table | ShowCreateObject::View) {
+                    self.push_occurrence(scope, Some(obj_name), None, RelationRole::MetadataTarget);
+                }
+            }
+            Statement::ShowColumns { show_options, .. } => {
+                // ⛔ `SHOW COLUMNS FROM t` puts `t` in `show_in.parent_name`, and so does
+                // `SHOW TABLES FROM db` -- where the name is a **schema**. The clause is what
+                // tells them apart, and reading the name without it is the defect `objects()`
+                // has: it files `mysql` from `SHOW TABLES FROM mysql` as though it were a table.
+                if let Some(show_in) = &show_options.show_in {
+                    if let Some(name) = &show_in.parent_name {
+                        self.push_occurrence(scope, Some(name), None, RelationRole::MetadataTarget);
+                    }
+                }
+            }
+            Statement::Flush { tables, .. } => {
+                for name in tables {
+                    self.push_occurrence(scope, Some(name), None, RelationRole::FlushTarget);
+                }
+            }
+            // ⛔ WHAT IS STILL DECLINED, AND WHY IT IS A DECISION RATHER THAN A GAP:
+            //
+            // | statement | names | declined because |
+            // |---|---|---|
+            // | `SHOW TABLES FROM db` | a **schema** | not a relation. `objects()` files it as one, which is the single exception its own law records |
+            // | `GRANT SELECT ON db.* TO …` | a **privilege scope** | `db.*` is a wildcard over a schema; the statement opens no table and takes no lock on one |
+            // | `REVOKE … ON db.* FROM …` | the same | the same |
+            // | `CREATE|DROP DATABASE db` | a schema | a relation artifact has nowhere to put one |
+            // | `SET`, `KILL`, `FLUSH` with no table list, `SAVEPOINT`, `USE` | nothing | no relation is named at all |
+            //
+            // ⚠️ The first four name something; the last names nothing, and those are two
+            // different reasons that happen to reach the same filing.
             _ => {}
         }
     }
@@ -1078,12 +1359,16 @@ impl Builder {
         }
         // ⚠️ ORDER BY AND LIMIT HANG OFF THE `Query`, NOT OFF THE `Select`, so they are read
         // here and filed on the scope the query heads.
+        let mut ordered: Vec<Expr> = Vec::new();
         let st = &mut self.graph.scopes[scope as usize].stages;
         match &query.order_by {
             Some(o) => match &o.kind {
                 OrderByKind::Expressions(terms) => {
                     st.sort_terms += terms.len() as u32;
-                    st.sort_directions = directions_of(terms);
+                    let (directions, not_mysql) = directions_of(terms);
+                    st.sort_directions = directions;
+                    st.not_mysql |= not_mysql;
+                    ordered = terms.iter().map(|t| t.expr.clone()).collect();
                 }
                 // ⛔ `ORDER BY ALL` is not MySQL.
                 OrderByKind::All(_) => st.not_mysql = true,
@@ -1096,7 +1381,22 @@ impl Builder {
             st.limit_rows = st.limit_rows.or(rows);
             st.limit_offset = st.limit_offset.or(offset);
         }
+        for lock in &query.locks {
+            let (strength, wait) = locking_of(lock);
+            // A scope may carry more than one clause; the stronger claim is the one that holds.
+            if strength > self.graph.scopes[scope as usize].locking {
+                self.graph.scopes[scope as usize].locking = strength;
+            }
+            if wait != LockWait::Wait {
+                self.graph.scopes[scope as usize].lock_wait = wait;
+            }
+        }
         self.walk_set_expr(&query.body, scope);
+        // `ORDER BY (SELECT …)` sorts on a relation no `FROM` names. Walked after the body so
+        // the scope is the one the body established.
+        for e in &ordered {
+            self.walk_expr(e, scope);
+        }
     }
 
     fn walk_set_expr(&mut self, body: &SetExpr, scope: u32) {
@@ -1124,7 +1424,15 @@ impl Builder {
             SetExpr::Insert(s) | SetExpr::Update(s) | SetExpr::Delete(s) => {
                 self.walk_statement(s, scope)
             }
-            SetExpr::Values(_) | SetExpr::Table(_) => {}
+            // A `VALUES` row may hold a scalar subquery, which reads a relation of its own.
+            SetExpr::Values(values) => {
+                for row in &values.rows {
+                    for e in &row.content {
+                        self.walk_expr(e, scope);
+                    }
+                }
+            }
+            SetExpr::Table(_) => {}
         }
     }
 
@@ -1177,10 +1485,18 @@ impl Builder {
 
     fn walk_select(&mut self, select: &Select, scope: u32) {
         self.record_stages(select, scope);
+        for h in &select.optimizer_hints {
+            self.graph.optimizer_hints.push(OptimizerHintText {
+                scope,
+                text: Bytes::copy_from_slice(h.text.as_bytes()),
+                prefix: Bytes::copy_from_slice(h.prefix.as_bytes()),
+                line_comment: matches!(h.style, OptimizerHintStyle::SingleLine { .. }),
+            });
+        }
         // ⭐ TWO PASSES, AND THE ORDER IS THE POINT. Every occurrence has to exist before any
         // predicate is resolved, because a join's `ON` clause routinely names a relation the
         // parser has not reached yet and a one-pass walk would drop that edge.
-        let ids = self.collect_from(&select.from, scope, false);
+        let ids = self.collect_from(&select.from, scope, RelationRole::From);
         self.join_edges(&select.from, scope, &ids);
 
         let clauses = [
@@ -1202,6 +1518,7 @@ impl Builder {
                 ConstraintKind::On,
                 clause,
                 true,
+                None,
                 &mut path,
             );
         }
@@ -1218,6 +1535,7 @@ impl Builder {
                     ConstraintKind::On,
                     Clause::Projection,
                     true,
+                    None,
                     &mut path,
                 );
             }
@@ -1225,14 +1543,17 @@ impl Builder {
     }
 
     /// Pass one: every relation occurrence in a `FROM` list, in written order.
-    fn collect_from(&mut self, from: &[TableWithJoins], scope: u32, target: bool) -> Vec<Vec<u32>> {
+    /// `base` is the role the first relation of each `FROM` item takes. It is a parameter and
+    /// not a constant because the same syntactic position means different things per statement:
+    /// a `SELECT`'s is read, an `UPDATE`'s is written, and a single-table `DELETE`'s is deleted.
+    fn collect_from(
+        &mut self,
+        from: &[TableWithJoins],
+        scope: u32,
+        base: RelationRole,
+    ) -> Vec<Vec<u32>> {
         from.iter()
             .map(|twj| {
-                let base = if target {
-                    RelationRole::UpdateTarget
-                } else {
-                    RelationRole::From
-                };
                 let mut ids = vec![self.walk_table_factor(&twj.relation, scope, base)];
                 for j in &twj.joins {
                     ids.push(self.walk_table_factor(&j.relation, scope, RelationRole::Join));
@@ -1271,6 +1592,7 @@ impl Builder {
                         constraint,
                         Clause::On,
                         false,
+                        Some(rhs),
                         &mut path,
                     );
                 }
@@ -1293,9 +1615,40 @@ impl Builder {
 
     fn walk_table_factor(&mut self, tf: &TableFactor, scope: u32, role: RelationRole) -> u32 {
         match tf {
-            TableFactor::Table { name, alias, .. } => {
+            TableFactor::Table {
+                name,
+                alias,
+                index_hints,
+                partitions,
+                ..
+            } => {
                 let a = alias.as_ref().map(|a| ident_bytes(&a.name));
-                self.push_occurrence(scope, Some(name), a, role)
+                let occ = self.push_occurrence(scope, Some(name), a, role);
+                for p in partitions {
+                    self.graph.partitions.push(Partition {
+                        occ,
+                        name: ident_bytes(p),
+                    });
+                }
+                for h in index_hints {
+                    self.graph.index_hints.push(IndexHint {
+                        occ,
+                        kind: match h.hint_type {
+                            TableIndexHintType::Use => IndexHintKind::Use,
+                            TableIndexHintType::Force => IndexHintKind::Force,
+                            TableIndexHintType::Ignore => IndexHintKind::Ignore,
+                        },
+                        scope: match h.for_clause {
+                            None => IndexHintScope::Any,
+                            Some(TableIndexHintForClause::Join) => IndexHintScope::Join,
+                            Some(TableIndexHintForClause::OrderBy) => IndexHintScope::OrderBy,
+                            Some(TableIndexHintForClause::GroupBy) => IndexHintScope::GroupBy,
+                        },
+                        names: h.index_names.iter().map(ident_bytes).collect(),
+                        spelled_key: matches!(h.index_type, TableIndexType::Key),
+                    });
+                }
+                occ
             }
             TableFactor::Derived {
                 subquery, alias, ..
@@ -1316,7 +1669,7 @@ impl Builder {
             } => {
                 let a = alias.as_ref().map(|a| ident_bytes(&a.name));
                 let occ = self.push_occurrence(scope, None, a, role);
-                let ids = self.collect_from(std::slice::from_ref(table_with_joins), scope, false);
+                let ids = self.collect_from(std::slice::from_ref(table_with_joins), scope, RelationRole::From);
                 self.join_edges(std::slice::from_ref(table_with_joins), scope, &ids);
                 occ
             }
@@ -1430,7 +1783,7 @@ impl Builder {
     /// none of their own.
     fn predicate_edges(&mut self, expr: &Expr, scope: u32, op: JoinOp, constraint: ConstraintKind) {
         let mut path = Vec::new();
-        self.walk_condition(expr, scope, op, constraint, Clause::Where, true, &mut path);
+        self.walk_condition(expr, scope, op, constraint, Clause::Where, true, None, &mut path);
     }
 
     /// Walks one condition, emitting the edges it draws and the splits it writes.
@@ -1451,6 +1804,7 @@ impl Builder {
         constraint: ConstraintKind,
         clause: Clause,
         emit_edges: bool,
+        join_occ: Option<u32>,
         path: &mut Vec<PathStep>,
     ) {
         use sqlparser::ast::BinaryOperator as B;
@@ -1466,11 +1820,11 @@ impl Builder {
                     _ => Connective::And,
                 };
                 path.push(PathStep { connective, branch: 0 });
-                self.walk_condition(left, scope, op, constraint, clause, emit_edges, path);
+                self.walk_condition(left, scope, op, constraint, clause, emit_edges, join_occ, path);
                 if let Some(last) = path.last_mut() {
                     last.branch = 1;
                 }
-                self.walk_condition(right, scope, op, constraint, clause, emit_edges, path);
+                self.walk_condition(right, scope, op, constraint, clause, emit_edges, join_occ, path);
                 path.pop();
             }
             Expr::BinaryOp { left, right, op: b } => {
@@ -1493,7 +1847,7 @@ impl Builder {
                         Some(_) => (RhsKind::Subquery, PredicateOp::Scalar),
                         None => (rhs_kind_of(right), pop),
                     };
-                    self.push_predicate(scope, clause, path, pop, left, right, rhs_kind, rhs_scope);
+                    self.push_predicate(scope, clause, path, pop, left, right, rhs_kind, rhs_scope, join_occ);
                 }
             }
             Expr::UnaryOp {
@@ -1504,13 +1858,13 @@ impl Builder {
                     connective: Connective::Not,
                     branch: 0,
                 });
-                self.walk_condition(e, scope, op, constraint, clause, emit_edges, path);
+                self.walk_condition(e, scope, op, constraint, clause, emit_edges, join_occ, path);
                 path.pop();
             }
             Expr::Nested(e) | Expr::UnaryOp { expr: e, .. } => {
-                self.walk_condition(e, scope, op, constraint, clause, emit_edges, path)
+                self.walk_condition(e, scope, op, constraint, clause, emit_edges, join_occ, path)
             }
-            Expr::IsNull(e) | Expr::IsNotNull(e) => {
+            Expr::IsNull(e) => {
                 self.push_predicate(
                     scope,
                     clause,
@@ -1520,43 +1874,131 @@ impl Builder {
                     e,
                     RhsKind::None,
                     None,
-                );
+                join_occ,
+            );
             }
-            Expr::InList { expr: e, .. } => {
+            Expr::IsNotNull(e) => {
                 self.push_predicate(
                     scope,
                     clause,
                     path,
-                    PredicateOp::InList,
+                    PredicateOp::IsNotNull,
                     e,
                     e,
-                    RhsKind::Literal,
+                    RhsKind::None,
                     None,
-                );
+                join_occ,
+            );
             }
-            Expr::Between { expr: e, .. } => {
+            Expr::InList { expr: e, negated, .. } => {
+                let pop = if *negated {
+                    PredicateOp::NotInList
+                } else {
+                    PredicateOp::InList
+                };
                 self.push_predicate(
                     scope,
                     clause,
                     path,
-                    PredicateOp::Between,
+                    pop,
                     e,
                     e,
                     RhsKind::Literal,
                     None,
-                );
+                join_occ,
+            );
             }
-            Expr::Like { expr: e, .. } | Expr::ILike { expr: e, .. } => {
+            Expr::Between { expr: e, negated, .. } => {
+                let pop = if *negated {
+                    PredicateOp::NotBetween
+                } else {
+                    PredicateOp::Between
+                };
                 self.push_predicate(
                     scope,
                     clause,
                     path,
-                    PredicateOp::Like,
+                    pop,
                     e,
                     e,
                     RhsKind::Literal,
                     None,
+                join_occ,
+            );
+            }
+            Expr::Like {
+                expr: e, negated, ..
+            }
+            | Expr::ILike {
+                expr: e, negated, ..
+            } => {
+                let pop = if *negated {
+                    PredicateOp::NotLike
+                } else {
+                    PredicateOp::Like
+                };
+                self.push_predicate(
+                    scope,
+                    clause,
+                    path,
+                    pop,
+                    e,
+                    e,
+                    RhsKind::Literal,
+                    None,
+                join_occ,
+            );
+            }
+            // MySQL's regex predicate. It is a filter on a column like any other, and it can
+            // use no index at all, which is why the shape it seeks is not a region this walk
+            // can name.
+            Expr::RLike {
+                expr: e,
+                negated,
+                regexp: _,
+                ..
+            } => {
+                let pop = if *negated {
+                    PredicateOp::NotRegexp
+                } else {
+                    PredicateOp::Regexp
+                };
+                self.push_predicate(
+                    scope,
+                    clause,
+                    path,
+                    pop,
+                    e,
+                    e,
+                    RhsKind::Literal,
+                    None,
+                    join_occ,
                 );
+            }
+            // `MATCH (a, b) AGAINST ('x')` searches a `FULLTEXT` index and nothing else, so the
+            // columns it names are the ones the index covers. Filed against the first, which is
+            // the one an unqualified reading would resolve.
+            Expr::MatchAgainst { columns, .. } => {
+                if let Some(first) = columns.first() {
+                    let e = Expr::CompoundIdentifier(
+                        first
+                            .0
+                            .iter()
+                            .filter_map(|p| p.as_ident().cloned())
+                            .collect(),
+                    );
+                    self.push_predicate(
+                        scope,
+                        clause,
+                        path,
+                        PredicateOp::MatchAgainst,
+                        &e,
+                        &e,
+                        RhsKind::Literal,
+                        None,
+                        join_occ,
+                    );
+                }
             }
             Expr::InSubquery { expr: e, negated, .. } => {
                 let rhs_scope = self.subquery_scope_of(expr, scope);
@@ -1574,6 +2016,7 @@ impl Builder {
                     e,
                     RhsKind::Subquery,
                     rhs_scope,
+                    join_occ,
                 );
             }
             Expr::Exists { negated, .. } => {
@@ -1592,6 +2035,7 @@ impl Builder {
                     Side::default(),
                     RhsKind::Subquery,
                     rhs_scope,
+                    join_occ,
                 );
             }
             Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
@@ -1612,6 +2056,7 @@ impl Builder {
                     left,
                     RhsKind::Subquery,
                     rhs_scope,
+                    join_occ,
                 );
             }
             _ => {}
@@ -1630,6 +2075,8 @@ impl Builder {
         right: &Expr,
         rhs_kind: RhsKind,
         rhs_scope: Option<u32>,
+        join_occ: Option<u32>,
+
     ) {
         let lhs = self.side_of(left, scope);
         let rhs = if std::ptr::eq(left, right) {
@@ -1637,7 +2084,7 @@ impl Builder {
         } else {
             self.side_of(right, scope)
         };
-        self.push_predicate_sides(scope, clause, path, op, lhs, rhs, rhs_kind, rhs_scope);
+        self.push_predicate_sides(scope, clause, path, op, lhs, rhs, rhs_kind, rhs_scope, join_occ);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1651,6 +2098,8 @@ impl Builder {
         rhs: Side,
         rhs_kind: RhsKind,
         rhs_scope: Option<u32>,
+        join_occ: Option<u32>,
+
     ) {
         self.graph.predicates.push(Predicate {
             scope,
@@ -1661,6 +2110,7 @@ impl Builder {
             rhs,
             rhs_kind,
             rhs_scope,
+            join_occ,
         });
     }
 
@@ -1759,25 +2209,30 @@ fn column_ref(expr: &Expr) -> Option<(Option<Bytes>, Bytes)> {
 }
 
 /// The directions an `ORDER BY` wrote, with an unwritten one reading as ascending.
-fn directions_of(terms: &[sqlparser::ast::OrderByExpr]) -> SortDirections {
+/// The directions an `ORDER BY` wrote, and whether it wrote a construct MySQL has no syntax for.
+fn directions_of(terms: &[sqlparser::ast::OrderByExpr]) -> (SortDirections, bool) {
     use sqlparser::ast::OrderBySort as S;
     let mut asc = false;
     let mut desc = false;
+    let mut not_mysql = false;
     for t in terms {
         // `ORDER BY x` is ascending; MySQL has no way to leave it undecided. `USING <op>` is
-        // PostgreSQL's and reaches no MySQL corpus, so it reads as neither.
+        // PostgreSQL's, and MySQL has no `NULLS FIRST` / `NULLS LAST` — it sorts NULLs first
+        // ascending and last descending, with no way to say otherwise.
         match t.options.sort {
             Some(S::Desc) => desc = true,
-            Some(S::Using(_)) => {}
+            Some(S::Using(_)) => not_mysql = true,
             _ => asc = true,
         }
+        not_mysql |= t.options.nulls_first.is_some();
     }
-    match (asc, desc) {
+    let directions = match (asc, desc) {
         (true, true) => SortDirections::Mixed,
         (false, true) => SortDirections::Desc,
         (true, false) => SortDirections::Asc,
         (false, false) => SortDirections::NotApplicable,
-    }
+    };
+    (directions, not_mysql)
 }
 
 /// The `(rows, offset)` a `LIMIT` wrote, where it wrote literal ones.
@@ -2111,6 +2566,340 @@ mod tests {
             "and they share it"
         );
         assert_ne!(outer.scope, inner_scope, "two levels, not one");
+    }
+
+    /// A statement that names a relation and takes a metadata lock on it files both facts.
+    ///
+    /// The role is the lock, and the two are opposite: `SHOW`/`EXPLAIN` take a **shared** one and
+    /// `FLUSH TABLES` an **exclusive** one. Folding them into a single "administrative" arm would
+    /// fuse the two least alike events in MySQL's locking behaviour, which is the defect `ddl`
+    /// was split from `write` to stop one level up.
+    #[test]
+    fn a_metadata_statement_names_the_relation_and_the_lock_it_takes() {
+        for (sql, want) in [
+            ("SHOW CREATE TABLE ledger", RelationRole::MetadataTarget),
+            ("SHOW COLUMNS FROM ledger", RelationRole::MetadataTarget),
+            ("EXPLAIN ledger", RelationRole::MetadataTarget),
+            ("DESCRIBE ledger", RelationRole::MetadataTarget),
+            ("FLUSH TABLES ledger", RelationRole::FlushTarget),
+        ] {
+            let g = graph(sql);
+            let got: Vec<(RelationRole, String)> = g
+                .occurrences
+                .iter()
+                .map(|o| {
+                    (
+                        o.role,
+                        String::from_utf8_lossy(o.object_name.as_deref().unwrap_or(b"")).into_owned(),
+                    )
+                })
+                .collect();
+            assert_eq!(got, vec![(want, "ledger".to_string())], "{sql}");
+        }
+    }
+
+    /// `SHOW TABLES FROM db` names a **schema**, and the walk declines it.
+    ///
+    /// The name sits in the same `show_in.parent_name` that `SHOW COLUMNS FROM t` uses, so a rule
+    /// reading the field without its clause files a schema as a relation — which is exactly the
+    /// one exception `objects()` has to carry.
+    #[test]
+    fn show_tables_names_a_schema_and_is_not_a_relation() {
+        assert!(graph("SHOW TABLES FROM shop").occurrences.is_empty());
+        assert_eq!(graph("SHOW COLUMNS FROM shop").occurrences.len(), 1);
+    }
+
+    /// `EXPLAIN <statement>` is descended into, so the statement it wraps reaches the artifacts.
+    ///
+    /// Before this the relation, the split and the scope were all dropped while the literal scan
+    /// ran anyway — so the record filed a value the author sought and could not say against which
+    /// table, in a statement naming exactly one.
+    #[test]
+    fn explain_descends_into_the_statement_it_wraps() {
+        let g = graph("EXPLAIN SELECT id FROM ledger WHERE id = 5");
+        let named: Vec<String> = g
+            .occurrences
+            .iter()
+            .filter_map(|o| o.object_name.as_deref())
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect();
+        assert_eq!(named, vec!["ledger".to_string()]);
+        // ⭐ The ordinary role, not one of its own: `EXPLAIN` does not execute, `rows_examined`
+        // is the measured zero that says so, and `sql_type` already names the form. A role here
+        // would be this walk asserting something those three do not.
+        assert_eq!(g.occurrences[0].role, RelationRole::From);
+        assert_eq!(g.predicates.len(), 1, "the split is recovered too");
+    }
+
+    /// A split written in a join clause names the join, which `clause` alone cannot.
+    ///
+    /// With two joins in one statement, `clause = On` says both sat in a join clause and nothing
+    /// says which — so the operator above each one is unreachable, and an outer join's `ON` reads
+    /// like an inner join's.
+    #[test]
+    fn a_split_names_the_join_it_sits_under() {
+        let g = graph(
+            "SELECT p.id FROM pallet p \
+             JOIN crate q ON p.id = q.pallet_id AND q.grade = 'B' \
+             LEFT JOIN depot d ON p.depot_id = d.id AND d.region = 'north'",
+        );
+        let joins: Vec<Option<u32>> = g
+            .predicates
+            .iter()
+            .filter(|p| p.clause == Clause::On)
+            .map(|p| p.join_occ)
+            .collect();
+        assert_eq!(joins.len(), 4, "two splits in each of two join clauses");
+        let distinct: std::collections::BTreeSet<Option<u32>> = joins.iter().copied().collect();
+        assert_eq!(distinct.len(), 2, "the two clauses name two joins: {joins:?}");
+        assert!(joins.iter().all(|j| j.is_some()));
+        // And a `WHERE` names none, which is the other half of the two-sided claim.
+        let g2 = graph("SELECT id FROM t WHERE id = 1");
+        assert!(g2.predicates.iter().all(|p| p.join_occ.is_none()));
+    }
+
+    /// A negated comparison is a different operator, not the same one with the `NOT` dropped.
+    ///
+    /// The region a negation selects is the complement of the region the positive form selects, so
+    /// filing `NOT BETWEEN` as `Between` would give it a `range` in the analyzer. The enum already
+    /// names the negation for the subquery forms, which is the precedent.
+    #[test]
+    fn a_negated_comparison_is_not_the_comparison() {
+        let cases = [
+            ("SELECT a FROM t WHERE a BETWEEN 1 AND 9", PredicateOp::Between),
+            ("SELECT a FROM t WHERE a NOT BETWEEN 1 AND 9", PredicateOp::NotBetween),
+            ("SELECT a FROM t WHERE a IN (1, 2)", PredicateOp::InList),
+            ("SELECT a FROM t WHERE a NOT IN (1, 2)", PredicateOp::NotInList),
+            ("SELECT a FROM t WHERE a LIKE 'x%'", PredicateOp::Like),
+            ("SELECT a FROM t WHERE a NOT LIKE 'x%'", PredicateOp::NotLike),
+            ("SELECT a FROM t WHERE a IS NULL", PredicateOp::IsNull),
+            ("SELECT a FROM t WHERE a IS NOT NULL", PredicateOp::IsNotNull),
+            ("SELECT a FROM t WHERE a REGEXP '^x'", PredicateOp::Regexp),
+            ("SELECT a FROM t WHERE a NOT REGEXP '^x'", PredicateOp::NotRegexp),
+            ("SELECT a FROM t WHERE a RLIKE '^x'", PredicateOp::Regexp),
+            ("SELECT a FROM t WHERE MATCH(a) AGAINST ('x')", PredicateOp::MatchAgainst),
+        ];
+        for (sql, want) in cases {
+            let ops: Vec<PredicateOp> = splits(sql).into_iter().map(|(_, _, o)| o).collect();
+            assert_eq!(ops, vec![want], "{sql}");
+        }
+        // `MATCH (a, b) AGAINST (…)` names several columns and files one split, against the first.
+        let g = graph("SELECT a FROM t WHERE MATCH(a, b) AGAINST ('x')");
+        assert_eq!(g.predicates.len(), 1);
+        assert_eq!(g.predicates[0].op, PredicateOp::MatchAgainst);
+    }
+
+    /// A construct this grammar accepts and MySQL cannot write lands in a diagnostic arm.
+    ///
+    /// `FOR UPDATE OF t` names the table to lock and MySQL has no such clause; `NULLS FIRST` is
+    /// not MySQL either, which sorts NULLs first ascending and last descending with no way to say
+    /// otherwise. Both are trees the server could not have run, so the artifact says so rather
+    /// than filing them as ordinary.
+    #[test]
+    fn a_clause_mysql_cannot_write_is_marked_and_not_filed_as_ordinary() {
+        let g = graph("SELECT id FROM t FOR UPDATE");
+        assert_eq!(g.scopes[0].locking, LockStrength::Exclusive);
+
+        let g = graph("SELECT id FROM t FOR UPDATE OF t");
+        assert_eq!(g.scopes[0].locking, LockStrength::NotMySql);
+
+        assert!(!st("SELECT id FROM t ORDER BY a DESC").not_mysql);
+        assert!(st("SELECT id FROM t ORDER BY a ASC NULLS FIRST").not_mysql);
+        assert!(st("SELECT id FROM t ORDER BY a NULLS LAST").not_mysql);
+    }
+
+    /// A partition restriction divides the relation, and the division is a partition rather than a
+    /// cover.
+    ///
+    /// Every row of a partitioned table is in exactly one partition, so the parts are disjoint and
+    /// they cover the whole: a total over partitions is the table's total exactly and owes no
+    /// elimination. A partitioned table also carries a local index per partition, so a restriction
+    /// here decides which index trees exist to be walked — and two statements restricted to
+    /// disjoint partitions touch no page in common whatever else they share.
+    #[test]
+    fn a_partition_restriction_divides_the_relation() {
+        let g = graph("SELECT id FROM t PARTITION (p0, p1) WHERE x = 1");
+        assert_eq!(g.partitions.len(), 2);
+        assert_eq!(g.partitions[0].occ, 0);
+        assert_eq!(g.partitions[0].name, Bytes::from_static(b"p0"));
+        assert_eq!(g.partitions[1].name, Bytes::from_static(b"p1"));
+
+        // One row per name rather than a list on the occurrence, so a reader asking which
+        // statements restricted to a given partition joins rather than splitting a string.
+        let g = graph("SELECT a.id FROM t PARTITION (p0) a JOIN u PARTITION (q1, q2) b ON a.id = b.id");
+        assert_eq!(g.partitions.len(), 3);
+        assert_eq!(g.partitions[0].occ, 0);
+        assert_eq!(g.partitions[1].occ, 1);
+        assert_eq!(g.partitions[2].occ, 1);
+
+        // An unrestricted occurrence files nothing, which is a written absence and not a blank:
+        // the author named no partition, so every one is in play.
+        assert!(graph("SELECT id FROM t WHERE x = 1").partitions.is_empty());
+    }
+
+    /// An optimizer hint is carried as the author's own bytes and deliberately not decomposed.
+    ///
+    /// `NO_ICP`, `NO_MRR`, `INDEX_MERGE` and `BKA` name index access methods outright, which makes
+    /// them the same family as an index hint. But `sqlparser` hands the whole comment body over as
+    /// raw text without separating the hints inside it, so naming each hint, its target table and
+    /// its target index would be this walk lexing where everything else parses — the judgement
+    /// already made about `SHOW INDEX FROM t`.
+    #[test]
+    fn an_optimizer_hint_is_carried_as_the_authors_bytes() {
+        let g = graph("SELECT /*+ NO_ICP(t idx) NO_MRR(t) */ id FROM t WHERE x = 1");
+        // One row per COMMENT and not per hint: the grammar does not separate the hints inside the
+        // body, so two hints in one comment are one row and its text holds both.
+        assert_eq!(g.optimizer_hints.len(), 1);
+        assert_eq!(g.optimizer_hints[0].scope, 0);
+        // Verbatim, including the whitespace the author wrote around the body. Trimming would be
+        // this walk editing the author's bytes, which is the one thing `sql_raw` exists to refuse.
+        assert_eq!(
+            g.optimizer_hints[0].text,
+            Bytes::from_static(b" NO_ICP(t idx) NO_MRR(t) ")
+        );
+        assert!(!g.optimizer_hints[0].line_comment);
+        assert!(g.optimizer_hints[0].prefix.is_empty());
+
+        // A hint written in a nested scope is filed against that scope: the optimiser applies it
+        // to the block it was written in, and the statement's own scope is 0.
+        let g = graph("SELECT id FROM t WHERE x IN (SELECT /*+ BKA(u) */ y FROM u)");
+        assert_eq!(g.optimizer_hints.len(), 1);
+        assert!(g.optimizer_hints[0].scope > 0);
+
+        assert!(graph("SELECT id FROM t WHERE x = 1").optimizer_hints.is_empty());
+    }
+
+    /// An index hint is the author naming an index, filed against the occurrence it was written on.
+    ///
+    /// The only construct in a slow log that names an index at all. Several hints may sit on one
+    /// relation, and the `FOR` clause says which part of the statement each applies to.
+    #[test]
+    fn an_index_hint_names_the_occurrence_it_was_written_on() {
+        let g = graph("SELECT id FROM t a USE INDEX (i1) WHERE a.x = 1");
+        assert_eq!(g.index_hints.len(), 1);
+        let h = &g.index_hints[0];
+        assert_eq!(h.occ, 0);
+        assert_eq!(h.kind, IndexHintKind::Use);
+        assert_eq!(h.scope, IndexHintScope::Any);
+        assert_eq!(h.names, vec![Bytes::from_static(b"i1")]);
+        assert!(!h.spelled_key);
+
+        // The three kinds and the three `FOR` clauses, each a different claim on the optimiser.
+        for (sql, kind, scope) in [
+            ("SELECT id FROM t a FORCE INDEX FOR ORDER BY (i1)", IndexHintKind::Force, IndexHintScope::OrderBy),
+            ("SELECT id FROM t a IGNORE INDEX FOR JOIN (i1)", IndexHintKind::Ignore, IndexHintScope::Join),
+            ("SELECT id FROM t a USE KEY FOR GROUP BY (i1)", IndexHintKind::Use, IndexHintScope::GroupBy),
+        ] {
+            let g = graph(sql);
+            assert_eq!(g.index_hints[0].kind, kind, "{sql}");
+            assert_eq!(g.index_hints[0].scope, scope, "{sql}");
+        }
+        assert!(graph("SELECT id FROM t a USE KEY FOR GROUP BY (i1)").index_hints[0].spelled_key);
+
+        // Each hint travels with its own relation, which is what makes `occ` the key.
+        let g = graph("SELECT id FROM a USE INDEX (ia) JOIN b FORCE INDEX (ib) ON a.i = b.i");
+        let pairs: Vec<(u32, IndexHintKind)> =
+            g.index_hints.iter().map(|h| (h.occ, h.kind)).collect();
+        assert_eq!(pairs, vec![(0, IndexHintKind::Use), (1, IndexHintKind::Force)]);
+
+        // And a statement naming no index files none, which is a measured zero.
+        assert!(graph("SELECT id FROM t WHERE x = 1").index_hints.is_empty());
+    }
+
+    /// A single-table `DELETE` names its target in the `FROM`, and the role says it was written.
+    ///
+    /// `Delete.tables` is populated only by the multi-table form, so reading the target from
+    /// there alone files the ordinary `DELETE FROM t` as a read of `t`.
+    #[test]
+    fn a_delete_names_the_relation_it_deletes_from() {
+        for sql in [
+            "DELETE FROM invoice WHERE id = 1",
+            "DELETE FROM invoice",
+            "DELETE FROM invoice USING invoice JOIN line ON line.iid = invoice.id",
+        ] {
+            let g = graph(sql);
+            assert_eq!(
+                g.occurrences[0].role,
+                RelationRole::DeleteTarget,
+                "{sql}"
+            );
+        }
+        // The multi-table form still names its targets by alias and its sources in the `FROM`.
+        let g = graph("DELETE o, p FROM orders o JOIN payments p ON p.oid = o.id");
+        let roles: Vec<RelationRole> = g.occurrences.iter().map(|o| o.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                RelationRole::DeleteTarget,
+                RelationRole::DeleteTarget,
+                RelationRole::From,
+                RelationRole::Join,
+            ]
+        );
+    }
+
+    /// The expression positions that can hold a subquery are walked, so the relation it reads and
+    /// the splits it writes reach the graph.
+    ///
+    /// Each of these is visited by `objects()`, so leaving it out makes the two readings of one
+    /// statement disagree about a relation it names.
+    #[test]
+    fn a_subquery_outside_a_clause_the_walk_knows_still_names_its_relation() {
+        for sql in [
+            "UPDATE invoice SET n = (SELECT MAX(x) FROM ledger WHERE ledger.z = 3)",
+            "INSERT INTO invoice (id) VALUES ((SELECT MAX(id) FROM ledger WHERE ledger.z = 3))",
+            "INSERT INTO invoice (id) VALUES (1) ON DUPLICATE KEY UPDATE \
+             id = (SELECT MAX(id) FROM ledger WHERE ledger.z = 3)",
+            "SELECT id FROM invoice ORDER BY (SELECT MAX(x) FROM ledger WHERE ledger.z = 3)",
+        ] {
+            let g = graph(sql);
+            let named: Vec<&[u8]> = g
+                .occurrences
+                .iter()
+                .filter_map(|o| o.object_name.as_deref())
+                .collect();
+            assert!(named.contains(&&b"ledger"[..]), "{sql}: {named:?}");
+            assert_eq!(g.predicates.len(), 1, "{sql}");
+        }
+    }
+
+    /// A `FOR UPDATE` or `FOR SHARE` is filed on the scope that wrote it and on no other.
+    ///
+    /// MySQL locks the tables of the block the clause sits in, so a subquery under a locking
+    /// outer select is not itself locking.
+    #[test]
+    fn a_locking_read_says_which_lock_it_took_and_where() {
+        let cases = [
+            ("SELECT id FROM t", LockStrength::None, LockWait::Wait),
+            (
+                "SELECT id FROM t FOR SHARE",
+                LockStrength::Shared,
+                LockWait::Wait,
+            ),
+            (
+                "SELECT id FROM t FOR UPDATE",
+                LockStrength::Exclusive,
+                LockWait::Wait,
+            ),
+            (
+                "SELECT id FROM t FOR UPDATE NOWAIT",
+                LockStrength::Exclusive,
+                LockWait::NoWait,
+            ),
+            (
+                "SELECT id FROM t FOR UPDATE SKIP LOCKED",
+                LockStrength::Exclusive,
+                LockWait::SkipLocked,
+            ),
+        ];
+        for (sql, strength, wait) in cases {
+            let g = graph(sql);
+            assert_eq!(g.scopes[0].locking, strength, "{sql}");
+            assert_eq!(g.scopes[0].lock_wait, wait, "{sql}");
+        }
+        let g = graph("SELECT id FROM t WHERE id IN (SELECT id FROM u) FOR UPDATE");
+        assert_eq!(g.scopes[0].locking, LockStrength::Exclusive);
+        assert_eq!(g.scopes[1].locking, LockStrength::None, "the subquery");
     }
 
     /// A quantified comparison holds its subquery on the right, and the walk descends into it.
@@ -2635,6 +3424,17 @@ mod tests {
             .find(|o| o.role == RelationRole::AlterTarget)
             .expect("⛔ ALTER TABLE reached `objects()` and no artifact that has roles");
         assert_eq!(o.object_name.as_deref(), Some(b"actor".as_ref()));
+
+        // `DROP INDEX idx ON t` alters `t`, and the relation is in `Drop.table` rather than in
+        // `names`. Neither `objects()` nor this walk saw it while the grammar refused the form.
+        let g = graph("DROP INDEX idx_last_name ON actor");
+        let o = g
+            .occurrences
+            .iter()
+            .find(|o| o.role == RelationRole::AlterTarget)
+            .expect("DROP INDEX names the table it alters");
+        assert_eq!(o.object_name.as_deref(), Some(b"actor".as_ref()));
+        assert_eq!(g.occurrences.len(), 1, "the index is not a relation");
 
         let g = graph("DROP TABLE IF EXISTS sakila.film_text, sakila.staff_list");
         let dropped: Vec<_> = g

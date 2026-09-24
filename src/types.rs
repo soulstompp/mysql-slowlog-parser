@@ -2,7 +2,7 @@ use crate::graph::StatementGraph;
 use crate::parser::EntryLiteral;
 use crate::{EntryAdminCommand, SessionLine, SqlStatementContext, StatsLine};
 use bytes::{BufMut, Bytes, BytesMut};
-use sqlparser::ast::{ObjectType, Statement, visit_relations};
+use sqlparser::ast::{ObjectType, SetExpr, Statement, visit_relations};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
@@ -158,7 +158,15 @@ impl EntrySqlStatement {
     /// returns the MySQL-facing kind of this statement
     pub fn sql_type(&self) -> EntrySqlType {
         match self.statement {
-            Statement::Query(_) => EntrySqlType::Query,
+            // MySQL 8.0 admits `WITH c AS (…) INSERT/UPDATE/DELETE …`, which parses as a
+            // `Query` whose body is the write. Reading the outer node alone would type all
+            // three as reads.
+            Statement::Query(ref q) => match q.body.as_ref() {
+                SetExpr::Insert(_) => EntrySqlType::Insert,
+                SetExpr::Update(_) => EntrySqlType::Update,
+                SetExpr::Delete(_) => EntrySqlType::Delete,
+                _ => EntrySqlType::Query,
+            },
             Statement::Insert { .. } => EntrySqlType::Insert,
             Statement::Update { .. } => EntrySqlType::Update,
             Statement::Delete { .. } => EntrySqlType::Delete,
@@ -744,6 +752,20 @@ mod every_sql_type_arm {
             ("INSERT INTO t VALUES (1)", EntrySqlType::Insert),
             ("UPDATE t SET a = 1", EntrySqlType::Update),
             ("DELETE FROM t", EntrySqlType::Delete),
+            // A `WITH` in front of a write parses as a `Query` whose body is the write, so the
+            // outer node alone types all three as reads.
+            (
+                "WITH c AS (SELECT 1 AS i) INSERT INTO t SELECT i FROM c",
+                EntrySqlType::Insert,
+            ),
+            (
+                "WITH c AS (SELECT 1 AS i) UPDATE t SET a = 1",
+                EntrySqlType::Update,
+            ),
+            (
+                "WITH c AS (SELECT 1 AS i) DELETE FROM t",
+                EntrySqlType::Delete,
+            ),
             ("CREATE TABLE t (a INT)", EntrySqlType::CreateTable),
             ("CREATE INDEX i ON t (a)", EntrySqlType::CreateIndex),
             ("CREATE VIEW v AS SELECT 1 FROM t", EntrySqlType::CreateView),

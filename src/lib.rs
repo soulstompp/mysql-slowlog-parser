@@ -69,10 +69,10 @@ mod parser;
 mod types;
 
 pub use graph::{
-    Clause, Connective, ConstraintKind, Edge, GraphMeasures, JoinOp, PathStep, Predicate,
-    PredicateOp, RelationOccurrence, RelationRole, RhsKind, Scope, ScopeKind, SetOperator, Side,
-    SortDirections, Stages,
-    StatementGraph,
+    Clause, Connective, ConstraintKind, Edge, GraphMeasures, IndexHint, IndexHintKind,
+    IndexHintScope, JoinOp, LockStrength, LockWait, PathStep, Predicate, PredicateOp,
+    RelationOccurrence, RelationRole, RhsKind, Scope, ScopeKind, SetOperator, Side, SortDirections,
+    Stages, StatementGraph,
 };
 
 pub use types::{
