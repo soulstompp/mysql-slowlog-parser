@@ -2,7 +2,7 @@ use crate::graph::StatementGraph;
 use crate::parser::EntryLiteral;
 use crate::{EntryAdminCommand, SessionLine, SqlStatementContext, StatsLine};
 use bytes::{BufMut, Bytes, BytesMut};
-use sqlparser::ast::{ObjectType, SetExpr, Statement, visit_relations};
+use sqlparser::ast::{ObjectType, SetExpr, ShowCreateObject, Statement, visit_relations};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
@@ -158,16 +158,23 @@ impl EntrySqlStatement {
 
     /// returns the MySQL-facing kind of this statement
     pub fn sql_type(&self) -> EntrySqlType {
-        match self.statement {
+        EntrySqlType::of(&self.statement)
+    }
+}
+
+impl EntrySqlType {
+    fn of(statement: &Statement) -> Self {
+        match statement {
             // MySQL 8.0 admits `WITH c AS (…) INSERT/UPDATE/DELETE …`, which parses as a
             // `Query` whose body is the write. Reading the outer node alone would type all
             // three as reads.
-            Statement::Query(ref q) => match q.body.as_ref() {
-                SetExpr::Insert(_) => EntrySqlType::Insert,
-                SetExpr::Update(_) => EntrySqlType::Update,
-                SetExpr::Delete(_) => EntrySqlType::Delete,
+            Statement::Query(q) => match q.body.as_ref() {
+                SetExpr::Insert(s) | SetExpr::Update(s) | SetExpr::Delete(s) => Self::of(s),
                 _ => EntrySqlType::Query,
             },
+            // `REPLACE` parses as an `INSERT` with a flag set, and it is not one: MySQL deletes
+            // the row holding the same key before it writes.
+            Statement::Insert(i) if i.replace_into => EntrySqlType::Replace,
             Statement::Insert { .. } => EntrySqlType::Insert,
             Statement::Update { .. } => EntrySqlType::Update,
             Statement::Delete { .. } => EntrySqlType::Delete,
@@ -175,22 +182,30 @@ impl EntrySqlStatement {
             Statement::CreateIndex { .. } => EntrySqlType::CreateIndex,
             Statement::CreateView { .. } => EntrySqlType::CreateView,
             Statement::AlterTable { .. } => EntrySqlType::AlterTable,
+            Statement::AlterView { .. } => EntrySqlType::AlterView,
             // One arm per object type, because the label is what a caller matches on and
-            // `DROP TABLE` asserts the object a `DROP VIEW` or a `DROP DATABASE` is not.
-            Statement::Drop {
-                object_type: ObjectType::View,
-                ..
-            } => EntrySqlType::DropView,
-            Statement::Drop {
-                object_type: ObjectType::Database | ObjectType::Schema,
-                ..
-            } => EntrySqlType::DropDatabase,
-            Statement::Drop { .. } => EntrySqlType::Drop,
+            // `DROP TABLE` asserts the object a `DROP VIEW` or a `DROP DATABASE` is not. The
+            // relation graph files `DROP INDEX idx ON t` as an alter of `t`, so it is owed an
+            // arm; a `DROP` of anything else -- a user, a role -- names no relation and is
+            // `Unknown` rather than a label for an object it did not drop.
+            Statement::Drop { object_type, .. } => match object_type {
+                ObjectType::Table => EntrySqlType::Drop,
+                ObjectType::View => EntrySqlType::DropView,
+                ObjectType::Index => EntrySqlType::DropIndex,
+                ObjectType::Database | ObjectType::Schema => EntrySqlType::DropDatabase,
+                _ => EntrySqlType::Unknown,
+            },
             Statement::DropFunction { .. } => EntrySqlType::DropFunction,
             Statement::Set { .. } => EntrySqlType::Set,
             Statement::ShowVariable { .. } => EntrySqlType::ShowVariable,
             Statement::ShowVariables { .. } => EntrySqlType::ShowVariables,
-            Statement::ShowCreate { .. } => EntrySqlType::ShowCreate,
+            // The two the relation graph gives a metadata target. A routine, a trigger and an
+            // event are not relations, and have no arm.
+            Statement::ShowCreate { obj_type, .. } => match obj_type {
+                ShowCreateObject::Table => EntrySqlType::ShowCreate,
+                ShowCreateObject::View => EntrySqlType::ShowCreateView,
+                _ => EntrySqlType::Unknown,
+            },
             Statement::ShowColumns { .. } => EntrySqlType::ShowColumns,
             Statement::ShowTables { .. } => EntrySqlType::ShowTables,
             Statement::ShowCollation { .. } => EntrySqlType::ShowCollation,
@@ -361,6 +376,9 @@ pub enum EntrySqlType {
     Query,
     /// INSERT
     Insert,
+    /// `REPLACE`, which `sqlparser` parses as an `INSERT` and MySQL runs as a delete of the row
+    /// holding the same key followed by an insert
+    Replace,
     /// UPDATE
     Update,
     /// DELETE
@@ -373,11 +391,15 @@ pub enum EntrySqlType {
     CreateView,
     /// ALTER TABLE
     AlterTable,
-    /// `DROP TABLE`, and every `DROP` of an object type with no arm of its own (`DROP INDEX`,
-    /// `DROP USER`, `DROP ROLE`), which also displays as `DROP TABLE`.
+    /// ALTER VIEW
+    AlterView,
+    /// `DROP TABLE`. A `DROP` of an object type with no arm of its own, such as `DROP USER`, is
+    /// [`Self::Unknown`].
     Drop,
     /// DROP VIEW
     DropView,
+    /// `DROP INDEX idx ON t`, which changes `t` rather than dropping it
+    DropIndex,
     /// DROP DATABASE / DROP SCHEMA
     DropDatabase,
     /// DROP FUNCTION
@@ -393,9 +415,11 @@ pub enum EntrySqlType {
     ShowVariable,
     /// SHOW VARIABLES
     ShowVariables,
-    /// `SHOW CREATE TABLE`, and every other `SHOW CREATE` (`VIEW`, `FUNCTION`, `PROCEDURE`,
-    /// `TRIGGER`, `EVENT`), which also displays as `SHOW CREATE TABLE`.
+    /// `SHOW CREATE TABLE`. A `SHOW CREATE` of a routine, a trigger or an event is
+    /// [`Self::Unknown`].
     ShowCreate,
+    /// SHOW CREATE VIEW
+    ShowCreateView,
     /// SHOW COLUMNS
     ShowColumns,
     /// SHOW TABLES
@@ -442,7 +466,8 @@ pub enum EntrySqlType {
     /// spells it `UNKNOWN`, so a caller can tell it from a line that had no statement at all.
     ///
     /// Two kinds land here. One is ordinary MySQL this enum has no arm for — `CALL`, `EXECUTE`,
-    /// `DEALLOCATE` — which the relation graph gives no role either. The other is text
+    /// `DEALLOCATE`, `DROP USER`, `SHOW CREATE PROCEDURE` — which the relation graph gives no
+    /// role either. The other is text
     /// `sqlparser` accepts and MySQL cannot write, such as `ALTER INDEX`; this crate reads MySQL
     /// slow logs, so naming those would make the vocabulary a union of every dialect
     /// `sqlparser` knows and put cases that cannot occur in front of every caller.
@@ -454,20 +479,24 @@ impl Display for EntrySqlType {
         let out = match self {
             Self::Query => "SELECT",
             Self::Insert => "INSERT",
+            Self::Replace => "REPLACE",
             Self::Update => "UPDATE",
             Self::Delete => "DELETE",
             Self::CreateTable => "CREATE TABLE",
             Self::CreateIndex => "CREATE INDEX",
             Self::CreateView => "CREATE VIEW",
             Self::AlterTable => "ALTER TABLE",
+            Self::AlterView => "ALTER VIEW",
             Self::Drop => "DROP TABLE",
             Self::DropView => "DROP VIEW",
+            Self::DropIndex => "DROP INDEX",
             Self::DropDatabase => "DROP DATABASE",
             Self::DropFunction => "DROP FUNCTION",
             Self::Set => "SET",
             Self::ShowVariable => "SHOW",
             Self::ShowVariables => "SHOW VARIABLES",
             Self::ShowCreate => "SHOW CREATE TABLE",
+            Self::ShowCreateView => "SHOW CREATE VIEW",
             Self::ShowColumns => "SHOW COLUMNS",
             Self::ShowTables => "SHOW TABLES",
             Self::ShowCollation => "SHOW COLLATION",
@@ -779,6 +808,7 @@ mod every_sql_type_arm {
         let mysql: &[(&str, EntrySqlType)] = &[
             ("SELECT 1 FROM t", EntrySqlType::Query),
             ("INSERT INTO t VALUES (1)", EntrySqlType::Insert),
+            ("REPLACE INTO t VALUES (1)", EntrySqlType::Replace),
             ("UPDATE t SET a = 1", EntrySqlType::Update),
             ("DELETE FROM t", EntrySqlType::Delete),
             // A `WITH` in front of a write parses as a `Query` whose body is the write, so the
@@ -799,8 +829,10 @@ mod every_sql_type_arm {
             ("CREATE INDEX i ON t (a)", EntrySqlType::CreateIndex),
             ("CREATE VIEW v AS SELECT 1 FROM t", EntrySqlType::CreateView),
             ("ALTER TABLE t ADD COLUMN b INT", EntrySqlType::AlterTable),
+            ("ALTER VIEW v AS SELECT 1 FROM t", EntrySqlType::AlterView),
             ("DROP TABLE t", EntrySqlType::Drop),
             ("DROP VIEW v", EntrySqlType::DropView),
+            ("DROP INDEX idx ON t", EntrySqlType::DropIndex),
             ("DROP DATABASE d", EntrySqlType::DropDatabase),
             ("DROP SCHEMA d", EntrySqlType::DropDatabase),
             ("DROP FUNCTION f", EntrySqlType::DropFunction),
@@ -819,6 +851,7 @@ mod every_sql_type_arm {
             ("SHOW ENGINE INNODB STATUS", EntrySqlType::ShowVariable),
             ("SHOW VARIABLES LIKE 'long%'", EntrySqlType::ShowVariables),
             ("SHOW CREATE TABLE t", EntrySqlType::ShowCreate),
+            ("SHOW CREATE VIEW v", EntrySqlType::ShowCreateView),
             ("SHOW COLUMNS FROM t", EntrySqlType::ShowColumns),
             ("SHOW TABLES FROM d", EntrySqlType::ShowTables),
             ("SHOW COLLATION", EntrySqlType::ShowCollation),
@@ -869,9 +902,44 @@ mod every_sql_type_arm {
         // a new arm without a case has to fail here.
         assert_eq!(
             seen.len(),
-            38,
+            42,
             "every EntrySqlType arm needs a statement that reaches it; reached {seen:?}"
         );
+    }
+
+    /// A LABEL NAMES THE STATEMENT WRITTEN, OR IT IS `Unknown` -- never a neighbour.
+    ///
+    /// Each of these shares a `Statement` node with a sibling, so a mapping that read only the
+    /// node would give one the other's label. An arm is owed where the relation graph says
+    /// something specific about the statement; where it says nothing, `Unknown` is the truthful
+    /// label.
+    #[test]
+    fn a_label_names_the_statement_written_or_is_unknown() {
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "REPLACE INTO t VALUES (1)",
+            "ALTER TABLE t ADD COLUMN b INT",
+            "ALTER VIEW v AS SELECT 1 FROM t",
+            "DROP TABLE t",
+            "DROP VIEW v",
+            "DROP INDEX idx ON t",
+            "DROP DATABASE d",
+            "SHOW CREATE TABLE t",
+            "SHOW CREATE VIEW v",
+        ] {
+            let label = typed(sql).to_string();
+            assert!(sql.starts_with(&label), "{sql} is labelled {label}");
+        }
+        for sql in [
+            "DROP USER u",
+            "DROP ROLE r",
+            "SHOW CREATE PROCEDURE p",
+            "SHOW CREATE FUNCTION f",
+            "SHOW CREATE TRIGGER tr",
+            "SHOW CREATE EVENT e",
+        ] {
+            assert_eq!(typed(sql), EntrySqlType::Unknown, "{sql}");
+        }
     }
 
     /// The label is what a reader sees.
@@ -888,6 +956,10 @@ mod every_sql_type_arm {
         assert_eq!(EntrySqlType::UnlockTables.to_string(), "UNLOCK TABLES");
         assert_eq!(EntrySqlType::DropView.to_string(), "DROP VIEW");
         assert_eq!(EntrySqlType::DropDatabase.to_string(), "DROP DATABASE");
+        assert_eq!(EntrySqlType::DropIndex.to_string(), "DROP INDEX");
+        assert_eq!(EntrySqlType::ShowCreateView.to_string(), "SHOW CREATE VIEW");
+        assert_eq!(EntrySqlType::AlterView.to_string(), "ALTER VIEW");
+        assert_eq!(EntrySqlType::Replace.to_string(), "REPLACE");
 
         // And the catch-all, which is not a variable.
         assert_eq!(EntrySqlType::ShowVariable.to_string(), "SHOW");
@@ -896,20 +968,24 @@ mod every_sql_type_arm {
         let labels: Vec<String> = [
             EntrySqlType::Query,
             EntrySqlType::Insert,
+            EntrySqlType::Replace,
             EntrySqlType::Update,
             EntrySqlType::Delete,
             EntrySqlType::CreateTable,
             EntrySqlType::CreateIndex,
             EntrySqlType::CreateView,
             EntrySqlType::AlterTable,
+            EntrySqlType::AlterView,
             EntrySqlType::Drop,
             EntrySqlType::DropView,
+            EntrySqlType::DropIndex,
             EntrySqlType::DropDatabase,
             EntrySqlType::DropFunction,
             EntrySqlType::Set,
             EntrySqlType::ShowVariable,
             EntrySqlType::ShowVariables,
             EntrySqlType::ShowCreate,
+            EntrySqlType::ShowCreateView,
             EntrySqlType::ShowColumns,
             EntrySqlType::ShowTables,
             EntrySqlType::ShowCollation,
@@ -936,8 +1012,8 @@ mod every_sql_type_arm {
         .iter()
         .map(|t| t.to_string())
         .collect();
-        assert_eq!(labels.len(), 38);
+        assert_eq!(labels.len(), 42);
         let distinct: BTreeSet<&String> = labels.iter().collect();
-        assert_eq!(distinct.len(), 38, "two arms share a label: {labels:?}");
+        assert_eq!(distinct.len(), 42, "two arms share a label: {labels:?}");
     }
 }
