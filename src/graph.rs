@@ -53,7 +53,7 @@ use sqlparser::ast::{
     LockType, NonBlock, ObjectName, ObjectNamePart, ObjectType, OnInsert, OptimizerHintStyle,
     OrderByKind, Query, Select, SetExpr, ShowCreateObject, Statement, TableFactor,
     TableIndexHintForClause, TableIndexHintType, TableIndexType, TableObject, TableWithJoins,
-    UpdateTableFromKind, Visit, Visitor, visit_expressions,
+    UpdateTableFromKind, Visit, Visitor,
 };
 use std::ops::ControlFlow;
 
@@ -214,6 +214,9 @@ pub enum JoinOp {
     /// text MySQL has no syntax for. This crate reads MySQL slow logs, so one arm covers all of
     /// them rather than naming cases that cannot occur in front of every caller and every match.
     ///
+    /// A comparison relating two relations with an operator MySQL does not have lands here too,
+    /// rather than on [`JoinOp::Predicate`].
+    ///
     /// An edge carrying this is a diagnostic and not data: either the input was not a MySQL slow
     /// log, or `sqlparser` built a tree the server could not have run. The author's bytes are on
     /// the entry either way.
@@ -241,7 +244,8 @@ pub enum ConstraintKind {
     Using,
     /// `NATURAL`
     Natural,
-    /// no constraint was written
+    /// no join constraint was written: a comma, a join with no `ON` or `USING`, and every edge a
+    /// comparison in a `WHERE`, a `HAVING` or the projection draws, which sits in no join
     None,
 }
 
@@ -282,11 +286,14 @@ vocabulary!(Clause {
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum Connective {
-    /// `AND`
+    /// `AND`. This grammar binds MySQL's `&&` tighter than `=`, so `a = 1 && b = 2` arrives as one
+    /// comparison over no column and never as this connective.
     And,
-    /// `OR`
+    /// `OR`. MySQL reads `||` as `OR` by default; this grammar reads it as concatenation bound
+    /// tighter than `=`, so `a = 1 || b = 2` arrives as one comparison over no column.
     Or,
-    /// MySQL's `XOR`, which no other dialect spells this way.
+    /// MySQL's `XOR`, which no other dialect spells this way. This grammar binds it tighter than
+    /// `=`, so only operands written in parentheses, `(a = 1) XOR (b = 2)`, reach this connective.
     Xor,
     /// `NOT`, which negates the branch beneath it.
     Not,
@@ -754,6 +761,9 @@ pub struct Stages {
     pub having_terms: u32,
     /// Calls to a built-in aggregate in `HAVING`.
     ///
+    /// The scope's own: an aggregate inside a subquery groups that subquery, and one with an
+    /// `OVER` clause is a window function, which aggregates over a window and groups nothing.
+    ///
     /// A lower bound: matched against MySQL's built-in aggregate names, so a
     /// `CREATE AGGREGATE FUNCTION` UDF is not on the list and is not counted.
     pub having_aggregate_calls: u32,
@@ -808,17 +818,19 @@ fn conjuncts(e: &Expr) -> u32 {
     }
 }
 
-/// MySQL's built-in aggregates, by name.
+/// MySQL 8.0's built-in aggregates, by name.
 ///
 /// A lower bound: a `CREATE AGGREGATE FUNCTION` UDF is not on this list, and whether a function
 /// aggregates is not decidable from a log.
-const AGGREGATES: [&str; 15] = [
+const AGGREGATES: [&str; 18] = [
     "COUNT",
     "SUM",
     "AVG",
     "MIN",
     "MAX",
     "GROUP_CONCAT",
+    "JSON_ARRAYAGG",
+    "JSON_OBJECTAGG",
     "STD",
     "STDDEV",
     "STDDEV_POP",
@@ -828,20 +840,44 @@ const AGGREGATES: [&str; 15] = [
     "VAR_SAMP",
     "BIT_AND",
     "BIT_OR",
+    "BIT_XOR",
 ];
 
+/// Calls to a built-in aggregate that group the scope an expression sits in.
+///
+/// Not a subquery's, which group that subquery's own scope, and not a window function's:
+/// `SUM(x) OVER (…)` aggregates over a window and leaves every row in place.
 fn aggregate_calls(e: &Expr) -> u32 {
-    let mut n = 0u32;
-    let _ = visit_expressions(e, |x| {
-        if let Expr::Function(f) = x {
-            let last = f.name.0.last().map(|p| p.to_string().to_ascii_uppercase());
-            if last.is_some_and(|l| AGGREGATES.contains(&l.trim_matches('`'))) {
-                n += 1;
-            }
+    struct Counter {
+        depth: usize,
+        n: u32,
+    }
+    impl Visitor for Counter {
+        type Break = ();
+        fn pre_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+            self.depth += 1;
+            ControlFlow::Continue(())
         }
-        ControlFlow::<()>::Continue(())
-    });
-    n
+        fn post_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+            self.depth -= 1;
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+            if self.depth == 0
+                && let Expr::Function(f) = e
+                && f.over.is_none()
+            {
+                let last = f.name.0.last().map(|p| p.to_string().to_ascii_uppercase());
+                if last.is_some_and(|l| AGGREGATES.contains(&l.trim_matches('`'))) {
+                    self.n += 1;
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut c = Counter { depth: 0, n: 0 };
+    let _ = e.visit(&mut c);
+    c.n
 }
 
 /// One appearance of a relation in a statement.
@@ -1439,7 +1475,7 @@ impl Builder {
                 }
                 if let Some(e) = selection {
                     self.walk_expr(e, scope);
-                    self.predicate_edges(e, scope, JoinOp::Predicate, ConstraintKind::On);
+                    self.predicate_edges(e, scope);
                 }
                 // MySQL's single-table `UPDATE … ORDER BY … LIMIT`.
                 self.walk_expr(&u.order_by, scope);
@@ -1491,7 +1527,7 @@ impl Builder {
                 }
                 if let Some(e) = selection {
                     self.walk_expr(e, scope);
-                    self.predicate_edges(e, scope, JoinOp::Predicate, ConstraintKind::On);
+                    self.predicate_edges(e, scope);
                 }
                 // MySQL's single-table `DELETE … ORDER BY … LIMIT`.
                 self.walk_expr(order_by, scope);
@@ -1845,16 +1881,7 @@ impl Builder {
             let Some(e) = expr else { continue };
             self.walk_expr(e, scope);
             let mut path = Vec::new();
-            self.walk_condition(
-                e,
-                scope,
-                JoinOp::Predicate,
-                ConstraintKind::On,
-                clause,
-                true,
-                None,
-                &mut path,
-            );
+            self.walk_condition(e, scope, clause, true, None, &mut path);
         }
         // Clauses that hold expressions and write no split: a subquery there still reads a
         // relation.
@@ -1866,16 +1893,7 @@ impl Builder {
         for item in &select.projection {
             for e in select_item_exprs(item) {
                 let mut path = Vec::new();
-                self.walk_condition(
-                    e,
-                    scope,
-                    JoinOp::Predicate,
-                    ConstraintKind::On,
-                    Clause::Projection,
-                    true,
-                    None,
-                    &mut path,
-                );
+                self.walk_condition(e, scope, Clause::Projection, true, None, &mut path);
             }
         }
     }
@@ -1923,16 +1941,7 @@ impl Builder {
                 if let Some(e) = constraint_expr(&j.join_operator) {
                     self.walk_expr(e, scope);
                     let mut path = Vec::new();
-                    self.walk_condition(
-                        e,
-                        scope,
-                        op,
-                        constraint,
-                        Clause::On,
-                        false,
-                        Some(rhs),
-                        &mut path,
-                    );
+                    self.walk_condition(e, scope, Clause::On, false, Some(rhs), &mut path);
                 }
                 // A `USING (i, j)` list is a relationship per named column. MySQL matches the
                 // same column name on both sides, so each name is an equality whose two sides are
@@ -2142,18 +2151,9 @@ impl Builder {
     /// side cross-multiply into four edges, of which `a–d` and `c–b` were never written down. Only
     /// the comparison arms carry an edge; `AND`, `OR` and `XOR` are descended through and
     /// contribute none of their own.
-    fn predicate_edges(&mut self, expr: &Expr, scope: u32, op: JoinOp, constraint: ConstraintKind) {
+    fn predicate_edges(&mut self, expr: &Expr, scope: u32) {
         let mut path = Vec::new();
-        self.walk_condition(
-            expr,
-            scope,
-            op,
-            constraint,
-            Clause::Where,
-            true,
-            None,
-            &mut path,
-        );
+        self.walk_condition(expr, scope, Clause::Where, true, None, &mut path);
     }
 
     /// Walks one condition, emitting the edges it draws and the splits it writes.
@@ -2165,13 +2165,10 @@ impl Builder {
     /// `emit_edges` is false for a join's `ON`, whose pair is already drawn from the `FROM`
     /// structure by [`Builder::join_edges`]. The splits are still recorded, so a disjunctive join
     /// naming a third relation reaches the predicates even though it draws no edge.
-    #[allow(clippy::too_many_arguments)]
     fn walk_condition(
         &mut self,
         expr: &Expr,
         scope: u32,
-        op: JoinOp,
-        constraint: ConstraintKind,
         clause: Clause,
         emit_edges: bool,
         join_occ: Option<u32>,
@@ -2193,41 +2190,45 @@ impl Builder {
                     connective,
                     branch: 0,
                 });
-                self.walk_condition(
-                    left, scope, op, constraint, clause, emit_edges, join_occ, path,
-                );
+                self.walk_condition(left, scope, clause, emit_edges, join_occ, path);
                 if let Some(last) = path.last_mut() {
                     last.branch = 1;
                 }
-                self.walk_condition(
-                    right, scope, op, constraint, clause, emit_edges, join_occ, path,
-                );
+                self.walk_condition(right, scope, clause, emit_edges, join_occ, path);
                 path.pop();
             }
+            // Only a comparison relates two relations. `a.x + b.y` computes a value from both
+            // and says nothing about which rows of one go with which of the other.
             Expr::BinaryOp { left, right, op: b } => {
+                let Some(pop) = comparison_op(b) else {
+                    return;
+                };
                 if emit_edges {
                     let (l, r) = (
                         self.resolved_qualifiers(left, scope),
                         self.resolved_qualifiers(right, scope),
                     );
+                    // A comparison MySQL has no operator for is not filed as one it has.
+                    let op = match pop {
+                        PredicateOp::NotMySql => JoinOp::NotMySql,
+                        _ => JoinOp::Predicate,
+                    };
                     for a in &l {
                         for b in &r {
                             if a != b {
-                                self.push_edge(*a, *b, op, constraint);
+                                self.push_edge(*a, *b, op, ConstraintKind::None);
                             }
                         }
                     }
                 }
-                if let Some(pop) = comparison_op(b) {
-                    let rhs_scope = self.subquery_scope_of(right, scope);
-                    let (rhs_kind, pop) = match rhs_scope {
-                        Some(_) => (RhsKind::Subquery, PredicateOp::Scalar),
-                        None => (rhs_kind_of(right), pop),
-                    };
-                    self.push_predicate(
-                        scope, clause, path, pop, left, right, rhs_kind, rhs_scope, join_occ,
-                    );
-                }
+                let rhs_scope = self.subquery_scope_of(right, scope);
+                let (rhs_kind, pop) = match rhs_scope {
+                    Some(_) => (RhsKind::Subquery, PredicateOp::Scalar),
+                    None => (rhs_kind_of(right), pop),
+                };
+                self.push_predicate(
+                    scope, clause, path, pop, left, right, rhs_kind, rhs_scope, join_occ,
+                );
             }
             Expr::UnaryOp {
                 op: sqlparser::ast::UnaryOperator::Not,
@@ -2237,11 +2238,11 @@ impl Builder {
                     connective: Connective::Not,
                     branch: 0,
                 });
-                self.walk_condition(e, scope, op, constraint, clause, emit_edges, join_occ, path);
+                self.walk_condition(e, scope, clause, emit_edges, join_occ, path);
                 path.pop();
             }
             Expr::Nested(e) | Expr::UnaryOp { expr: e, .. } => {
-                self.walk_condition(e, scope, op, constraint, clause, emit_edges, join_occ, path)
+                self.walk_condition(e, scope, clause, emit_edges, join_occ, path)
             }
             Expr::IsNull(e) => {
                 self.push_predicate(
@@ -2371,20 +2372,21 @@ impl Builder {
             // the one an unqualified reading would resolve.
             Expr::MatchAgainst { columns, .. } => {
                 if let Some(first) = columns.first() {
-                    let e = Expr::CompoundIdentifier(
-                        first
-                            .0
-                            .iter()
-                            .filter_map(|p| p.as_ident().cloned())
-                            .collect(),
-                    );
-                    self.push_predicate(
+                    let parts: Vec<&Ident> = first.0.iter().filter_map(|p| p.as_ident()).collect();
+                    let lhs = match qualified_column(&parts) {
+                        Some((qualifier, column)) => Side {
+                            occ: qualifier.and_then(|q| self.resolve(&q, scope)),
+                            column: Some(column),
+                        },
+                        None => Side::default(),
+                    };
+                    self.push_predicate_sides(
                         scope,
                         clause,
                         path,
                         PredicateOp::MatchAgainst,
-                        &e,
-                        &e,
+                        lhs,
+                        Side::default(),
                         RhsKind::Literal,
                         None,
                         join_occ,
@@ -2532,7 +2534,14 @@ impl Builder {
     }
 
     /// The scope a subquery on this side was walked into, where there is one.
+    ///
+    /// Parentheses are looked through: `x = ((SELECT …))` compares against the subquery, whose
+    /// scope is keyed on the subquery node and not on the parentheses around it.
     fn subquery_scope_of(&self, expr: &Expr, _scope: u32) -> Option<u32> {
+        let mut expr = expr;
+        while let Expr::Nested(inner) = expr {
+            expr = inner;
+        }
         self.subquery_scopes
             .get(&(std::ptr::from_ref(expr) as usize))
             .copied()
@@ -2579,7 +2588,8 @@ fn comparison_op(op: &sqlparser::ast::BinaryOperator) -> Option<PredicateOp> {
         B::GtEq => PredicateOp::Ge,
         B::Spaceship => PredicateOp::NullSafeEq,
         // MySQL's own, and none of them compares: arithmetic, `DIV`, the bitwise set, the JSON
-        // extractors, and the connectives, which are read as boolean structure elsewhere.
+        // extractors, `:=`, which assigns a user variable, and the connectives, which are read
+        // as boolean structure elsewhere.
         B::Plus
         | B::Minus
         | B::Multiply
@@ -2594,6 +2604,7 @@ fn comparison_op(op: &sqlparser::ast::BinaryOperator) -> Option<PredicateOp> {
         | B::PGBitwiseShiftRight
         | B::Arrow
         | B::LongArrow
+        | B::Assignment
         | B::And
         | B::Or
         | B::Xor => return None,
@@ -5081,5 +5092,158 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// `:=` ASSIGNS A USER VARIABLE AND COMPARES NOTHING. It is MySQL, so it is not the
+    /// diagnostic arm, and it is not a comparison, so it is no split at all.
+    #[test]
+    fn an_assignment_is_not_a_comparison() {
+        let g = graph("SELECT @r := @r + 1 FROM t");
+        assert!(g.predicates.is_empty(), "{:?}", g.predicates);
+        let g = graph("SELECT a FROM t WHERE (@r := a) = 1");
+        assert_eq!(g.predicates.len(), 1);
+        assert_eq!(g.predicates[0].op, PredicateOp::Eq);
+    }
+
+    /// ONLY A COMPARISON RELATES TWO RELATIONS. `a.x + b.y` computes one value out of both and
+    /// says nothing about which rows go together, so it draws no edge; and a `WHERE` comparison
+    /// wrote no join constraint, so its edge does not claim an `ON`.
+    #[test]
+    fn arithmetic_draws_no_edge_and_a_where_edge_claims_no_on() {
+        let g = graph("SELECT a.x + b.y FROM a, b");
+        let ops: Vec<JoinOp> = g.edges.iter().map(|e| e.op).collect();
+        assert_eq!(ops, vec![JoinOp::Comma]);
+        assert!(g.predicates.is_empty());
+
+        // One side computed from both relations and the other from neither relates nothing.
+        let g = graph("SELECT 1 FROM a, b WHERE a.x + b.y = 5");
+        assert!(g.edges.iter().all(|e| e.op == JoinOp::Comma));
+
+        let g = graph("SELECT 1 FROM a, b WHERE a.x + 1 = b.y");
+        let p: Vec<&Edge> = g
+            .edges
+            .iter()
+            .filter(|e| e.op == JoinOp::Predicate)
+            .collect();
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].constraint, ConstraintKind::None);
+
+        for sql in [
+            "UPDATE a JOIN b ON a.id = b.id SET a.x = 1 WHERE a.k = b.k",
+            "SELECT 1 FROM a, b GROUP BY a.id HAVING MAX(a.x) = MAX(b.y)",
+            "SELECT a.x = b.y FROM a, b",
+        ] {
+            let g = graph(sql);
+            assert!(
+                g.edges
+                    .iter()
+                    .filter(|e| e.op == JoinOp::Predicate)
+                    .all(|e| e.constraint == ConstraintKind::None),
+                "{sql}: {:?}",
+                g.edges
+            );
+            assert!(g.edges.iter().any(|e| e.op == JoinOp::Predicate), "{sql}");
+        }
+        // And a join's own `ON` still says so.
+        let g = graph("SELECT 1 FROM a JOIN b ON a.id = b.id");
+        assert_eq!(g.edges[0].constraint, ConstraintKind::On);
+    }
+
+    /// AN AGGREGATE GROUPS ITS OWN SCOPE, AND A WINDOW FUNCTION GROUPS NOTHING.
+    ///
+    /// `projection_aggregate_calls > 0` with no `GROUP BY` reads as implicit grouping, so an
+    /// aggregate counted from a subquery — or a `SUM(x) OVER (…)`, which keeps every row — would
+    /// say a statement collapses to one row when it does not.
+    #[test]
+    fn an_aggregate_is_counted_in_the_scope_it_groups() {
+        let g = graph("SELECT id, (SELECT COUNT(*) FROM u) FROM t");
+        assert_eq!(g.scopes[0].stages.projection_aggregate_calls, 0);
+        assert_eq!(g.scopes[1].stages.projection_aggregate_calls, 1);
+
+        assert_eq!(
+            st("SELECT SUM(x) OVER (PARTITION BY y) FROM t").projection_aggregate_calls,
+            0
+        );
+        assert_eq!(
+            st("SELECT SUM(x) OVER w FROM t WINDOW w AS (ORDER BY y)").projection_aggregate_calls,
+            0
+        );
+        // The inner aggregate groups and the window over it does not.
+        assert_eq!(
+            st("SELECT SUM(COUNT(*)) OVER () FROM t GROUP BY a").projection_aggregate_calls,
+            1
+        );
+        assert_eq!(
+            st("SELECT a FROM t GROUP BY a HAVING COUNT(*) > (SELECT AVG(n) FROM u)")
+                .having_aggregate_calls,
+            1
+        );
+        // The IN's left operand is the scope's own; the subquery it is compared with is not.
+        assert_eq!(
+            st("SELECT a FROM t GROUP BY a HAVING MAX(b) IN (SELECT MAX(c) FROM u)")
+                .having_aggregate_calls,
+            1
+        );
+
+        // MySQL 8.0's whole list.
+        assert_eq!(
+            st("SELECT BIT_XOR(a), JSON_ARRAYAGG(a), JSON_OBJECTAGG(a, b) FROM t")
+                .projection_aggregate_calls,
+            3
+        );
+    }
+
+    /// `MATCH (col) AGAINST (…)` NAMES ITS COLUMN, qualified or not, as every other split does.
+    #[test]
+    fn a_fulltext_search_names_its_column() {
+        let g = graph("SELECT a FROM t WHERE MATCH (body) AGAINST ('x')");
+        let lhs = &g.predicates[0].lhs;
+        assert_eq!(lhs.column.as_deref(), Some(b"body".as_ref()));
+        assert_eq!(lhs.occ, None, "unqualified, as any unqualified column");
+
+        let g = graph("SELECT a FROM t JOIN u ON t.id = u.id WHERE MATCH (u.body) AGAINST ('x')");
+        let m = g
+            .predicates
+            .iter()
+            .find(|p| p.op == PredicateOp::MatchAgainst)
+            .unwrap();
+        assert_eq!(m.lhs.occ, Some(1));
+        assert_eq!(m.lhs.column.as_deref(), Some(b"body".as_ref()));
+    }
+
+    /// A SUBQUERY IN PARENTHESES IS STILL THE SUBQUERY. `x = ((SELECT …))` compares against it,
+    /// so the split is scalar and names the scope, rather than an `=` against an operand with no
+    /// scope.
+    #[test]
+    fn parentheses_around_a_subquery_are_looked_through() {
+        let g = graph("SELECT a FROM t WHERE x = ((SELECT MAX(y) FROM u))");
+        let p = &g.predicates[0];
+        assert_eq!(p.op, PredicateOp::Scalar);
+        assert_eq!(p.rhs_kind, RhsKind::Subquery);
+        assert_eq!(p.rhs_scope, Some(1));
+
+        let g = graph("SELECT a FROM t WHERE x > ANY ((SELECT y FROM u))");
+        assert_eq!(g.predicates[0].rhs_scope, Some(1));
+    }
+
+    /// `XOR`, `||` AND `&&` ARE BOUND TIGHTER THAN `=` BY THIS GRAMMAR, and looser by MySQL.
+    ///
+    /// The text is accepted and the tree is not the one the server ran, so each arrives as one
+    /// comparison over no column. This is the grammar's regime and is recorded rather than
+    /// re-parsed; parenthesised operands are read as MySQL reads them.
+    #[test]
+    fn xor_and_the_symbol_connectives_are_bound_by_the_grammar() {
+        for sql in [
+            "SELECT a FROM t WHERE a = 1 XOR b = 2",
+            "SELECT a FROM t WHERE a = 1 || b = 2",
+            "SELECT a FROM t WHERE a = 1 && b = 2",
+        ] {
+            let g = graph(sql);
+            assert_eq!(g.predicates.len(), 1, "{sql}");
+            assert_eq!(g.predicates[0].lhs.column, None, "{sql}");
+        }
+        let s = splits("SELECT a FROM t WHERE (a = 1) XOR (b = 2)");
+        let paths: Vec<&str> = s.iter().map(|(_, p, _)| p.as_str()).collect();
+        assert_eq!(paths, ["xor[0]", "xor[1]"]);
     }
 }
