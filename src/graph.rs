@@ -48,11 +48,12 @@
 
 use bytes::Bytes;
 use sqlparser::ast::{
-    Cte, Delete, Distinct, Expr, FromTable, GroupByExpr, GroupByWithModifier, Insert,
-    JoinConstraint, JoinOperator, LockClause, LockTableType, LockType, NonBlock, ObjectName,
-    ObjectNamePart, ObjectType, OnInsert, OptimizerHintStyle, OrderByKind, Query, Select, SetExpr,
-    ShowCreateObject, Statement, TableFactor, TableIndexHintForClause, TableIndexHintType,
-    TableIndexType, TableObject, TableWithJoins, UpdateTableFromKind, visit_expressions,
+    Assignment, AssignmentTarget, Cte, Delete, Distinct, Expr, FromTable, GroupByExpr,
+    GroupByWithModifier, Ident, Insert, JoinConstraint, JoinOperator, LockClause, LockTableType,
+    LockType, NonBlock, ObjectName, ObjectNamePart, ObjectType, OnInsert, OptimizerHintStyle,
+    OrderByKind, Query, Select, SetExpr, ShowCreateObject, Statement, TableFactor,
+    TableIndexHintForClause, TableIndexHintType, TableIndexType, TableObject, TableWithJoins,
+    UpdateTableFromKind, visit_expressions,
 };
 use std::ops::ControlFlow;
 
@@ -64,13 +65,22 @@ use std::ops::ControlFlow;
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum RelationRole {
-    /// the first relation of a `FROM` clause
+    /// the first relation of a `FROM` clause, or of a multi-table `UPDATE`'s table list where the
+    /// statement only reads it
     From,
     /// a relation introduced by a `JOIN`, or by a comma in a `FROM` list
     Join,
     /// the relation an `INSERT` writes to
     InsertTarget,
     /// the relation an `UPDATE` writes to
+    ///
+    /// In a multi-table `UPDATE` that is each relation a `SET` assignment names by its qualifier,
+    /// and a relation joined in only to be read keeps [`RelationRole::From`] or
+    /// [`RelationRole::Join`]. An unqualified assignment there belongs to whichever relation has
+    /// the column, which only the catalogue can say, so every base relation of the statement is
+    /// filed as a target: a write filed as a read would hide a conflict, where the reverse only
+    /// proposes one. MySQL's comma form, `UPDATE a, b SET …`, is refused by this grammar and
+    /// reaches a caller as an invalid statement.
     UpdateTarget,
     /// a relation a `DELETE` removes rows from
     DeleteTarget,
@@ -938,6 +948,10 @@ impl StatementGraph {
     /// than by an assumption made here.
     ///
     /// [`Self::measures_collapsed_by_name`] is the other reading, and it belongs to a reader.
+    ///
+    /// An occurrence that refers to another ([`RelationOccurrence::resolves_to_occ`]) is measured
+    /// as the one it refers to, under either reading: a multi-table `DELETE`'s target list names
+    /// relations the statement already introduced and adds none of its own.
     pub fn measures(&self) -> GraphMeasures {
         self.measure_by(|_, occ| format!("\u{0}occ{occ}").into_bytes())
     }
@@ -964,14 +978,24 @@ impl StatementGraph {
     }
 
     fn measure_by(&self, key_of: impl Fn(&RelationOccurrence, u32) -> Vec<u8>) -> GraphMeasures {
+        // One hop and no further: a referent is a relation the statement introduced, never
+        // another reference.
+        let referent = |occ: u32| -> u32 {
+            self.occurrences
+                .get(occ as usize)
+                .and_then(|o| o.resolves_to_occ)
+                .filter(|r| self.occurrences.get(*r as usize).is_some())
+                .unwrap_or(occ)
+        };
         let key = |occ: u32| -> Vec<u8> {
+            let occ = referent(occ);
             match self.occurrences.get(occ as usize) {
                 Some(o) => key_of(o, occ),
                 None => format!("\u{0}gone{occ}").into_bytes(),
             }
         };
 
-        let mut nodes: Vec<Vec<u8>> = self.occurrences.iter().map(|o| key_of(o, o.occ)).collect();
+        let mut nodes: Vec<Vec<u8>> = self.occurrences.iter().map(|o| key(o.occ)).collect();
         nodes.sort();
         nodes.dedup();
         let index = |k: &Vec<u8>| nodes.binary_search(k).expect("node was collected above");
@@ -1219,25 +1243,102 @@ impl Builder {
     ///
     /// Innermost wins, because that is what SQL does: a correlated subquery may rebind an alias
     /// the outer query already bound to a different relation.
-    fn resolve(&self, qualifier: &Bytes, scope: u32) -> Option<u32> {
+    fn resolve(&self, qualifier: &Qualifier, scope: u32) -> Option<u32> {
         let mut at = Some(scope);
         while let Some(id) = at {
-            if let Some(o) = self
-                .graph
-                .occurrences
-                .iter()
-                .find(|o| o.scope == id && o.alias.as_ref() == Some(qualifier))
-            {
-                return Some(o.occ);
-            }
-            if let Some(o) = self.graph.occurrences.iter().find(|o| {
-                o.scope == id && o.alias.is_none() && o.object_name.as_ref() == Some(qualifier)
-            }) {
-                return Some(o.occ);
+            if let Some(o) = self.find_in_scope(qualifier, id) {
+                return Some(o);
             }
             at = self.graph.scopes.get(id as usize)?.parent;
         }
         None
+    }
+
+    /// The occurrence a qualifier names inside one scope.
+    ///
+    /// A relation the scope reads — [`RelationRole::From`] or [`RelationRole::Join`] — is taken
+    /// before a mention of the same name in a write position, because that is where a clause's
+    /// columns come from. `DELETE t1 FROM t1 JOIN t2 ON t1.id = t2.id` mentions `t1` twice, and
+    /// the `ON` compares the one the `FROM` reads; `INSERT INTO t SELECT t.a FROM t` shares one
+    /// scope between the target and the source, and `t.a` is the source's column.
+    ///
+    /// An alias is matched before a written name, and a qualifier written with a schema matches no
+    /// alias, since MySQL does not qualify one.
+    fn find_in_scope(&self, qualifier: &Qualifier, scope: u32) -> Option<u32> {
+        let names = |o: &RelationOccurrence, by_alias: bool| match (&o.alias, by_alias) {
+            (Some(a), true) => qualifier.schema.is_none() && *a == qualifier.name,
+            (None, false) => {
+                o.object_name.as_ref() == Some(&qualifier.name)
+                    && (qualifier.schema.is_none()
+                        || o.schema_name.is_none()
+                        || o.schema_name == qualifier.schema)
+            }
+            _ => false,
+        };
+        let reads =
+            |o: &RelationOccurrence| matches!(o.role, RelationRole::From | RelationRole::Join);
+        for reads_only in [true, false] {
+            for by_alias in [true, false] {
+                if let Some(o) =
+                    self.graph.occurrences.iter().find(|o| {
+                        o.scope == scope && (!reads_only || reads(o)) && names(o, by_alias)
+                    })
+                {
+                    return Some(o.occ);
+                }
+            }
+        }
+        None
+    }
+
+    /// Files the relations an `UPDATE`'s assignments write as its targets, among the occurrences
+    /// its table list introduced.
+    ///
+    /// Decided by the assignments and not by position: `UPDATE a JOIN b ON … SET b.x = 1` writes
+    /// `b` and only reads `a`. See [`RelationRole::UpdateTarget`] for an unqualified assignment.
+    fn mark_update_targets(
+        &mut self,
+        assignments: &[Assignment],
+        scope: u32,
+        listed: std::ops::Range<usize>,
+    ) {
+        let mut targets: Vec<usize> = Vec::new();
+        let mut unattributed = false;
+        for a in assignments {
+            let columns: Vec<&ObjectName> = match &a.target {
+                AssignmentTarget::ColumnName(n) => vec![n],
+                AssignmentTarget::Tuple(ns) => ns.iter().collect(),
+            };
+            for n in columns {
+                let parts: Vec<&Ident> = n.0.iter().filter_map(|p| p.as_ident()).collect();
+                let written = qualified_column(&parts)
+                    .and_then(|(q, _)| q)
+                    .and_then(|q| self.find_in_scope(&q, scope))
+                    .map(|o| o as usize)
+                    .filter(|o| listed.contains(o));
+                match written {
+                    Some(o) if !targets.contains(&o) => targets.push(o),
+                    Some(_) => {}
+                    None => unattributed = true,
+                }
+            }
+        }
+        if unattributed {
+            // A derived table and a CTE are not updatable in MySQL, so neither can own the column.
+            for i in listed {
+                let o = &self.graph.occurrences[i];
+                if o.scope == scope
+                    && o.object_name.is_some()
+                    && o.resolves_to_cte.is_none()
+                    && !targets.contains(&i)
+                {
+                    targets.push(i);
+                }
+            }
+        }
+        for t in targets {
+            self.graph.occurrences[t].role = RelationRole::UpdateTarget;
+        }
     }
 
     fn walk_statement(&mut self, statement: &Statement, scope: u32) {
@@ -1286,18 +1387,19 @@ impl Builder {
                 self.push_optimizer_hints(&u.optimizer_hints, scope);
                 let (table, from, selection) = (&u.table, &u.from, &u.selection);
                 // MySQL's multi-table `UPDATE a JOIN b` puts a whole join graph in the target
-                // position, so this is a `TableWithJoins` and not a name.
-                let ids = self.collect_from(
-                    std::slice::from_ref(table),
-                    scope,
-                    RelationRole::UpdateTarget,
-                );
+                // position, so this is a `TableWithJoins` and not a name, and which of its
+                // relations are written is for the assignments to say.
+                let first = self.graph.occurrences.len();
+                let ids = self.collect_from(std::slice::from_ref(table), scope, RelationRole::From);
+                let listed = first..self.graph.occurrences.len();
+                self.mark_update_targets(&u.assignments, scope, listed);
                 self.join_edges(std::slice::from_ref(table), scope, &ids);
                 if let Some(UpdateTableFromKind::BeforeSet(f) | UpdateTableFromKind::AfterSet(f)) =
                     from
                 {
                     let ids = self.collect_from(f, scope, RelationRole::From);
                     self.join_edges(f, scope, &ids);
+                    self.comma_edges(&ids);
                 }
                 // `SET n = (SELECT … FROM other)` reads `other`. `objects()` sees it, because
                 // `Assignment.value` carries the `visit_relation` annotation.
@@ -1341,9 +1443,15 @@ impl Builder {
                 };
                 let ids = self.collect_from(f, scope, base);
                 self.join_edges(f, scope, &ids);
+                // Under `USING` the `FROM` is a list of the tables deleted from, and its commas
+                // separate names rather than joining relations.
+                if using.is_none() {
+                    self.comma_edges(&ids);
+                }
                 if let Some(u) = using {
                     let ids = self.collect_from(u, scope, RelationRole::From);
                     self.join_edges(u, scope, &ids);
+                    self.comma_edges(&ids);
                 }
                 // An `UPDATE`/`DELETE` `WHERE` is a filter stage with no `Select` at all, so
                 // it is recorded here or nowhere: a scope is not one `Select`.
@@ -1674,6 +1782,7 @@ impl Builder {
         // reached yet and a one-pass walk would drop that edge.
         let ids = self.collect_from(&select.from, scope, RelationRole::From);
         self.join_edges(&select.from, scope, &ids);
+        self.comma_edges(&ids);
 
         let clauses = [
             (select.selection.as_ref(), Clause::Where),
@@ -1748,8 +1857,6 @@ impl Builder {
     /// can resolve.
     fn join_edges(&mut self, from: &[TableWithJoins], scope: u32, ids: &[Vec<u32>]) {
         for (twj, ids) in from.iter().zip(ids) {
-            // A comma in a `FROM` list is a cross join between whole `TableWithJoins`, which is
-            // why it is drawn between the first relations of each rather than inside one.
             for (i, j) in twj.joins.iter().enumerate() {
                 let rhs = ids[i + 1];
                 let (op, constraint) = classify(&j.join_operator);
@@ -1812,6 +1919,14 @@ impl Builder {
                 }
             }
         }
+    }
+
+    /// The commas of a `FROM` list: a cross join between whole `TableWithJoins`, drawn between
+    /// the first relations of each rather than inside one.
+    ///
+    /// Apart from [`Builder::join_edges`] because not every list joins: a `DELETE … USING`
+    /// target list names the tables deleted from.
+    fn comma_edges(&mut self, ids: &[Vec<u32>]) {
         for pair in ids.windows(2) {
             if let (Some(a), Some(b)) = (pair[0].first(), pair[1].first()) {
                 self.push_edge(*a, *b, JoinOp::Comma, ConstraintKind::None);
@@ -2471,17 +2586,34 @@ fn rhs_kind_of(expr: &Expr) -> RhsKind {
     }
 }
 
-/// The `(qualifier, column)` a side names, where it names one.
+/// The relation a column reference names, as the author wrote it.
+struct Qualifier {
+    /// the schema the relation was qualified with, where it was
+    schema: Option<Bytes>,
+    /// the relation's alias or written name
+    name: Bytes,
+}
+
+/// The `(qualifier, column)` a dotted name writes: `c`, `t.c` or `db.t.c`.
 ///
-/// Matched on the last two identifiers, so `schema.table.column` resolves on `table` — the rule
-/// MySQL itself enforces, since a relation given an alias may not be referred to by its name.
-fn column_ref(expr: &Expr) -> Option<(Option<Bytes>, Bytes)> {
+/// The last part is the column and the one before it the relation, so `schema.table.column`
+/// resolves on `table` — the rule MySQL itself enforces, since a relation given an alias may not
+/// be referred to by its name. Every reading of a column reference goes through here, so the side
+/// of a split and the edge it draws cannot disagree about which relation a qualifier names.
+fn qualified_column(parts: &[&Ident]) -> Option<(Option<Qualifier>, Bytes)> {
+    let (column, rest) = parts.split_last()?;
+    let qualifier = rest.split_last().map(|(name, rest)| Qualifier {
+        schema: rest.last().map(|s| ident_bytes(s)),
+        name: ident_bytes(name),
+    });
+    Some((qualifier, ident_bytes(column)))
+}
+
+/// The `(qualifier, column)` a side names, where it names one. See [`qualified_column`].
+fn column_ref(expr: &Expr) -> Option<(Option<Qualifier>, Bytes)> {
     match expr {
-        Expr::Identifier(i) => Some((None, ident_bytes(i))),
-        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => Some((
-            Some(ident_bytes(&parts[parts.len() - 2])),
-            ident_bytes(&parts[parts.len() - 1]),
-        )),
+        Expr::Identifier(i) => qualified_column(&[i]),
+        Expr::CompoundIdentifier(parts) => qualified_column(&parts.iter().collect::<Vec<_>>()),
         Expr::Nested(inner) => column_ref(inner),
         _ => None,
     }
@@ -2561,9 +2693,13 @@ fn set_operator_of(
     }
 }
 
-fn collect_qualifiers(expr: &Expr, f: &mut impl FnMut(Bytes)) {
+fn collect_qualifiers(expr: &Expr, f: &mut impl FnMut(Qualifier)) {
     match expr {
-        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => f(ident_bytes(&parts[0])),
+        Expr::CompoundIdentifier(_) => {
+            if let Some((Some(q), _)) = column_ref(expr) {
+                f(q);
+            }
+        }
         Expr::BinaryOp { left, right, .. } => {
             collect_qualifiers(left, f);
             collect_qualifiers(right, f);
@@ -2700,7 +2836,7 @@ fn join_constraint(op: &JoinOperator) -> Option<&JoinConstraint> {
     Some(c)
 }
 
-fn ident_bytes(i: &sqlparser::ast::Ident) -> Bytes {
+fn ident_bytes(i: &Ident) -> Bytes {
     Bytes::from(i.value.clone())
 }
 
@@ -4503,5 +4639,176 @@ mod tests {
             1,
             "the statement's own scope exists even when it names nothing"
         );
+    }
+
+    /// The occurrence with this identity that is not a write-position mention of it.
+    fn read_occ(g: &StatementGraph, identity: &str) -> u32 {
+        g.occurrences
+            .iter()
+            .find(|o| {
+                o.identity().as_deref() == Some(identity.as_bytes())
+                    && matches!(o.role, RelationRole::From | RelationRole::Join)
+            })
+            .unwrap_or_else(|| panic!("no read of {identity} in {:?}", ids(g)))
+            .occ
+    }
+
+    /// A QUALIFIER BINDS TO THE RELATION THE CLAUSE READS, not to a mention of the same name in a
+    /// write position.
+    ///
+    /// A multi-table `DELETE`'s target list and an `INSERT … SELECT`'s target are walked before
+    /// the `FROM` they sit beside, so a first-match rule hands every `t1.x` to the mention: the
+    /// join's condition lands on names that read nothing and the relation actually read is left
+    /// isolated.
+    #[test]
+    fn a_qualifier_binds_to_the_relation_the_clause_reads() {
+        for sql in [
+            "DELETE t1, t2 FROM t1 JOIN t2 ON t1.id = t2.t1_id WHERE t1.x = 1",
+            "DELETE FROM t1 USING t1 JOIN t2 ON t1.id = t2.t1_id WHERE t1.x = 1",
+            "DELETE FROM t1, t2 USING t1 JOIN t2 ON t1.id = t2.t1_id WHERE t1.x = 1",
+        ] {
+            let g = graph(sql);
+            let (t1, t2) = (read_occ(&g, "t1"), read_occ(&g, "t2"));
+            let on = g
+                .predicates
+                .iter()
+                .find(|p| p.clause == Clause::On)
+                .unwrap();
+            assert_eq!((on.lhs.occ, on.rhs.occ), (Some(t1), Some(t2)), "{sql}");
+            let wh = g
+                .predicates
+                .iter()
+                .find(|p| p.clause == Clause::Where)
+                .unwrap();
+            assert_eq!(wh.lhs.occ, Some(t1), "{sql}");
+            assert!(
+                g.edges
+                    .iter()
+                    .all(|e| [t1, t2].contains(&e.lhs) && [t1, t2].contains(&e.rhs)),
+                "{sql}: an edge touches a mention: {:?}",
+                g.edges
+            );
+            let m = g.measures();
+            assert_eq!((m.nodes, m.edges, m.components), (2, 1, 1), "{sql}");
+        }
+
+        let g = graph("INSERT INTO t (a) SELECT t.a FROM t JOIN u ON u.id = t.id WHERE t.b = 2");
+        let (t, u) = (read_occ(&g, "t"), read_occ(&g, "u"));
+        assert_eq!(g.occurrences[0].role, RelationRole::InsertTarget);
+        assert_ne!(t, 0, "the source's t, not the target");
+        let on = g
+            .predicates
+            .iter()
+            .find(|p| p.clause == Clause::On)
+            .unwrap();
+        assert_eq!((on.lhs.occ, on.rhs.occ), (Some(u), Some(t)));
+        let wh = g
+            .predicates
+            .iter()
+            .find(|p| p.clause == Clause::Where)
+            .unwrap();
+        assert_eq!(wh.lhs.occ, Some(t));
+        assert_eq!(g.edges.len(), 1);
+        assert_eq!((g.edges[0].lhs, g.edges[0].rhs), (t, u));
+
+        // And where nothing reads the name, the write position is what it names: a single-table
+        // statement's target is also the relation its `WHERE` filters.
+        let g = graph("DELETE FROM t WHERE t.x = 1");
+        assert_eq!(g.predicates[0].lhs.occ, Some(0));
+    }
+
+    /// A MULTI-TABLE `UPDATE` WRITES WHAT ITS ASSIGNMENTS NAME, whatever position it holds.
+    #[test]
+    fn an_update_writes_the_relations_its_assignments_name() {
+        let roles = |sql: &str| -> Vec<(String, RelationRole)> {
+            let g = graph(sql);
+            ids(&g)
+                .into_iter()
+                .zip(g.occurrences.iter().map(|o| o.role))
+                .collect()
+        };
+        use RelationRole::*;
+        assert_eq!(
+            roles("UPDATE a JOIN b ON a.id = b.id SET b.x = 1"),
+            vec![("a".into(), From), ("b".into(), UpdateTarget)]
+        );
+        assert_eq!(
+            roles("UPDATE orders o JOIN customers c ON o.cid = c.id SET o.status = c.tier"),
+            vec![("o".into(), UpdateTarget), ("c".into(), Join)]
+        );
+        assert_eq!(
+            roles("UPDATE a JOIN b ON a.id = b.id SET a.x = 1, b.y = 2"),
+            vec![("a".into(), UpdateTarget), ("b".into(), UpdateTarget)]
+        );
+        // MySQL's comma form is the grammar's refusal and not the server's.
+        assert!(Parser::parse_sql(&MySqlDialect {}, "UPDATE a, b SET a.x = 1").is_err());
+        // Unqualified in a single-table `UPDATE`: the one relation there is.
+        assert_eq!(
+            roles("UPDATE t SET a = 1"),
+            vec![("t".into(), UpdateTarget)]
+        );
+        assert_eq!(
+            roles("UPDATE shop.t SET shop.t.a = 1"),
+            vec![("t".into(), UpdateTarget)]
+        );
+        // Unqualified in a multi-table one: the column's owner is the catalogue's to say, so
+        // every base relation is a target and the derived table, which MySQL cannot update, is
+        // not.
+        assert_eq!(
+            roles("UPDATE a JOIN b ON a.id = b.id SET x = 1"),
+            vec![("a".into(), UpdateTarget), ("b".into(), UpdateTarget)]
+        );
+        assert_eq!(
+            roles("UPDATE a JOIN (SELECT id FROM c) d ON a.id = d.id SET x = 1"),
+            vec![
+                ("a".into(), UpdateTarget),
+                ("d".into(), Join),
+                ("c".into(), From)
+            ]
+        );
+    }
+
+    /// THE TARGETS OF A `DELETE … USING` ARE A LIST AND NOT A JOIN. The commas separate the
+    /// names of the tables deleted from, so drawing them as comma joins relates two relations the
+    /// statement never put together.
+    #[test]
+    fn a_delete_target_list_joins_nothing() {
+        let g = graph("DELETE FROM t1, t2 USING t1 JOIN t2 ON t1.id = t2.id");
+        assert!(
+            g.edges.iter().all(|e| e.op != JoinOp::Comma),
+            "{:?}",
+            g.edges
+        );
+        let m = g.measures();
+        assert_eq!((m.nodes, m.edges, m.cycle_space), (2, 1, 0));
+
+        // The source list of a multi-table delete is a `FROM` like any other, and its commas do
+        // join.
+        let g = graph("DELETE t1 FROM t1, t2 WHERE t1.id = t2.id");
+        assert!(g.edges.iter().any(|e| e.op == JoinOp::Comma));
+    }
+
+    /// A SCHEMA-QUALIFIED COLUMN NAMES ITS RELATION BY THE PART BEFORE THE COLUMN, for the split
+    /// and for the edge alike. Read one way for one and another way for the other, both sides of
+    /// `shop.a.id = shop.b.a_id` resolve and no relationship is drawn.
+    #[test]
+    fn a_schema_qualified_column_draws_the_edge_its_split_names() {
+        let g = graph("SELECT 1 FROM shop.a, shop.b WHERE shop.a.id = shop.b.a_id");
+        let p = &g.predicates[0];
+        assert_eq!((p.lhs.occ, p.rhs.occ), (Some(0), Some(1)));
+        assert!(
+            g.edges
+                .iter()
+                .any(|e| e.op == JoinOp::Predicate && (e.lhs, e.rhs) == (0, 1)),
+            "{:?}",
+            g.edges
+        );
+
+        // The schema is part of the match where the relation was written with one.
+        let g = graph("SELECT 1 FROM shop.a, other.a AS x WHERE other.a.id = 1");
+        assert_eq!(g.predicates[0].lhs.occ, None, "other.a is aliased as x");
+        let g = graph("SELECT 1 FROM shop.a JOIN other.b ON shop.a.id = other.b.id");
+        assert_eq!(g.edges.len(), 1);
+        assert_eq!((g.edges[0].lhs, g.edges[0].rhs), (0, 1));
     }
 }
