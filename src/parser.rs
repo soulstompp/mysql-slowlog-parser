@@ -1137,43 +1137,49 @@ fn escape_payload(s: &str, quote: char) -> String {
 /// than it must, which costs fidelity and not confidentiality.
 ///
 /// It reads inside MySQL version gates, `/*!40101 … */`, whatever their version, because the
-/// server executes what is inside one.
+/// server executes what is inside one; and inside optimizer hints, `/*+ … */`, because the server
+/// parses those, and `SET_VAR(sort_buffer_size = 16777216)` carries a value. Any other comment is
+/// not read, `/* !40101 … */` included: with a space before the `!` MySQL does not execute it.
+/// A caller publishing the text on a `false` publishes its comments as written.
 ///
 /// A value written as an identifier is invisible here, and no token scan can see it: in
 /// ``DEFINER=`msandbox`@`%` `` a username and a host are backtick identifiers. A caller must not
 /// read a `false` as covering that case.
 pub fn carries_a_value(sql: &str) -> Option<bool> {
-    fn scan(sql: &str, depth: u32) -> Option<bool> {
-        if depth > 4 {
-            return Some(false);
+    // `MySqlDialect` tokenizes a version gate's body in place, so a gate needs nothing here.
+    let tokens = Tokenizer::new(&MySqlDialect {}, sql).tokenize().ok()?;
+    for t in &tokens {
+        if is_literal_token(t) {
+            return Some(true);
         }
-        let tokens = Tokenizer::new(&MySqlDialect {}, sql).tokenize().ok()?;
-        for t in &tokens {
-            match t {
-                Token::Number(..)
-                | Token::SingleQuotedString(_)
-                | Token::DoubleQuotedString(_)
-                | Token::NationalStringLiteral(_)
-                | Token::HexStringLiteral(_)
-                | Token::EscapedStringLiteral(_)
-                | Token::SingleQuotedByteStringLiteral(_)
-                | Token::DoubleQuotedByteStringLiteral(_) => return Some(true),
-                Token::Whitespace(Whitespace::MultiLineComment(body)) => {
-                    // `MySqlDialect` expands `/*!40101 … */` into tokens itself; what reaches
-                    // here is a body that starts `!` only after whitespace.
-                    if let Some(rest) = body.trim_start().strip_prefix('!') {
-                        let inner = rest.trim_start_matches(|c: char| c.is_ascii_digit());
-                        if scan(inner, depth + 1)? {
-                            return Some(true);
-                        }
-                    }
-                }
-                _ => {}
+        if let Token::Whitespace(Whitespace::MultiLineComment(body)) = t
+            && let Some(hint) = body.strip_prefix('+')
+        {
+            let inner = Tokenizer::new(&MySqlDialect {}, hint).tokenize().ok()?;
+            if inner.iter().any(is_literal_token) {
+                return Some(true);
             }
         }
-        Some(false)
     }
-    scan(sql, 0)
+    Some(false)
+}
+
+/// Whether a token is a value the author wrote: a quoted string, a number, a hex or bit literal,
+/// or `0b…`, which `MySqlDialect` lexes as a word. A number inside a name is part of the name's
+/// token and is not one.
+fn is_literal_token(t: &Token) -> bool {
+    match t {
+        Token::Number(..)
+        | Token::SingleQuotedString(_)
+        | Token::DoubleQuotedString(_)
+        | Token::NationalStringLiteral(_)
+        | Token::HexStringLiteral(_)
+        | Token::EscapedStringLiteral(_)
+        | Token::SingleQuotedByteStringLiteral(_)
+        | Token::DoubleQuotedByteStringLiteral(_) => true,
+        Token::Word(w) => w.quote_style.is_none() && bit_digits(&w.value).is_some(),
+        _ => false,
+    }
 }
 
 /// The kind and payload of a `Value` this crate records as a literal, or `None` for one it does
@@ -2016,6 +2022,47 @@ mod a_literal_can_be_replaced_by_its_surrogate {
         // blanket `true` on every gated statement.
         assert_eq!(
             carries_a_value("/*!40101 SET character_set_client = utf8 */;"),
+            Some(false)
+        );
+    }
+
+    /// AN OPTIMIZER HINT IS READ, AND A COMMENT THE SERVER DOES NOT EXECUTE IS NOT.
+    ///
+    /// The server parses a `/*+ … */` hint, and `SET_VAR` takes a value. `/* !40103 … */`, with
+    /// a space before the `!`, is an ordinary comment to MySQL.
+    #[test]
+    fn a_value_inside_an_optimizer_hint_is_still_a_value() {
+        assert_eq!(
+            carries_a_value(
+                "SELECT /*+ SET_VAR(sort_buffer_size = 16777216) */ a FROM t LOCK IN SHARE MODE"
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            carries_a_value("SELECT /*+ SET_VAR(sql_mode = 'ANSI') */ a FROM t"),
+            Some(true)
+        );
+        // A hint that names only tables and indexes carries nothing.
+        assert_eq!(
+            carries_a_value("SELECT /*+ BKA(t1) NO_ICP(t1 idx2) */ a FROM t1"),
+            Some(false)
+        );
+        assert_eq!(
+            carries_a_value("/* !40103 SET TIME_ZONE='+00:00' */ UNLOCK TABLES"),
+            Some(false)
+        );
+        assert_eq!(carries_a_value("UNLOCK TABLES /* 42 */"), Some(false));
+    }
+
+    /// `0b…` IS A VALUE, and a digit inside a name is not.
+    #[test]
+    fn a_bit_literal_is_a_value_and_a_digit_in_a_name_is_not() {
+        assert_eq!(
+            carries_a_value("ALTER TABLE t1 ALTER c2 SET DEFAULT 0b1"),
+            Some(true)
+        );
+        assert_eq!(
+            carries_a_value("OPTIMIZE TABLE t1, `t2`, db3.t4"),
             Some(false)
         );
     }
