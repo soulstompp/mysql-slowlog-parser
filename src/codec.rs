@@ -1062,9 +1062,8 @@ mod graph_census {
             }
             // Nothing `objects()` found may be missing from the graph; the reverse is allowed.
             //
-            // The comparison strips backticks: `objects()` builds its names with `to_string()`,
-            // which renders the quote style, so `` `actor` `` and `actor` are two entries there.
-            // The graph carries the unquoted value.
+            // Both carry a name's unquoted value. `quoted` counts any name `objects()` still
+            // reports in backticks.
             for o in s.objects() {
                 let raw = o.object_name();
                 let bare = raw.trim_matches('`');
@@ -1089,13 +1088,11 @@ mod graph_census {
 
         missed.sort();
         missed.dedup();
-        // One miss, and it is not a relation. `SHOW TABLES FROM mysql` names a schema, and
-        // `ShowStatementIn.parent_name` carries a `visit_relation` annotation, so `objects()`
-        // files the schema `mysql` as though it were a table. The graph declines to.
-        assert_eq!(
-            missed,
-            vec!["mysql <- ShowTables".to_string()],
-            "the graph may hold more than objects(), and may lose nothing that is a relation"
+        // No miss. `SHOW TABLES FROM mysql` names a schema, which neither files.
+        assert!(
+            missed.is_empty(),
+            "the graph may hold more than objects(), and may lose nothing that is a relation: \
+             {missed:?}"
         );
 
         assert_eq!(parsed, 310);
@@ -1139,8 +1136,8 @@ mod graph_census {
         // The seven views this log creates, each a create target outside its own body.
         assert_eq!(view_targets, 7);
 
-        // 46 names `objects()` reports wrapped in backticks and the graph reports bare.
-        assert_eq!(quoted, 46, "names objects() spells with backticks");
+        // The log writes 46 of these names in backticks, and `objects()` reports every one bare.
+        assert_eq!(quoted, 0, "names objects() spells with backticks");
     }
 }
 

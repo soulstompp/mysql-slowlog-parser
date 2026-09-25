@@ -2,7 +2,9 @@ use crate::graph::StatementGraph;
 use crate::parser::EntryLiteral;
 use crate::{EntryAdminCommand, SessionLine, SqlStatementContext, StatsLine};
 use bytes::{BufMut, Bytes, BytesMut};
-use sqlparser::ast::{ObjectType, SetExpr, ShowCreateObject, Statement, visit_relations};
+use sqlparser::ast::{
+    ObjectNamePart, ObjectType, SetExpr, ShowCreateObject, Statement, visit_relations,
+};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
@@ -131,23 +133,44 @@ impl EntrySqlStatement {
     /// A set, so multiplicity, position, nesting depth and the relationships between the
     /// relations are not carried. [`Self::relation_graph`] is the same parse with them.
     ///
-    /// Each name is rendered with its quoting, so `` `t` `` and `t` are two entries, and
-    /// `SHOW TABLES FROM db` files the schema `db` as though it were a relation.
+    /// Each name is the identifier's value without its quoting, so `` `t` `` and `t` are one
+    /// entry. Case is kept: whether `T` and `t` are one table depends on the server's
+    /// `lower_case_table_names`, which a slow log does not record.
+    ///
+    /// The `db` of `SHOW TABLES FROM db` names a schema and not a relation, and is not among them.
     pub fn objects(&self) -> Vec<EntrySqlStatementObject> {
+        // `ShowStatementIn.parent_name` carries `visit_relation`, and under `SHOW TABLES` it
+        // holds a schema. Told apart by identity, as the same field names a table under
+        // `SHOW COLUMNS`.
+        let schema = match &self.statement {
+            Statement::ShowTables { show_options, .. } => show_options
+                .show_in
+                .as_ref()
+                .and_then(|s| s.parent_name.as_ref()),
+            _ => None,
+        };
+
         let mut visited = BTreeSet::new();
 
         let _ = visit_relations(&self.statement, |relation| {
+            if schema.is_some_and(|s| std::ptr::eq(s, relation)) {
+                return ControlFlow::<()>::Continue(());
+            }
+            let part = |p: &ObjectNamePart| match p.as_ident() {
+                Some(i) => Bytes::from(i.value.clone()),
+                None => Bytes::from(p.to_string()),
+            };
             let ident = &relation.0;
 
             let _ = visited.insert(if ident.len() == 2 {
                 EntrySqlStatementObject {
-                    schema_name: Some(Bytes::from(ident[0].to_string())),
-                    object_name: Bytes::from(ident[1].to_string()),
+                    schema_name: Some(part(&ident[0])),
+                    object_name: part(&ident[1]),
                 }
             } else {
                 EntrySqlStatementObject {
                     schema_name: None,
-                    object_name: ident.last().unwrap().to_string().to_owned().into(),
+                    object_name: part(ident.last().unwrap()),
                 }
             });
 
@@ -1015,5 +1038,46 @@ mod every_sql_type_arm {
         assert_eq!(labels.len(), 42);
         let distinct: BTreeSet<&String> = labels.iter().collect();
         assert_eq!(distinct.len(), 42, "two arms share a label: {labels:?}");
+    }
+}
+
+#[cfg(test)]
+mod every_object_is_a_relation_by_name {
+    use super::*;
+    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::parser::Parser;
+
+    fn objects(sql: &str) -> Vec<String> {
+        let mut s =
+            Parser::parse_sql(&MySqlDialect {}, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        EntrySqlStatement::from(s.remove(0))
+            .objects()
+            .iter()
+            .map(|o| o.full_object_name().into_owned())
+            .collect()
+    }
+
+    /// A NAME IS ITS VALUE AND NOT ITS SPELLING. Quoting a name changes nothing MySQL resolves,
+    /// so `` `actor` `` and `actor` are one relation.
+    #[test]
+    fn quoting_does_not_make_a_second_relation() {
+        assert_eq!(
+            objects("SELECT * FROM `actor` JOIN actor a2 JOIN `sakila`.`film` f JOIN sakila.film"),
+            ["actor", "sakila.film"]
+        );
+        // Case is the server's to fold, and a slow log does not say how it folds it.
+        assert_eq!(
+            objects("SELECT * FROM Actor JOIN actor"),
+            ["Actor", "actor"]
+        );
+    }
+
+    /// A SCHEMA IS NOT A RELATION.
+    #[test]
+    fn show_tables_names_a_schema_and_no_relation() {
+        assert!(objects("SHOW TABLES FROM mysql").is_empty());
+        assert!(objects("SHOW FULL TABLES IN `db` LIKE 'x%'").is_empty());
+        // The same field names a table under `SHOW COLUMNS`, which is why the statement decides.
+        assert_eq!(objects("SHOW COLUMNS FROM t FROM db"), ["db.t"]);
     }
 }
