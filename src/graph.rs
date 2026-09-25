@@ -437,7 +437,7 @@ vocabulary!(RhsKind {
 });
 
 /// One side of a split, as the author spelled it.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct Side {
     /// The occurrence a written qualifier resolved to. `None` where the column was unqualified,
     /// which a caller holding the whole statement can resolve against its sole relation.
@@ -450,7 +450,7 @@ pub struct Side {
 ///
 /// A split with both sides occupied is a relationship — the join — and one with a single side is a
 /// filter. They are the same kind of object, which is why they share a row type.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Predicate {
     /// The scope whose boolean tree this split sits in.
     pub scope: u32,
@@ -642,7 +642,7 @@ vocabulary!(IndexHintScope {
 /// makes about access paths is a claim about the region a predicate sought, because the index
 /// that would serve it is schema and a slow log carries none — so the rows here are the
 /// exception, and they are the author's own words rather than a reader's inference.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct IndexHint {
     /// the occurrence the hint was written against
     pub occ: u32,
@@ -662,7 +662,7 @@ pub struct IndexHint {
 /// `FROM t PARTITION (p0, p1)` is the author naming which partitions may be read. A partitioned
 /// table carries a local index per partition, so a restriction here decides which index trees exist
 /// to be walked — and two statements restricted to disjoint partitions touch no page in common.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Partition {
     /// the occurrence the restriction was written against
     pub occ: u32,
@@ -676,7 +676,7 @@ pub struct Partition {
 /// family as an index hint. One row per **comment** and not per hint: `sqlparser` hands the whole
 /// comment body over as raw text without separating the hints inside it, so naming each hint, its
 /// target table and its target index would be this walk lexing where everything else parses.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct OptimizerHintText {
     /// the scope the hint was written in
     pub scope: u32,
@@ -689,7 +689,7 @@ pub struct OptimizerHintText {
 }
 
 /// A naming scope: the statement itself, or something nested inside it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Scope {
     /// index of this scope in [`StatementGraph::scopes`]
     pub id: u32,
@@ -745,7 +745,7 @@ fn locking_of(lock: &LockClause) -> (LockStrength, LockWait) {
 /// A scope is not one `Select`, so these counts accumulate: `INSERT ... SELECT ... WHERE` walks
 /// its source into the same scope as the insert target, and `UPDATE`/`DELETE` carry a `WHERE` with
 /// no `Select` at all. Assigning rather than accumulating would lose whichever came second.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct Stages {
     /// Top-level `AND` conjuncts of this scope's `WHERE`. `0` means the parse looked and there was
     /// no filter, rather than that nobody looked.
@@ -881,7 +881,7 @@ fn aggregate_calls(e: &Expr) -> u32 {
 }
 
 /// One appearance of a relation in a statement.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct RelationOccurrence {
     /// index of this occurrence in [`StatementGraph::occurrences`]
     pub occ: u32,
@@ -956,7 +956,7 @@ pub struct Edge {
 /// down.
 ///
 /// See the module header for what this holds that `objects()` does not.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct StatementGraph {
     /// the naming scopes, `scopes[0]` being the statement's own
     pub scopes: Vec<Scope>,
@@ -998,6 +998,10 @@ impl StatementGraph {
     /// An occurrence that refers to another ([`RelationOccurrence::resolves_to_occ`]) is measured
     /// as the one it refers to, under either reading: a multi-table `DELETE`'s target list names
     /// relations the statement already introduced and adds none of its own.
+    ///
+    /// Every field is public, so a graph can be built by hand. An edge naming an occurrence the
+    /// graph does not hold joins nothing: it is left out of `edges` and still counted in
+    /// `incidences`.
     pub fn measures(&self) -> GraphMeasures {
         self.measure_by(|_, occ| format!("\u{0}occ{occ}").into_bytes())
     }
@@ -1033,25 +1037,25 @@ impl StatementGraph {
                 .filter(|r| self.occurrences.get(*r as usize).is_some())
                 .unwrap_or(occ)
         };
-        let key = |occ: u32| -> Vec<u8> {
+        // An occurrence is named by its index in `occurrences` wherever the graph refers to one.
+        let key = |occ: u32| -> Option<Vec<u8>> {
             let occ = referent(occ);
-            match self.occurrences.get(occ as usize) {
-                Some(o) => key_of(o, occ),
-                None => format!("\u{0}gone{occ}").into_bytes(),
-            }
+            self.occurrences.get(occ as usize).map(|o| key_of(o, occ))
         };
 
-        let mut nodes: Vec<Vec<u8>> = self.occurrences.iter().map(|o| key(o.occ)).collect();
+        let mut nodes: Vec<Vec<u8>> = (0..self.occurrences.len())
+            .filter_map(|i| key(i as u32))
+            .collect();
         nodes.sort();
         nodes.dedup();
-        let index = |k: &Vec<u8>| nodes.binary_search(k).expect("node was collected above");
+        let index = |occ: u32| key(occ).and_then(|k| nodes.binary_search(&k).ok());
 
         let mut simple: Vec<(usize, usize)> = self
             .edges
             .iter()
-            .map(|e| {
-                let (a, b) = (index(&key(e.lhs)), index(&key(e.rhs)));
-                if a <= b { (a, b) } else { (b, a) }
+            .filter_map(|e| {
+                let (a, b) = (index(e.lhs)?, index(e.rhs)?);
+                Some(if a <= b { (a, b) } else { (b, a) })
             })
             .collect();
         simple.sort_unstable();
@@ -1089,10 +1093,13 @@ impl StatementGraph {
     /// Whether an occurrence sits anywhere beneath the body of a `CREATE VIEW`.
     ///
     /// A relation this is true of was named and not read. See [`ScopeKind::ViewBody`].
+    ///
+    /// The walk up the scope chain takes at most one step per scope, so a hand-built graph whose
+    /// parents form a cycle ends the walk rather than looping.
     pub fn in_view_body(&self, occ: u32) -> bool {
         let mut at = self.occurrences.get(occ as usize).map(|o| o.scope);
-        while let Some(id) = at {
-            let Some(s) = self.scopes.get(id as usize) else {
+        for _ in 0..self.scopes.len() {
+            let Some(s) = at.and_then(|id| self.scopes.get(id as usize)) else {
                 return false;
             };
             if s.kind == ScopeKind::ViewBody {
@@ -1110,7 +1117,7 @@ impl StatementGraph {
 }
 
 /// Nodes, edges and components of a [`StatementGraph`], and the cycle space they fix.
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct GraphMeasures {
     /// distinct node identities
     pub nodes: usize,
@@ -5245,5 +5252,67 @@ mod tests {
         let s = splits("SELECT a FROM t WHERE (a = 1) XOR (b = 2)");
         let paths: Vec<&str> = s.iter().map(|(_, p, _)| p.as_str()).collect();
         assert_eq!(paths, ["xor[0]", "xor[1]"]);
+    }
+
+    /// A HAND-BUILT GRAPH IS MEASURED AND NOT PANICKED ON. Every field is public, so an edge can
+    /// name an occurrence the graph does not hold and a scope can be its own ancestor; neither is
+    /// something the walk produces, and neither may take a caller's process down.
+    #[test]
+    fn a_hand_built_graph_is_measured_without_panicking() {
+        let mut g = graph("SELECT 1 FROM a JOIN b ON a.id = b.id");
+        g.edges.push(Edge {
+            lhs: 0,
+            rhs: 99,
+            op: JoinOp::Inner,
+            constraint: ConstraintKind::On,
+            crosses_scope: false,
+        });
+        g.occurrences[1].resolves_to_occ = Some(42);
+        let m = g.measures();
+        assert_eq!((m.nodes, m.edges, m.components, m.incidences), (2, 1, 1, 2));
+        assert_eq!(g.measures_collapsed_by_name().edges, 1);
+
+        let mut g = graph("SELECT 1 FROM a WHERE id IN (SELECT id FROM b)");
+        g.scopes[0].parent = Some(1);
+        assert!(!g.in_view_body(1), "a parent cycle ends the walk");
+        assert!(!g.in_view_body(7), "and an absent occurrence is in no body");
+    }
+
+    /// THE ROWS ARE VALUES. Two walks of one statement are equal and hash alike, so a caller can
+    /// deduplicate graphs, or key on a single row, without writing the comparison themselves.
+    #[test]
+    fn a_graph_and_its_rows_are_comparable_and_hashable() {
+        use std::collections::HashSet;
+        let sql = "SELECT a.id FROM a USE INDEX (i) JOIN b PARTITION (p0) ON a.id = b.id \
+                   WHERE a.x IN (SELECT /*+ BKA(c) */ y FROM c) FOR UPDATE";
+        let graphs: HashSet<StatementGraph> = [graph(sql), graph(sql)].into_iter().collect();
+        assert_eq!(graphs.len(), 1);
+        let other: HashSet<StatementGraph> =
+            [graph(sql), graph("SELECT 1 FROM a")].into_iter().collect();
+        assert_eq!(other.len(), 2);
+
+        let g = graph(sql);
+        let scopes: HashSet<&Scope> = g.scopes.iter().collect();
+        let occurrences: HashSet<&RelationOccurrence> = g.occurrences.iter().collect();
+        let predicates: HashSet<&Predicate> = g.predicates.iter().collect();
+        let sides: HashSet<&Side> = g.predicates.iter().map(|p| &p.lhs).collect();
+        let hints: HashSet<&IndexHint> = g.index_hints.iter().collect();
+        let parts: HashSet<&Partition> = g.partitions.iter().collect();
+        let texts: HashSet<&OptimizerHintText> = g.optimizer_hints.iter().collect();
+        let measures: HashSet<GraphMeasures> = [g.measures()].into_iter().collect();
+        assert_eq!(
+            (scopes.len(), occurrences.len(), predicates.len()),
+            (2, 3, 2)
+        );
+        assert_eq!(
+            (
+                sides.len(),
+                hints.len(),
+                parts.len(),
+                texts.len(),
+                measures.len()
+            ),
+            (2, 1, 1, 1, 1)
+        );
     }
 }
