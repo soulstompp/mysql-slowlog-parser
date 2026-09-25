@@ -1,6 +1,10 @@
+use crate::graph::StatementGraph;
+use crate::parser::EntryLiteral;
 use crate::{EntryAdminCommand, SessionLine, SqlStatementContext, StatsLine};
 use bytes::{BufMut, Bytes, BytesMut};
-use sqlparser::ast::{Statement, visit_relations};
+use sqlparser::ast::{
+    ObjectNamePart, ObjectType, SetExpr, ShowCreateObject, Statement, visit_relations,
+};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
@@ -27,35 +31,34 @@ impl Entry {
     }
 
     /// returns the mysql user name that requested the command
-    pub fn user_name(&self) -> Cow<str> {
+    pub fn user_name(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(&self.session.user_name)
     }
 
-    /// returns the mysql user name that requested the command
+    /// returns the mysql user name that requested the command, as bytes
     pub fn user_name_bytes(&self) -> Bytes {
         self.session.user_name.clone()
     }
 
     /// returns the system user name that requested the command
-    pub fn sys_user_name(&self) -> Cow<str> {
+    pub fn sys_user_name(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(&self.session.sys_user_name)
     }
 
-    /// returns the system user name that requested the command
+    /// returns the system user name that requested the command, as bytes
     pub fn sys_user_name_bytes(&self) -> Bytes {
         self.session.sys_user_name.clone()
     }
 
     /// returns the host name which requested the command
-    pub fn host_name(&self) -> Option<Cow<str>> {
-        if let Some(v) = &self.session.host_name {
-            Some(String::from_utf8_lossy(v.as_ref()))
-        } else {
-            None
-        }
+    pub fn host_name(&self) -> Option<Cow<'_, str>> {
+        self.session
+            .host_name
+            .as_ref()
+            .map(|v| String::from_utf8_lossy(v.as_ref()))
     }
 
-    /// returns the host name which requested the command
+    /// returns the host name which requested the command, as bytes
     pub fn host_name_bytes(&self) -> Option<Bytes> {
         self.session.host_name_bytes()
     }
@@ -65,13 +68,13 @@ impl Entry {
         self.session.ip_address()
     }
 
-    /// returns the ip address which requested the command
+    /// returns the ip address which requested the command, as bytes
     pub fn ip_address_bytes(&self) -> Option<Bytes> {
         self.session.ip_address_bytes()
     }
 
-    /// returns the the thread id of the session which requested the command
-    pub fn thread_id(&self) -> u32 {
+    /// returns the thread id of the session which requested the command, where the log wrote one
+    pub fn thread_id(&self) -> Option<u32> {
         self.session.thread_id()
     }
 
@@ -91,44 +94,83 @@ impl Entry {
     }
 
     /// returns number of rows returned when query was executed
-    pub fn rows_sent(&self) -> u32 {
+    pub fn rows_sent(&self) -> u64 {
         self.stats.rows_sent()
     }
 
-    /// returns how many rows where examined to execute the query
-    pub fn rows_examined(&self) -> u32 {
+    /// returns how many rows were examined to execute the query
+    pub fn rows_examined(&self) -> u64 {
         self.stats.rows_examined()
     }
 }
 
+/// A statement the SQL parser accepted, with whatever the log's comment said about it.
 #[derive(Clone, Debug, PartialEq)]
-///
 pub struct EntrySqlStatement {
     /// Holds the Statement
     pub statement: Statement,
+    /// the key/value pairs of the comment preceding the statement, where there was one
     pub context: Option<SqlStatementContext>,
 }
 
 impl EntrySqlStatement {
+    /// returns the key/value pairs parsed from the statement's preceding comment
     pub fn sql_context(&self) -> Option<SqlStatementContext> {
         self.context.clone()
     }
 
+    /// The statement's relation graph: every relation it names, where each one sits, and every
+    /// relationship between them that the statement wrote down.
+    ///
+    /// [`Self::objects`] folds the same parse into a set of names; this keeps the multiplicity,
+    /// the position, the nesting depth and the edges. See [`StatementGraph`].
+    pub fn relation_graph(&self) -> StatementGraph {
+        StatementGraph::of(&self.statement)
+    }
+
+    /// returns the relations this statement names, deduplicated and sorted
+    ///
+    /// A set, so multiplicity, position, nesting depth and the relationships between the
+    /// relations are not carried. [`Self::relation_graph`] is the same parse with them.
+    ///
+    /// Each name is the identifier's value without its quoting, so `` `t` `` and `t` are one
+    /// entry. Case is kept: whether `T` and `t` are one table depends on the server's
+    /// `lower_case_table_names`, which a slow log does not record.
+    ///
+    /// The `db` of `SHOW TABLES FROM db` names a schema and not a relation, and is not among them.
     pub fn objects(&self) -> Vec<EntrySqlStatementObject> {
+        // `ShowStatementIn.parent_name` carries `visit_relation`, and under `SHOW TABLES` it
+        // holds a schema. Told apart by identity, as the same field names a table under
+        // `SHOW COLUMNS`.
+        let schema = match &self.statement {
+            Statement::ShowTables { show_options, .. } => show_options
+                .show_in
+                .as_ref()
+                .and_then(|s| s.parent_name.as_ref()),
+            _ => None,
+        };
+
         let mut visited = BTreeSet::new();
 
         let _ = visit_relations(&self.statement, |relation| {
+            if schema.is_some_and(|s| std::ptr::eq(s, relation)) {
+                return ControlFlow::<()>::Continue(());
+            }
+            let part = |p: &ObjectNamePart| match p.as_ident() {
+                Some(i) => Bytes::from(i.value.clone()),
+                None => Bytes::from(p.to_string()),
+            };
             let ident = &relation.0;
 
             let _ = visited.insert(if ident.len() == 2 {
                 EntrySqlStatementObject {
-                    schema_name: Some(Bytes::from(ident[0].to_string())),
-                    object_name: Bytes::from(ident[1].to_string()),
+                    schema_name: Some(part(&ident[0])),
+                    object_name: part(&ident[1]),
                 }
             } else {
                 EntrySqlStatementObject {
                     schema_name: None,
-                    object_name: ident.last().unwrap().to_string().to_owned().into(),
+                    object_name: part(ident.last().unwrap()),
                 }
             });
 
@@ -137,9 +179,25 @@ impl EntrySqlStatement {
         visited.into_iter().collect()
     }
 
+    /// returns the MySQL-facing kind of this statement
     pub fn sql_type(&self) -> EntrySqlType {
-        match self.statement {
-            Statement::Query(_) => EntrySqlType::Query,
+        EntrySqlType::of(&self.statement)
+    }
+}
+
+impl EntrySqlType {
+    fn of(statement: &Statement) -> Self {
+        match statement {
+            // MySQL 8.0 admits `WITH c AS (…) INSERT/UPDATE/DELETE …`, which parses as a
+            // `Query` whose body is the write. Reading the outer node alone would type all
+            // three as reads.
+            Statement::Query(q) => match q.body.as_ref() {
+                SetExpr::Insert(s) | SetExpr::Update(s) | SetExpr::Delete(s) => Self::of(s),
+                _ => EntrySqlType::Query,
+            },
+            // `REPLACE` parses as an `INSERT` with a flag set, and it is not one: MySQL deletes
+            // the row holding the same key before it writes.
+            Statement::Insert(i) if i.replace_into => EntrySqlType::Replace,
             Statement::Insert { .. } => EntrySqlType::Insert,
             Statement::Update { .. } => EntrySqlType::Update,
             Statement::Delete { .. } => EntrySqlType::Delete,
@@ -147,13 +205,30 @@ impl EntrySqlStatement {
             Statement::CreateIndex { .. } => EntrySqlType::CreateIndex,
             Statement::CreateView { .. } => EntrySqlType::CreateView,
             Statement::AlterTable { .. } => EntrySqlType::AlterTable,
-            Statement::AlterIndex { .. } => EntrySqlType::AlterIndex,
-            Statement::Drop { .. } => EntrySqlType::Drop,
+            Statement::AlterView { .. } => EntrySqlType::AlterView,
+            // One arm per object type, because the label is what a caller matches on and
+            // `DROP TABLE` asserts the object a `DROP VIEW` or a `DROP DATABASE` is not. The
+            // relation graph files `DROP INDEX idx ON t` as an alter of `t`, so it is owed an
+            // arm; a `DROP` of anything else -- a user, a role -- names no relation and is
+            // `Unknown` rather than a label for an object it did not drop.
+            Statement::Drop { object_type, .. } => match object_type {
+                ObjectType::Table => EntrySqlType::Drop,
+                ObjectType::View => EntrySqlType::DropView,
+                ObjectType::Index => EntrySqlType::DropIndex,
+                ObjectType::Database | ObjectType::Schema => EntrySqlType::DropDatabase,
+                _ => EntrySqlType::Unknown,
+            },
             Statement::DropFunction { .. } => EntrySqlType::DropFunction,
             Statement::Set { .. } => EntrySqlType::Set,
             Statement::ShowVariable { .. } => EntrySqlType::ShowVariable,
             Statement::ShowVariables { .. } => EntrySqlType::ShowVariables,
-            Statement::ShowCreate { .. } => EntrySqlType::ShowCreate,
+            // The two the relation graph gives a metadata target. A routine, a trigger and an
+            // event are not relations, and have no arm.
+            Statement::ShowCreate { obj_type, .. } => match obj_type {
+                ShowCreateObject::Table => EntrySqlType::ShowCreate,
+                ShowCreateObject::View => EntrySqlType::ShowCreateView,
+                _ => EntrySqlType::Unknown,
+            },
             Statement::ShowColumns { .. } => EntrySqlType::ShowColumns,
             Statement::ShowTables { .. } => EntrySqlType::ShowTables,
             Statement::ShowCollation { .. } => EntrySqlType::ShowCollation,
@@ -170,8 +245,19 @@ impl EntrySqlStatement {
             Statement::Explain { .. } => EntrySqlType::Explain,
             Statement::Savepoint { .. } => EntrySqlType::Savepoint,
             Statement::LockTables { .. } => EntrySqlType::LockTables,
-            Statement::UnlockTables { .. } => EntrySqlType::LockTables,
+            // The statement that releases a table lock, kept apart from the one that takes it:
+            // `Lock_time` is the wait for that lock, so a caller counting lock-takers must not
+            // meet the two under one name.
+            Statement::UnlockTables => EntrySqlType::UnlockTables,
             Statement::Flush { .. } => EntrySqlType::Flush,
+            // `sqlparser` has hundreds of statement forms and this enum cannot have one arm
+            // each. An arm is owed where the relation graph already gives the statement a role:
+            // these three take a truncate target, a drop and a create target, and an analyze
+            // target there. `CALL`, `EXECUTE` and `DEALLOCATE` parse and take no role from the
+            // walk, so `Unknown` is what this enum says about them.
+            Statement::Truncate { .. } => EntrySqlType::Truncate,
+            Statement::RenameTable { .. } => EntrySqlType::RenameTable,
+            Statement::Analyze { .. } => EntrySqlType::Analyze,
             _ => EntrySqlType::Unknown,
         }
     }
@@ -197,12 +283,10 @@ pub struct EntrySqlStatementObject {
 
 impl EntrySqlStatementObject {
     /// returns the optional schema name of object
-    pub fn schema_name(&self) -> Option<Cow<str>> {
-        if let Some(v) = &self.schema_name {
-            Some(String::from_utf8_lossy(v.as_ref()))
-        } else {
-            None
-        }
+    pub fn schema_name(&self) -> Option<Cow<'_, str>> {
+        self.schema_name
+            .as_ref()
+            .map(|v| String::from_utf8_lossy(v.as_ref()))
     }
 
     /// returns the optional schema name of object as bytes
@@ -211,7 +295,7 @@ impl EntrySqlStatementObject {
     }
 
     /// returns the object name of object
-    pub fn object_name(&self) -> Cow<str> {
+    pub fn object_name(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(self.object_name.as_ref())
     }
 
@@ -244,17 +328,27 @@ impl EntrySqlStatementObject {
 
 /// Types of possible statements parsed from the log:
 /// * SqlStatement: parseable statement with a proper SQL AST
-/// * AdminCommand: commands passed from the mysql cli/admin tools
-/// * InvalidStatement: statement which isn't currently parseable as plain-text
+/// * AdminCommand: an `# administrator command:` line rather than SQL
+/// * InvalidStatement: statement text the SQL parser could not read
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)] // the large variant is the common one
+#[non_exhaustive]
 pub enum EntryStatement {
-    /// AdminCommand: commands passed from the mysql cli/admin tools
+    /// An `# administrator command:` line: a protocol command such as `Quit`, `Ping` or
+    /// `Init DB` rather than SQL.
     AdminCommand(EntryAdminCommand),
     /// SqlStatement: parseable statement with a proper SQL AST
     SqlStatement(EntrySqlStatement),
-    /// InvalidStatement: statement which isn't currently parseable by `sql-parser` crate
+    /// Statement text `sqlparser` refused, or read as other than exactly one statement. Carries
+    /// the text, lossily decoded; [`EntrySqlAttributes::sql_raw`] has the bytes.
     InvalidStatement(String),
 }
+
+vocabulary!(EntryStatement {
+    Self::SqlStatement(_) => "sql",
+    Self::AdminCommand(_) => "admin_command",
+    Self::InvalidStatement(_) => "invalid",
+});
 
 impl EntryStatement {
     /// returns the `EntrySqlStatement` objects associated with this statement, if known
@@ -265,15 +359,27 @@ impl EntryStatement {
         }
     }
 
-    /// returns the `EntrySqlType` associated with this statement if known
-    pub fn sql_type(&self) -> Option<EntrySqlType> {
+    /// returns the relation graph of this statement, where it has one
+    ///
+    /// `None` exactly where [`Self::objects`] is `None`, and for the same reason: an admin
+    /// command and an unparseable statement have no AST to walk. The two remain distinct in the
+    /// enum itself; this accessor says only that neither has a graph.
+    pub fn relation_graph(&self) -> Option<StatementGraph> {
         match self {
-            Self::SqlStatement(s) => Some(s.sql_type().clone()),
+            Self::SqlStatement(s) => Some(s.relation_graph()),
             _ => None,
         }
     }
 
-    /// returns the `SqlStatementContext` associated with this statement
+    /// returns the `EntrySqlType` associated with this statement if known
+    pub fn sql_type(&self) -> Option<EntrySqlType> {
+        match self {
+            Self::SqlStatement(s) => Some(s.sql_type()),
+            _ => None,
+        }
+    }
+
+    /// returns the key/value pairs parsed from the statement's preceding comment
     pub fn sql_context(&self) -> Option<SqlStatementContext> {
         match self {
             Self::SqlStatement(s) => s.sql_context().clone(),
@@ -284,14 +390,18 @@ impl EntryStatement {
 
 /// The SQL statement type of the EntrySqlStatement.
 ///
-/// NOTE: this is a MySQL specific sub-set of the entries in `sql_parser::ast::Statement`. This is
+/// NOTE: this is a MySQL specific sub-set of the entries in `sqlparser::ast::Statement`. This is
 /// a simpler enum to match against and displays as the start of the SQL command.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
 pub enum EntrySqlType {
     /// SELECT
     Query,
     /// INSERT
     Insert,
+    /// `REPLACE`, which `sqlparser` parses as an `INSERT` and MySQL runs as a delete of the row
+    /// holding the same key followed by an insert
+    Replace,
     /// UPDATE
     Update,
     /// DELETE
@@ -304,20 +414,35 @@ pub enum EntrySqlType {
     CreateView,
     /// ALTER TABLE
     AlterTable,
-    /// ALTER INDEX
-    AlterIndex,
-    /// DROP TABLE
+    /// ALTER VIEW
+    AlterView,
+    /// `DROP TABLE`. A `DROP` of an object type with no arm of its own, such as `DROP USER`, is
+    /// [`Self::Unknown`].
     Drop,
+    /// DROP VIEW
+    DropView,
+    /// `DROP INDEX idx ON t`, which changes `t` rather than dropping it
+    DropIndex,
+    /// DROP DATABASE / DROP SCHEMA
+    DropDatabase,
     /// DROP FUNCTION
     DropFunction,
     /// SET
     Set,
-    /// SHOW VARIABLE
+    /// A `SHOW` that `sqlparser` has no statement of its own for. Upstream's
+    /// `Statement::ShowVariable` is a catch-all rather than a variable: `SHOW WARNINGS`,
+    /// `SHOW ENGINE INNODB STATUS`, `SHOW GRANTS` and `SHOW INDEX` all land here, which is why it
+    /// displays as `SHOW` and not as `SHOW VARIABLE`. A `SHOW` that `sqlparser` does have a
+    /// statement for and this enum does not — `SHOW STATUS`, `SHOW DATABASES`,
+    /// `SHOW PROCESSLIST` — is [`Self::Unknown`].
     ShowVariable,
     /// SHOW VARIABLES
     ShowVariables,
-    /// SHOW CREATE TABLE
+    /// `SHOW CREATE TABLE`. A `SHOW CREATE` of a routine, a trigger or an event is
+    /// [`Self::Unknown`].
     ShowCreate,
+    /// SHOW CREATE VIEW
+    ShowCreateView,
     /// SHOW COLUMNS
     ShowColumns,
     /// SHOW TABLES
@@ -326,13 +451,11 @@ pub enum EntrySqlType {
     ShowCollation,
     /// USE
     Use,
-    /// BEGIN TRANSACTION
+    /// `START TRANSACTION` or `BEGIN`, displayed as `BEGIN TRANSACTION`
     StartTransaction,
-    /// SET TRANSACTION
-    SetTransaction,
     /// COMMIT TRANSACTION
     Commit,
-    /// ROLLBACK TRANSACTION
+    /// ROLLBACK TRANSACTION, including `ROLLBACK TO SAVEPOINT`
     Rollback,
     /// CREATE SCHEMA
     CreateSchema,
@@ -344,9 +467,9 @@ pub enum EntrySqlType {
     Revoke,
     /// KILL
     Kill,
-    /// EXPLAIN TABLE
+    /// `EXPLAIN t` or `DESCRIBE t`
     ExplainTable,
-    /// EXPLAIN
+    /// `EXPLAIN <statement>`
     Explain,
     /// SAVEPOINT
     Savepoint,
@@ -356,7 +479,21 @@ pub enum EntrySqlType {
     UnlockTables,
     /// FLUSH
     Flush,
-    /// Unable to identy if the type of statement
+    /// TRUNCATE TABLE
+    Truncate,
+    /// RENAME TABLE
+    RenameTable,
+    /// ANALYZE TABLE
+    Analyze,
+    /// The statement parsed and this enum has no MySQL name for it. Not an absence: `Display`
+    /// spells it `UNKNOWN`, so a caller can tell it from a line that had no statement at all.
+    ///
+    /// Two kinds land here. One is ordinary MySQL this enum has no arm for — `CALL`, `EXECUTE`,
+    /// `DEALLOCATE`, `DROP USER`, `SHOW CREATE PROCEDURE` — which the relation graph gives no
+    /// role either. The other is text
+    /// `sqlparser` accepts and MySQL cannot write, such as `ALTER INDEX`; this crate reads MySQL
+    /// slow logs, so naming those would make the vocabulary a union of every dialect
+    /// `sqlparser` knows and put cases that cannot occur in front of every caller.
     Unknown,
 }
 
@@ -365,25 +502,29 @@ impl Display for EntrySqlType {
         let out = match self {
             Self::Query => "SELECT",
             Self::Insert => "INSERT",
+            Self::Replace => "REPLACE",
             Self::Update => "UPDATE",
             Self::Delete => "DELETE",
             Self::CreateTable => "CREATE TABLE",
             Self::CreateIndex => "CREATE INDEX",
             Self::CreateView => "CREATE VIEW",
             Self::AlterTable => "ALTER TABLE",
-            Self::AlterIndex => "ALTER INDEX",
+            Self::AlterView => "ALTER VIEW",
             Self::Drop => "DROP TABLE",
+            Self::DropView => "DROP VIEW",
+            Self::DropIndex => "DROP INDEX",
+            Self::DropDatabase => "DROP DATABASE",
             Self::DropFunction => "DROP FUNCTION",
             Self::Set => "SET",
-            Self::ShowVariable => "SHOW VARIABLE",
+            Self::ShowVariable => "SHOW",
             Self::ShowVariables => "SHOW VARIABLES",
             Self::ShowCreate => "SHOW CREATE TABLE",
+            Self::ShowCreateView => "SHOW CREATE VIEW",
             Self::ShowColumns => "SHOW COLUMNS",
             Self::ShowTables => "SHOW TABLES",
             Self::ShowCollation => "SHOW COLLATION",
             Self::Use => "USE",
             Self::StartTransaction => "BEGIN TRANSACTION",
-            Self::SetTransaction => "SET TRANSACTION",
             Self::Commit => "COMMIT TRANSACTION",
             Self::Rollback => "ROLLBACK TRANSACTION",
             Self::CreateSchema => "CREATE SCHEMA",
@@ -397,7 +538,13 @@ impl Display for EntrySqlType {
             Self::LockTables => "LOCK TABLES",
             Self::UnlockTables => "UNLOCK TABLES",
             Self::Flush => "FLUSH",
-            Self::Unknown => "NULL",
+            Self::Truncate => "TRUNCATE TABLE",
+            Self::RenameTable => "RENAME TABLE",
+            Self::Analyze => "ANALYZE TABLE",
+            // A name and never the word `NULL`: a statement this enum has no arm for and a line
+            // that carried no statement are different facts, and a caller writing this label
+            // into a nullable column has to be able to tell them apart.
+            Self::Unknown => "UNKNOWN",
         };
 
         write!(f, "{}", out)
@@ -407,16 +554,19 @@ impl Display for EntrySqlType {
 /// struct containing information about the connection where the query originated
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntrySession {
-    /// user name of the connected user who ran the query
+    /// the account MySQL matched for privileges, the name before the brackets; empty where the
+    /// server wrote none, as for a replication applier thread
     pub user_name: Bytes,
-    /// system user name of the connected user who ran the query
+    /// the name the client connected as, the name inside the brackets
     pub sys_user_name: Bytes,
     /// hostname of the connected user who ran the query
     pub host_name: Option<Bytes>,
-    /// ip address of the connected user who ran the query
+    /// ip address of the connected user who ran the query, IPv4 or IPv6 as the server wrote it
     pub ip_address: Option<Bytes>,
-    /// the thread id that the session was conntected on
-    pub thread_id: u32,
+    /// the thread id that the session was connected on, the `# User@Host:` line's `Id:`; `None`
+    /// where the line has none, as MySQL 5.5 and MariaDB write it. MariaDB writes the id on a
+    /// `# Thread_id:` line instead, which is in [`EntryStats::extra`].
+    pub thread_id: Option<u32>,
 }
 
 impl From<SessionLine> for EntrySession {
@@ -433,55 +583,51 @@ impl From<SessionLine> for EntrySession {
 
 impl EntrySession {
     /// returns the mysql user name that requested the command
-    pub fn user_name(&self) -> Cow<str> {
+    pub fn user_name(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(&self.user_name)
     }
 
-    /// returns the mysql user name that requested the command
+    /// returns the mysql user name that requested the command, as bytes
     pub fn user_name_bytes(&self) -> Bytes {
         self.user_name.clone()
     }
 
     /// returns the system user name that requested the command
-    pub fn sys_user_name(&self) -> Cow<str> {
+    pub fn sys_user_name(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(&self.sys_user_name)
     }
 
-    /// returns the system user name that requested the command
+    /// returns the system user name that requested the command, as bytes
     pub fn sys_user_name_bytes(&self) -> Bytes {
         self.sys_user_name.clone()
     }
 
     /// returns the host name which requested the command
-    pub fn host_name(&self) -> Option<Cow<str>> {
-        if let Some(v) = &self.host_name {
-            Some(String::from_utf8_lossy(v.as_ref()))
-        } else {
-            None
-        }
+    pub fn host_name(&self) -> Option<Cow<'_, str>> {
+        self.host_name
+            .as_ref()
+            .map(|v| String::from_utf8_lossy(v.as_ref()))
     }
 
-    /// returns the host name which requested the command
+    /// returns the host name which requested the command, as bytes
     pub fn host_name_bytes(&self) -> Option<Bytes> {
         self.host_name.clone()
     }
 
     /// returns the ip address which requested the command
     pub fn ip_address(&self) -> Option<Cow<'_, str>> {
-        if let Some(v) = &self.ip_address {
-            Some(String::from_utf8_lossy(v.as_ref()))
-        } else {
-            None
-        }
+        self.ip_address
+            .as_ref()
+            .map(|v| String::from_utf8_lossy(v.as_ref()))
     }
 
-    /// returns the ip address which requested the command
+    /// returns the ip address which requested the command, as bytes
     pub fn ip_address_bytes(&self) -> Option<Bytes> {
         self.ip_address.clone()
     }
 
-    /// returns the the thread id of the which requested the command
-    pub fn thread_id(&self) -> u32 {
+    /// returns the thread id of the session which requested the command, where the log wrote one
+    pub fn thread_id(&self) -> Option<u32> {
         self.thread_id
     }
 }
@@ -489,29 +635,52 @@ impl EntrySession {
 /// struct with information about the Entry's SQL query
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntrySqlAttributes {
-    /// the sql for this entry, possibly with values replaced by parameters
+    /// The reader's rendering: for a parsed statement this is the AST rendered back to text,
+    /// for an admin command the command word, for an unparseable statement the log's bytes --
+    /// with every literal replaced by `?` token by token under
+    /// [`crate::EntryMasking::PlaceHolder`].
+    ///
+    /// Three different things, and [`Self::statement`]'s arm is what says which.
     pub sql: Bytes,
-    /// the `EntryStatement for this entry
+    /// The author's own bytes, exactly as the log carried them, `;` included. A leading `--`
+    /// comment that reads as key/value pairs is not among them; it is read into the context.
+    ///
+    /// `None` only for an administrator command, where a different parser consumed the line and
+    /// its framing -- and there `sql` is already the log's own bytes, so nothing is lost.
+    ///
+    /// This is the only record of keyword case, line layout and in-statement comments, and the
+    /// only text holding the author's literals unmasked: `sql` above discards all of it for the
+    /// statements that parsed.
+    pub sql_raw: Option<Bytes>,
+    /// Every literal the author wrote, in traversal order, whether or not masking is on.
+    pub literals: Vec<EntryLiteral>,
+    /// The database the log said was current, where it said so.
+    ///
+    /// `USE` is sticky per connection and MySQL writes it only when the database changes, so
+    /// this is `None` on every entry that did not itself carry one. Carrying it forward along a
+    /// thread is a reader's inference and belongs to whoever draws it.
+    pub use_database: Option<Bytes>,
+    /// the `EntryStatement` for this entry
     pub statement: EntryStatement,
 }
 
 impl EntrySqlAttributes {
-    /// returns the sql statement as bytes
+    /// returns the `sql` field as bytes
     pub fn sql_bytes(&self) -> Bytes {
         self.sql.clone()
     }
 
-    /// returns the ip address which requested the command
+    /// returns the `sql` field, lossily decoded
     pub fn sql(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(self.sql.as_ref())
     }
 
-    /// returns the ip address which requested the command
+    /// returns the kind of statement, where it parsed
     pub fn sql_type(&self) -> Option<EntrySqlType> {
         self.statement.sql_type()
     }
 
-    /// returns entry sql statment objects
+    /// returns the relations the statement names, where it parsed
     pub fn objects(&self) -> Option<Vec<EntrySqlStatementObject>> {
         self.statement.objects()
     }
@@ -522,25 +691,35 @@ impl EntrySqlAttributes {
     }
 }
 
-/// struct containing details of how long the query took
+/// When the entry was logged (its `# Time:` line) and when its statement started (its
+/// `SET timestamp`)
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntryCall {
-    /// time recorded for the log entry
+    /// time recorded for the log entry; where the log omitted the entry's `# Time:` line, as
+    /// MySQL before 5.7 does for an entry in the same second as the one before, that entry's time
     pub log_time: DateTime,
-    /// effective time of NOW() during the query run
+    /// effective time of NOW() during the query run, in seconds since the Unix epoch
     pub set_timestamp: u32,
+    /// the value `LAST_INSERT_ID()` had for the statement, where the `SET` line carried
+    /// `last_insert_id=`: MySQL writes it where the statement read it
+    pub last_insert_id: Option<u64>,
+    /// the first auto-increment value the statement generated, where the `SET` line carried
+    /// `insert_id=`
+    pub insert_id: Option<u64>,
 }
 
 impl EntryCall {
-    /// create a new instance of EntryCall
+    /// create a new instance of EntryCall, with no `last_insert_id` or `insert_id`
     pub fn new(log_time: DateTime, set_timestamp: u32) -> Self {
         Self {
             log_time,
             set_timestamp,
+            last_insert_id: None,
+            insert_id: None,
         }
     }
 
-    /// returns the entry time as an `DateTime`
+    /// returns the entry time as a `DateTime`
     pub fn log_time(&self) -> DateTime {
         self.log_time.clone()
     }
@@ -549,19 +728,38 @@ impl EntryCall {
     pub fn set_timestamp(&self) -> u32 {
         self.set_timestamp
     }
+
+    /// returns the `last_insert_id=` the `SET` line carried, where it carried one
+    pub fn last_insert_id(&self) -> Option<u64> {
+        self.last_insert_id
+    }
+
+    /// returns the `insert_id=` the `SET` line carried, where it carried one
+    pub fn insert_id(&self) -> Option<u64> {
+        self.insert_id
+    }
 }
 
 /// struct with stats on how long a query took and number of rows examined
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, PartialEq, PartialOrd)]
 pub struct EntryStats {
-    /// how long the query took
+    /// how long the query took, in seconds
     pub query_time: f64,
-    /// how long the query held locks
+    /// how long the query waited to acquire locks, in seconds
     pub lock_time: f64,
     /// how many rows were returned to the client
-    pub rows_sent: u32,
+    pub rows_sent: u64,
     /// how many rows were scanned to find result
-    pub rows_examined: u32,
+    pub rows_examined: u64,
+    /// Every further `Name: value` field of the entry's comment lines, in the order written, names
+    /// and values as the server spelled them and unparsed.
+    ///
+    /// MySQL 8.0 appends them to the `# Query_time:` line under `log_slow_extra=ON`: `Thread_id`,
+    /// `Errno`, `Killed`, `Bytes_received`, `Bytes_sent`, the `Read_*`, `Sort_*` and
+    /// `Created_tmp_*` counters, and `Start` and `End` as ISO 8601 times. MariaDB and Percona
+    /// Server write whole lines of them around it: `Thread_id`, `Schema`, `QC_hit`,
+    /// `Rows_affected`, `Bytes_sent` and more. Empty where the server wrote none.
+    pub extra: Vec<(Bytes, Bytes)>,
 }
 
 impl EntryStats {
@@ -576,13 +774,27 @@ impl EntryStats {
     }
 
     /// returns number of rows returned when query was executed
-    pub fn rows_sent(&self) -> u32 {
+    pub fn rows_sent(&self) -> u64 {
         self.rows_sent
     }
 
-    /// returns how many rows where examined to execute the query
-    pub fn rows_examined(&self) -> u32 {
+    /// returns how many rows were examined to execute the query
+    pub fn rows_examined(&self) -> u64 {
         self.rows_examined
+    }
+
+    /// returns every further `Name: value` field of the entry's comment lines, in the order
+    /// written
+    pub fn extra(&self) -> &[(Bytes, Bytes)] {
+        &self.extra
+    }
+
+    /// returns the value of the first further field named `name`, as written
+    pub fn extra_value(&self, name: &str) -> Option<&Bytes> {
+        self.extra
+            .iter()
+            .find(|(n, _)| n.as_ref() == name.as_bytes())
+            .map(|(_, v)| v)
     }
 }
 
@@ -593,68 +805,279 @@ impl From<StatsLine> for EntryStats {
             lock_time: line.lock_time,
             rows_sent: line.rows_sent,
             rows_examined: line.rows_examined,
+            extra: line.extra,
         }
     }
 }
 
-/// Values parsed from a query comment, these values are currently overly-specific
-#[derive(Clone, Debug, PartialEq)]
-pub struct EntryContext {
-    /// optional request id, such as an SSRID
-    pub request_id: Option<Bytes>,
-    /// optional caller
-    pub caller: Option<Bytes>,
-    /// optional function/method
-    pub function: Option<Bytes>,
-    /// optional line number
-    pub line: Option<u32>,
+#[cfg(test)]
+mod every_sql_type_arm {
+    use super::*;
+    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::parser::Parser;
+    use std::collections::BTreeSet;
+
+    fn typed(sql: &str) -> EntrySqlType {
+        let mut s =
+            Parser::parse_sql(&MySqlDialect {}, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(s.len(), 1, "{sql}");
+        EntrySqlStatement::from(s.remove(0)).sql_type()
+    }
+
+    /// Every arm of [`EntrySqlType`], and the regime that can reach it.
+    #[test]
+    fn every_arm_that_a_mysql_statement_reaches_has_one() {
+        // Ordinary MySQL. Each of these is text the server that wrote the log could have run.
+        let mysql: &[(&str, EntrySqlType)] = &[
+            ("SELECT 1 FROM t", EntrySqlType::Query),
+            ("INSERT INTO t VALUES (1)", EntrySqlType::Insert),
+            ("REPLACE INTO t VALUES (1)", EntrySqlType::Replace),
+            ("UPDATE t SET a = 1", EntrySqlType::Update),
+            ("DELETE FROM t", EntrySqlType::Delete),
+            // A `WITH` in front of a write parses as a `Query` whose body is the write, so the
+            // outer node alone types all three as reads.
+            (
+                "WITH c AS (SELECT 1 AS i) INSERT INTO t SELECT i FROM c",
+                EntrySqlType::Insert,
+            ),
+            (
+                "WITH c AS (SELECT 1 AS i) UPDATE t SET a = 1",
+                EntrySqlType::Update,
+            ),
+            (
+                "WITH c AS (SELECT 1 AS i) DELETE FROM t",
+                EntrySqlType::Delete,
+            ),
+            ("CREATE TABLE t (a INT)", EntrySqlType::CreateTable),
+            ("CREATE INDEX i ON t (a)", EntrySqlType::CreateIndex),
+            ("CREATE VIEW v AS SELECT 1 FROM t", EntrySqlType::CreateView),
+            ("ALTER TABLE t ADD COLUMN b INT", EntrySqlType::AlterTable),
+            ("ALTER VIEW v AS SELECT 1 FROM t", EntrySqlType::AlterView),
+            ("DROP TABLE t", EntrySqlType::Drop),
+            ("DROP VIEW v", EntrySqlType::DropView),
+            ("DROP INDEX idx ON t", EntrySqlType::DropIndex),
+            ("DROP DATABASE d", EntrySqlType::DropDatabase),
+            ("DROP SCHEMA d", EntrySqlType::DropDatabase),
+            ("DROP FUNCTION f", EntrySqlType::DropFunction),
+            ("SET autocommit = 0", EntrySqlType::Set),
+            // Every `SET TRANSACTION` spelling lands on `Set`, so the isolation level has to be
+            // read off the author's bytes rather than off this enum.
+            (
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+                EntrySqlType::Set,
+            ),
+            (
+                "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+                EntrySqlType::Set,
+            ),
+            ("SHOW WARNINGS", EntrySqlType::ShowVariable),
+            ("SHOW ENGINE INNODB STATUS", EntrySqlType::ShowVariable),
+            ("SHOW VARIABLES LIKE 'long%'", EntrySqlType::ShowVariables),
+            ("SHOW CREATE TABLE t", EntrySqlType::ShowCreate),
+            ("SHOW CREATE VIEW v", EntrySqlType::ShowCreateView),
+            ("SHOW COLUMNS FROM t", EntrySqlType::ShowColumns),
+            ("SHOW TABLES FROM d", EntrySqlType::ShowTables),
+            ("SHOW COLLATION", EntrySqlType::ShowCollation),
+            ("USE d", EntrySqlType::Use),
+            ("START TRANSACTION", EntrySqlType::StartTransaction),
+            ("BEGIN", EntrySqlType::StartTransaction),
+            ("COMMIT", EntrySqlType::Commit),
+            ("ROLLBACK", EntrySqlType::Rollback),
+            ("CREATE SCHEMA d", EntrySqlType::CreateSchema),
+            ("CREATE DATABASE d", EntrySqlType::CreateDatabase),
+            ("GRANT SELECT ON d.* TO 'u'@'h'", EntrySqlType::Grant),
+            ("REVOKE SELECT ON d.* FROM 'u'@'h'", EntrySqlType::Revoke),
+            ("KILL 12345", EntrySqlType::Kill),
+            ("EXPLAIN t", EntrySqlType::ExplainTable),
+            ("DESCRIBE t", EntrySqlType::ExplainTable),
+            ("EXPLAIN SELECT 1 FROM t", EntrySqlType::Explain),
+            ("SAVEPOINT sp1", EntrySqlType::Savepoint),
+            ("LOCK TABLES t WRITE", EntrySqlType::LockTables),
+            ("UNLOCK TABLES", EntrySqlType::UnlockTables),
+            ("FLUSH TABLES", EntrySqlType::Flush),
+            ("TRUNCATE TABLE t", EntrySqlType::Truncate),
+            ("RENAME TABLE a TO b", EntrySqlType::RenameTable),
+            ("ANALYZE TABLE t", EntrySqlType::Analyze),
+            // `Unknown` is a real arm and this is what it means: parsed, and this enum has no
+            // name for it. An arm is owed instead where another artifact in the record already
+            // says something specific — `graph.rs` gives these no role.
+            ("CALL myproc(1)", EntrySqlType::Unknown),
+            ("EXECUTE s", EntrySqlType::Unknown),
+            ("DEALLOCATE PREPARE s", EntrySqlType::Unknown),
+            ("SHOW STATUS", EntrySqlType::Unknown),
+        ];
+        let mut seen: BTreeSet<String> = Default::default();
+        for (sql, want) in mysql {
+            assert_eq!(typed(sql), *want, "{sql}");
+            seen.insert(format!("{want:?}"));
+        }
+
+        // And text MySQL cannot write lands on `Unknown` too. MySQL has no `ALTER INDEX`
+        // statement at all; `sqlparser` parses one because its parser is largely shared across
+        // dialects. This crate reads MySQL slow logs, so the case that cannot occur does not get
+        // a name of its own.
+        assert_eq!(
+            typed("ALTER INDEX idx RENAME TO idx2"),
+            EntrySqlType::Unknown
+        );
+
+        // The guard. Written out rather than derived, because the enum cannot be iterated — so
+        // a new arm without a case has to fail here.
+        assert_eq!(
+            seen.len(),
+            42,
+            "every EntrySqlType arm needs a statement that reaches it; reached {seen:?}"
+        );
+    }
+
+    /// A LABEL NAMES THE STATEMENT WRITTEN, OR IT IS `Unknown` -- never a neighbour.
+    ///
+    /// Each of these shares a `Statement` node with a sibling, so a mapping that read only the
+    /// node would give one the other's label. An arm is owed where the relation graph says
+    /// something specific about the statement; where it says nothing, `Unknown` is the truthful
+    /// label.
+    #[test]
+    fn a_label_names_the_statement_written_or_is_unknown() {
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "REPLACE INTO t VALUES (1)",
+            "ALTER TABLE t ADD COLUMN b INT",
+            "ALTER VIEW v AS SELECT 1 FROM t",
+            "DROP TABLE t",
+            "DROP VIEW v",
+            "DROP INDEX idx ON t",
+            "DROP DATABASE d",
+            "SHOW CREATE TABLE t",
+            "SHOW CREATE VIEW v",
+        ] {
+            let label = typed(sql).to_string();
+            assert!(sql.starts_with(&label), "{sql} is labelled {label}");
+        }
+        for sql in [
+            "DROP USER u",
+            "DROP ROLE r",
+            "SHOW CREATE PROCEDURE p",
+            "SHOW CREATE FUNCTION f",
+            "SHOW CREATE TRIGGER tr",
+            "SHOW CREATE EVENT e",
+        ] {
+            assert_eq!(typed(sql), EntrySqlType::Unknown, "{sql}");
+        }
+    }
+
+    /// The label is what a reader sees.
+    ///
+    /// `Display` is not cosmetic here: a caller writing `sql_type().to_string()` into a column
+    /// files each of these strings as the value.
+    #[test]
+    fn no_label_asserts_something_the_statement_did_not_say() {
+        // A name, never the absence marker: a nullable column needs `NULL` to mean "not SQL".
+        assert_eq!(EntrySqlType::Unknown.to_string(), "UNKNOWN");
+        assert_ne!(EntrySqlType::Unknown.to_string(), "NULL");
+
+        // Each names its own object and its own direction.
+        assert_eq!(EntrySqlType::UnlockTables.to_string(), "UNLOCK TABLES");
+        assert_eq!(EntrySqlType::DropView.to_string(), "DROP VIEW");
+        assert_eq!(EntrySqlType::DropDatabase.to_string(), "DROP DATABASE");
+        assert_eq!(EntrySqlType::DropIndex.to_string(), "DROP INDEX");
+        assert_eq!(EntrySqlType::ShowCreateView.to_string(), "SHOW CREATE VIEW");
+        assert_eq!(EntrySqlType::AlterView.to_string(), "ALTER VIEW");
+        assert_eq!(EntrySqlType::Replace.to_string(), "REPLACE");
+
+        // And the catch-all, which is not a variable.
+        assert_eq!(EntrySqlType::ShowVariable.to_string(), "SHOW");
+
+        // Every label distinct, so no two arms collapse into one value.
+        let labels: Vec<String> = [
+            EntrySqlType::Query,
+            EntrySqlType::Insert,
+            EntrySqlType::Replace,
+            EntrySqlType::Update,
+            EntrySqlType::Delete,
+            EntrySqlType::CreateTable,
+            EntrySqlType::CreateIndex,
+            EntrySqlType::CreateView,
+            EntrySqlType::AlterTable,
+            EntrySqlType::AlterView,
+            EntrySqlType::Drop,
+            EntrySqlType::DropView,
+            EntrySqlType::DropIndex,
+            EntrySqlType::DropDatabase,
+            EntrySqlType::DropFunction,
+            EntrySqlType::Set,
+            EntrySqlType::ShowVariable,
+            EntrySqlType::ShowVariables,
+            EntrySqlType::ShowCreate,
+            EntrySqlType::ShowCreateView,
+            EntrySqlType::ShowColumns,
+            EntrySqlType::ShowTables,
+            EntrySqlType::ShowCollation,
+            EntrySqlType::Use,
+            EntrySqlType::StartTransaction,
+            EntrySqlType::Commit,
+            EntrySqlType::Rollback,
+            EntrySqlType::CreateSchema,
+            EntrySqlType::CreateDatabase,
+            EntrySqlType::Grant,
+            EntrySqlType::Revoke,
+            EntrySqlType::Kill,
+            EntrySqlType::ExplainTable,
+            EntrySqlType::Explain,
+            EntrySqlType::Savepoint,
+            EntrySqlType::LockTables,
+            EntrySqlType::UnlockTables,
+            EntrySqlType::Flush,
+            EntrySqlType::Truncate,
+            EntrySqlType::RenameTable,
+            EntrySqlType::Analyze,
+            EntrySqlType::Unknown,
+        ]
+        .iter()
+        .map(|t| t.to_string())
+        .collect();
+        assert_eq!(labels.len(), 42);
+        let distinct: BTreeSet<&String> = labels.iter().collect();
+        assert_eq!(distinct.len(), 42, "two arms share a label: {labels:?}");
+    }
 }
 
-impl EntryContext {
-    /// returns the request_id from query comment
-    pub fn request_id(&self) -> Option<Cow<str>> {
-        if let Some(v) = &self.request_id {
-            Some(String::from_utf8_lossy(v.as_ref()))
-        } else {
-            None
-        }
+#[cfg(test)]
+mod every_object_is_a_relation_by_name {
+    use super::*;
+    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::parser::Parser;
+
+    fn objects(sql: &str) -> Vec<String> {
+        let mut s =
+            Parser::parse_sql(&MySqlDialect {}, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        EntrySqlStatement::from(s.remove(0))
+            .objects()
+            .iter()
+            .map(|o| o.full_object_name().into_owned())
+            .collect()
     }
 
-    /// returns the request_id from query comment
-    pub fn request_id_bytes(&self) -> Option<Bytes> {
-        self.request_id.clone()
+    /// A NAME IS ITS VALUE AND NOT ITS SPELLING. Quoting a name changes nothing MySQL resolves,
+    /// so `` `actor` `` and `actor` are one relation.
+    #[test]
+    fn quoting_does_not_make_a_second_relation() {
+        assert_eq!(
+            objects("SELECT * FROM `actor` JOIN actor a2 JOIN `sakila`.`film` f JOIN sakila.film"),
+            ["actor", "sakila.film"]
+        );
+        // Case is the server's to fold, and a slow log does not say how it folds it.
+        assert_eq!(
+            objects("SELECT * FROM Actor JOIN actor"),
+            ["Actor", "actor"]
+        );
     }
 
-    /// returns the caller from query comment
-    pub fn caller(&self) -> Option<Cow<str>> {
-        if let Some(v) = &self.caller {
-            Some(String::from_utf8_lossy(v.as_ref()))
-        } else {
-            None
-        }
-    }
-
-    /// returns the caller from query comment
-    pub fn caller_bytes(&self) -> Option<Bytes> {
-        self.caller.clone()
-    }
-
-    /// returns the function from query comment
-    pub fn function(&self) -> Option<Cow<str>> {
-        if let Some(v) = &self.function {
-            Some(String::from_utf8_lossy(v.as_ref()))
-        } else {
-            None
-        }
-    }
-
-    /// returns the function from query comment
-    pub fn function_bytes(&self) -> Option<Bytes> {
-        self.function.clone()
-    }
-
-    /// returns the line from query comment
-    pub fn line(&self) -> Option<u32> {
-        self.line
+    /// A SCHEMA IS NOT A RELATION.
+    #[test]
+    fn show_tables_names_a_schema_and_no_relation() {
+        assert!(objects("SHOW TABLES FROM mysql").is_empty());
+        assert!(objects("SHOW FULL TABLES IN `db` LIKE 'x%'").is_empty());
+        // The same field names a table under `SHOW COLUMNS`, which is why the statement decides.
+        assert_eq!(objects("SHOW COLUMNS FROM t FROM db"), ["db.t"]);
     }
 }
