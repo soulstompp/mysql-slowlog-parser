@@ -1,13 +1,14 @@
 //! The framing reader: bytes of a slow log in, one [`Entry`] at a time out.
 //!
-//! What it reads: the file's header block, then, per entry, the `# Time:`, `# User@Host:` and
+//! What it reads: header blocks, then, per entry, the `# Time:`, `# User@Host:` and
 //! `# Query_time:` lines, an optional `USE <db>;`, the `SET timestamp=…;` line, and finally
 //! either an administrator command or the statement's own bytes. Each of those is a parser in
 //! [`crate::parser`]; this module is the state machine that orders them and the buffer
 //! arithmetic that lets a partial read resume.
 //!
 //! What it refuses: a line its stage cannot read, which is returned as
-//! [`CodecError::Malformed`] rather than skipped; and input that ends inside an entry, which
+//! [`CodecError::Malformed`] rather than skipped; an entry with no time to give it, as
+//! [`CodecError::MissingTime`]; and input that ends inside an entry, which
 //! [`Decoder::decode_eof`] reports as [`CodecError::Truncated`] so a caller can tell a truncated
 //! log from a complete one.
 //!
@@ -21,8 +22,9 @@
 //! completes, [`FileScope`] is not.
 
 use crate::parser::{
-    HeaderLines, Stream, admin_command, details_comment, entry_user, log_header, parse_entry_stats,
-    parse_entry_time, parse_sql, sql_lines, start_timestamp_command, use_database,
+    HeaderLines, SetLine, Stream, admin_command, details_comment, entry_user, log_header,
+    parse_entry_stats, parse_entry_time, parse_sql, sql_lines, start_timestamp_command,
+    use_database,
 };
 use crate::types::EntryStatement::SqlStatement;
 use crate::types::{Entry, EntryCall, EntrySqlAttributes, EntrySqlStatement, EntryStatement};
@@ -36,9 +38,10 @@ use thiserror::Error;
 use tokio::io;
 use tokio_util::codec::Decoder;
 use winnow::ascii::multispace0;
-use winnow::combinator::opt;
+use winnow::combinator::{opt, peek};
 use winnow::error::{ContextError, ErrMode};
 use winnow::stream::{Stream as _, StreamIsPartial};
+use winnow::token::literal;
 use winnow::{ModalResult, Parser};
 use winnow_datetime::DateTime;
 
@@ -66,6 +69,16 @@ pub enum CodecError {
         /// the first line of what the stage refused, lossily decoded and cut to at most 200
         /// bytes
         line: String,
+    },
+    /// An entry with no `# Time:` line and no earlier entry to take its time from.
+    ///
+    /// MySQL before 5.7 omits the line for an entry logged in the same second as the one before
+    /// it, so only the first entry of a log, or of a shard read without the previous shard's
+    /// [`FileScope`], can have no time at all.
+    #[error("entry {entry} has no `# Time:` line and no earlier entry to take one from")]
+    MissingTime {
+        /// the entry's position in the input, counting from zero
+        entry: usize,
     },
     /// Input that ends inside an entry: MySQL ends every entry with its statement and a `;`.
     #[error("input ends inside the {stage} of entry {entry}: {line:?}")]
@@ -122,6 +135,8 @@ enum Halt {
     Incomplete,
     /// the stage's grammar refused what is there
     Refused,
+    /// an entry with no `# Time:` line and no earlier time to take
+    NoTime,
 }
 
 impl From<ErrMode<ContextError>> for Halt {
@@ -145,7 +160,7 @@ struct EntryContext {
     time: Option<DateTime>,
     user: Option<SessionLine>,
     stats: Option<StatsLine>,
-    set_timestamp: Option<u32>,
+    set: Option<SetLine>,
     use_database: Option<Bytes>,
     attributes: Option<EntrySqlAttributes>,
 }
@@ -162,8 +177,15 @@ impl EntryContext {
     fn complete(&mut self) -> Option<Entry> {
         let ctx = std::mem::take(self);
 
+        let set = ctx.set?;
+
         Some(Entry {
-            call: EntryCall::new(ctx.time?, ctx.set_timestamp?),
+            call: EntryCall {
+                log_time: ctx.time?,
+                set_timestamp: set.timestamp,
+                last_insert_id: set.last_insert_id,
+                insert_id: set.insert_id,
+            },
             session: ctx.user?.into(),
             stats: ctx.stats?.into(),
             sql_attributes: ctx.attributes?,
@@ -172,13 +194,15 @@ impl EntryContext {
 }
 
 /// Everything a codec holds that is a fact about the *file* rather than about one entry: the
-/// header block, how many header blocks have been seen, and how many entries have been decoded.
+/// header block, how many header blocks have been seen, how many entries have been decoded, and
+/// the last entry's time.
 ///
 /// This is the state to hand to a codec reading a later shard of the same log. Only the first
 /// shard holds the header, so without it a second shard states no server version — and a claim
-/// about MySQL's behaviour only means something inside the regime a version names.
+/// about MySQL's behaviour only means something inside the regime a version names. The time is
+/// what an entry that omits its `# Time:` line takes.
 ///
-/// It is `O(1)`: one header block and two counters, whatever the file's size.
+/// It is `O(1)`: one header block, one time and two counters, whatever the file's size.
 /// [`EntryCodec::file_scope`] produces one and [`EntryCodec::resume`] takes one, so splitting a
 /// log and reading a log in two buffers are the same operation.
 ///
@@ -189,6 +213,7 @@ pub struct FileScope {
     headers: Option<HeaderLines>,
     headers_seen: usize,
     processed: usize,
+    last_time: Option<DateTime>,
 }
 
 impl FileScope {
@@ -211,9 +236,12 @@ impl FileScope {
 
 /// The [`Decoder`] for a MySQL slow log: bytes in, one [`Entry`] per log entry out.
 ///
-/// It reads the entry format MySQL 5.7 and later write by default, with an ISO 8601 `# Time:`
-/// line on every entry. A line it cannot read is an error rather than being skipped; see
-/// [`CodecError`].
+/// It reads the entry format of MySQL 5.5 and later, Percona Server and MariaDB: an ISO 8601 or
+/// `yymmdd h:mm:ss` `# Time:` line, or none where the server left it out, a `# User@Host:` line
+/// with or without an `Id:`, and a `# Query_time:` line with any further fields `log_slow_extra`
+/// adds and any `# Name: value` lines around it. A comment line of another shape, such as
+/// MariaDB's `# explain:` block, is not read. A line it cannot read is an error rather than being
+/// skipped; see [`CodecError`].
 #[derive(Debug, Default)]
 pub struct EntryCodec {
     /// File-scoped state, in one place because it is one scope. See [`FileScope`].
@@ -286,18 +314,35 @@ impl EntryCodec {
                 // `None` on the next entry. A second header block mid-file means the log was
                 // reopened, and the entries after it may have been written by a different server,
                 // so the first is kept and the count is recorded.
-                let res = opt(log_header).parse_next(i)?;
-                self.context.expects = DecodeStage::Time;
-                if let Some(h) = res {
-                    self.file.headers_seen += 1;
-                    if self.file.headers.is_none() {
-                        self.file.headers = Some(h);
+                //
+                // The arm stays in `Header` after a block, because a restart or a `FLUSH LOGS`
+                // with nothing logged in between leaves two blocks in a row.
+                match opt(log_header).parse_next(i)? {
+                    Some(h) => {
+                        self.file.headers_seen += 1;
+                        if self.file.headers.is_none() {
+                            self.file.headers = Some(h);
+                        }
                     }
+                    None => self.context.expects = DecodeStage::Time,
                 }
             }
             DecodeStage::Time => {
-                let dt = parse_entry_time(i)?;
-                self.context.time = Some(dt);
+                let time = match opt(parse_entry_time).parse_next(i)? {
+                    Some(t) => {
+                        self.file.last_time = Some(t.clone());
+                        t
+                    }
+                    // MySQL before 5.7 writes no `# Time:` line for an entry logged in the same
+                    // second as the entry before it, so the entry opens with its session line and
+                    // its time is that entry's.
+                    None => {
+                        let session: ModalResult<_> = peek(literal("# User@Host:")).parse_next(i);
+                        session?;
+                        self.file.last_time.clone().ok_or(Halt::NoTime)?
+                    }
+                };
+                self.context.time = Some(time);
                 self.context.expects = DecodeStage::Session;
             }
             DecodeStage::Session => {
@@ -320,7 +365,7 @@ impl EntryCodec {
             }
             DecodeStage::SetTimestamp => {
                 let st = start_timestamp_command(i)?;
-                self.context.set_timestamp = Some(st);
+                self.context.set = Some(st);
                 self.context.expects = DecodeStage::Statement;
             }
             DecodeStage::Statement => {
@@ -496,6 +541,7 @@ impl EntryCodec {
         let line = excerpt(rest);
 
         match halt {
+            Halt::NoTime => CodecError::MissingTime { entry },
             Halt::Incomplete => CodecError::Truncated { stage, entry, line },
             Halt::Refused
                 if eof
@@ -656,13 +702,14 @@ SET timestamp=1517798807;
                 sys_user_name: Bytes::from("msandbox"),
                 host_name: Some(Bytes::from("localhost")),
                 ip_address: None,
-                thread_id: 10,
+                thread_id: Some(10),
             },
             stats: EntryStats {
                 query_time: 0.000352,
                 lock_time: 0.0,
                 rows_sent: 0,
                 rows_examined: 0,
+                extra: vec![],
             },
             sql_attributes: EntrySqlAttributes {
                 sql_raw: Some(sql.trim().into()),
@@ -1242,8 +1289,9 @@ mod the_author_and_the_reader {
 mod every_shape_a_server_writes {
     use crate::Entry;
     use crate::codec::{CodecError, EntryCodec};
-    use bytes::BytesMut;
+    use bytes::{Bytes, BytesMut};
     use tokio_util::codec::Decoder;
+    use winnow_datetime::Date;
 
     pub(super) const HEADER: &str = "/home/karl/mysql/my-5.7/bin/mysqld, Version: 5.7.20-log (MySQL Community Server (GPL)). started with:
 Tcp port: 12345  Unix socket: /tmp/12345/mysql_sandbox12345.sock
@@ -1254,6 +1302,11 @@ Time                 Id Command    Argument
     pub(super) const STATS: &str =
         "# Query_time: 0.000016  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0\n";
     pub(super) const SET: &str = "SET timestamp=1517798803;\n";
+
+    /// A header, `entry`, and a `SELECT 2;` entry after it.
+    pub(super) fn log(entry: &str) -> String {
+        format!("{HEADER}{entry}{TIME}{SESSION}{STATS}{SET}SELECT 2;\n")
+    }
 
     /// Every entry decoded from `log` fed to the decoder `chunk` bytes at a time, as
     /// `FramedRead` would, and the first error if there is one.
@@ -1293,6 +1346,207 @@ Time                 Id Command    Argument
         }
 
         (whole, error)
+    }
+
+    /// Two entries, the second intact.
+    fn both(entry: &str) -> Entry {
+        let (entries, error) = read(&log(entry));
+        assert!(error.is_none(), "{error:?} in {entry}");
+        assert_eq!(entries.len(), 2, "{entry}");
+
+        let second = &entries[1].sql_attributes;
+        assert_eq!(second.sql(), "SELECT 2");
+        assert_eq!(second.sql_raw.as_deref(), Some(&b"SELECT 2;"[..]));
+
+        entries.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn every_session_line_reaches_the_entry() {
+        type Want = (
+            &'static str,
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<u32>,
+        );
+        let cases: [(&str, Want); 8] = [
+            (
+                "# User@Host: app[app] @ db-01.example.com []  Id:     3",
+                ("app", Some("db-01.example.com"), None, Some(3)),
+            ),
+            (
+                "# User@Host: app-rw[app-rw] @ localhost []  Id:     3",
+                ("app-rw", Some("localhost"), None, Some(3)),
+            ),
+            (
+                "# User@Host: app[app] @ localhost [::1]  Id:     3",
+                ("app", Some("localhost"), Some("::1"), Some(3)),
+            ),
+            (
+                "# User@Host: app[app] @ web1 [10.0.0.5]  Id:     3",
+                ("app", Some("web1"), Some("10.0.0.5"), Some(3)),
+            ),
+            (
+                "# User@Host: app[app] @ node1.cluster01 []  Id:     3",
+                ("app", Some("node1.cluster01"), None, Some(3)),
+            ),
+            (
+                "# User@Host: app[app] @ ip-10-0-0-5.ec2.internal [::ffff:10.0.0.7]  Id: 12",
+                (
+                    "app",
+                    Some("ip-10-0-0-5.ec2.internal"),
+                    Some("::ffff:10.0.0.7"),
+                    Some(12),
+                ),
+            ),
+            (
+                "# User@Host: [SQL_SLAVE] @  []  Id:     1",
+                ("", None, None, Some(1)),
+            ),
+            (
+                "# User@Host: msandbox[msandbox] @ localhost []",
+                ("msandbox", Some("localhost"), None, None),
+            ),
+        ];
+
+        for (line, (user, host, ip, id)) in cases {
+            let e = both(&format!("{TIME}{line}\n{STATS}{SET}SELECT 1;\n"));
+            let s = &e.session;
+
+            assert_eq!(s.user_name, Bytes::from(user), "{line}");
+            assert_eq!(s.host_name.as_deref(), host.map(str::as_bytes), "{line}");
+            assert_eq!(s.ip_address.as_deref(), ip.map(str::as_bytes), "{line}");
+            assert_eq!(e.thread_id(), id, "{line}");
+        }
+    }
+
+    /// The `use` line comes before `SET timestamp`, as MySQL writes it, and names the database
+    /// exactly as written.
+    #[test]
+    fn a_database_name_is_read_as_written() {
+        for (line, name) in [("use my-app;", "my-app"), ("use `my-app`;", "my-app")] {
+            let e = both(&format!("{TIME}{SESSION}{STATS}{line}\n{SET}SELECT 1;\n"));
+            assert_eq!(e.sql_attributes.use_database, Some(Bytes::from(name)));
+            assert_eq!(e.sql_attributes.sql(), "SELECT 1");
+        }
+    }
+
+    #[test]
+    fn row_counts_past_u32_and_the_extra_fields_reach_the_entry() {
+        let e = both(&format!(
+            "{TIME}{SESSION}# Query_time: 0.000016  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 5000000000\n{SET}SELECT 1;\n"
+        ));
+        assert_eq!(e.rows_examined(), 5_000_000_000);
+
+        // `log_slow_extra=ON`.
+        let e = both(&format!(
+            "{TIME}{SESSION}# Query_time: 0.000352  Lock_time: 0.000100 Rows_sent: 1  Rows_examined: 2 Thread_id: 10 Errno: 1064 Killed: 0 Bytes_received: 27 Start: 2019-01-01T12:00:00.000000Z End: 2019-01-01T12:00:00.000352Z\n{SET}SELECT 1;\n"
+        ));
+        assert_eq!(e.stats.extra.len(), 6);
+        assert_eq!(e.stats.extra_value("Errno"), Some(&Bytes::from("1064")));
+        assert_eq!(
+            e.stats.extra_value("End"),
+            Some(&Bytes::from("2019-01-01T12:00:00.000352Z"))
+        );
+        assert_eq!(e.stats.extra_value("Missing"), None);
+    }
+
+    /// A MariaDB entry: the `yymmdd` time, no `Id:`, and lines of fields around the stats line.
+    #[test]
+    fn a_mariadb_entry_reaches_the_entry_whole() {
+        let e = both(
+            "# Time: 230405 12:35:53
+# User@Host: root[root] @ localhost []
+# Thread_id: 36  Schema: test  QC_hit: No
+# Query_time: 0.000094  Lock_time: 0.000028  Rows_sent: 1  Rows_examined: 1
+# Rows_affected: 0  Bytes_sent: 57
+use test;
+SET timestamp=1680698153;
+select * from t1 where a=1;
+",
+        );
+
+        assert_eq!(e.thread_id(), None, "the session line has no `Id:`");
+        assert_eq!(e.stats.extra_value("Thread_id"), Some(&Bytes::from("36")));
+        assert_eq!(e.stats.extra_value("Bytes_sent"), Some(&Bytes::from("57")));
+        assert_eq!(e.stats.extra.len(), 5);
+        assert_eq!(e.sql_attributes.use_database, Some(Bytes::from("test")));
+        assert_eq!(e.call.log_time.time.hour, 12);
+    }
+
+    /// MySQL writes the insert ids on the `SET` line of any statement that generated or read one.
+    #[test]
+    fn the_insert_ids_on_the_set_line_reach_the_entry() {
+        let e = both(&format!(
+            "{TIME}{SESSION}{STATS}SET last_insert_id=4,insert_id=7,timestamp=1517798803;\nINSERT INTO t (a) VALUES (1);\n"
+        ));
+        assert_eq!(e.call.set_timestamp, 1517798803);
+        assert_eq!(e.call.last_insert_id(), Some(4));
+        assert_eq!(e.call.insert_id(), Some(7));
+    }
+
+    /// MySQL before 5.7 writes `yymmdd h:mm:ss`, and writes no `# Time:` line at all for an
+    /// entry logged in the same second as the one before it.
+    #[test]
+    fn an_entry_with_no_time_line_takes_the_time_before_it() {
+        let text = format!(
+            "{HEADER}# Time: 180205  2:46:47\n{SESSION}{STATS}{SET}SELECT 1;\n{SESSION}{STATS}{SET}SELECT 2;\n# Time: 180205  2:46:48\n{SESSION}{STATS}{SET}SELECT 3;\n"
+        );
+        let (entries, error) = read(&text);
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(entries.len(), 3);
+
+        assert_eq!(
+            entries[0].call.log_time.date,
+            Date::YMD {
+                year: 2018,
+                month: 2,
+                day: 5
+            }
+        );
+        assert_eq!(entries[1].call.log_time, entries[0].call.log_time);
+        assert_eq!(entries[2].call.log_time.time.second, 48);
+
+        // With no entry before it there is no time to take, which is an error and not a panic.
+        let (entries, error) = read(&format!("{HEADER}{SESSION}{STATS}{SET}SELECT 1;\n"));
+        assert!(entries.is_empty());
+        assert!(matches!(error, Some(CodecError::MissingTime { entry: 0 })));
+    }
+
+    /// A restart or a `FLUSH LOGS` with nothing logged in between leaves header blocks in a row,
+    /// and a Windows server writes its named pipe where a unix server writes its socket.
+    #[test]
+    fn header_blocks_in_a_row_are_all_read() {
+        let windows = "C:\\mysql\\bin\\mysqld.exe, Version: 8.0.36 (MySQL Community Server - GPL). started with:
+TCP Port: 3306, Named Pipe: MySQL
+Time                 Id Command    Argument
+";
+        let text = format!(
+            "{HEADER}{HEADER}{TIME}{SESSION}{STATS}{SET}SELECT 1;\n{windows}{TIME}{SESSION}{STATS}{SET}SELECT 2;\n"
+        );
+
+        let mut codec = EntryCodec::default();
+        let mut buf = BytesMut::from(text.as_bytes());
+        let mut n = 0;
+        while let Some(e) = codec.decode_eof(&mut buf).unwrap() {
+            assert_eq!(e.sql_attributes.sql(), ["SELECT 1", "SELECT 2"][n]);
+            n += 1;
+        }
+        assert_eq!(n, 2);
+        assert_eq!(codec.header_count(), 3);
+        assert_eq!(codec.headers().unwrap().tcp_port(), Some(12345));
+        assert_eq!(read(&text).0.len(), 2);
+
+        let (entries, error) = read(&format!("{windows}{TIME}{SESSION}{STATS}{SET}SELECT 1;\n"));
+        assert!(error.is_none() && entries.len() == 1);
+
+        let mut codec = EntryCodec::default();
+        let mut buf = BytesMut::from(windows.as_bytes());
+        assert!(codec.decode_eof(&mut buf).unwrap().is_none());
+        let h = codec.headers().unwrap();
+        assert_eq!(h.named_pipe(), Some(&Bytes::from("MySQL")));
+        assert_eq!(h.socket(), None);
+        assert_eq!(h.tcp_port(), Some(3306));
     }
 
     /// The shipped log, fed a byte at a time and in odd chunks, decodes to exactly what it
@@ -1339,6 +1593,25 @@ mod a_line_that_cannot_be_read_is_an_error {
                 "# User@Host: root[root] localhost []",
             ),
             (
+                format!(
+                    "{HEADER}{TIME}# User@Host: root[root] @ localhost []  Id: 99999999999\n{STATS}{SET}SELECT 1;\n"
+                ),
+                DecodeStage::Session,
+                "# User@Host: root[root] @ localhost []  Id: 99999999999",
+            ),
+            (
+                format!(
+                    "{HEADER}{TIME}{SESSION}# Query_time: 1.0  Lock_time: 0.0 Rows_sent: 0  Rows_examined: 99999999999999999999\n{SET}SELECT 1;\n"
+                ),
+                DecodeStage::Stats,
+                "# Query_time: 1.0  Lock_time: 0.0 Rows_sent: 0  Rows_examined: 99999999999999999999",
+            ),
+            (
+                format!("{HEADER}{TIME}{SESSION}{STATS}SET timestamp=99999999999;\nSELECT 1;\n"),
+                DecodeStage::SetTimestamp,
+                "SET timestamp=99999999999;",
+            ),
+            (
                 format!("{HEADER}not an entry\n{TIME}{SESSION}{STATS}{SET}SELECT 1;\n"),
                 DecodeStage::Time,
                 "not an entry",
@@ -1353,6 +1626,11 @@ mod a_line_that_cannot_be_read_is_an_error {
                 format!("{HEADER}{TIME}{SESSION}{STATS}SE timestamp=1;\nSELECT 1;\n"),
                 DecodeStage::SetTimestamp,
                 "SE timestamp=1;",
+            ),
+            (
+                HEADER.replace("Tcp port: 12345", "Tcp port: x"),
+                DecodeStage::Header,
+                HEADER.lines().next().unwrap(),
             ),
         ] {
             assert_eq!(malformed(&text), (stage, line.to_string()), "{text}");

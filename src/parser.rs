@@ -7,6 +7,9 @@
 //! to `sqlparser` and walks the tree once to record every literal, masking them on the way where
 //! the caller asked for it.
 //!
+//! Each line grammar reads one whole line first and parses only that, so no line grammar reads
+//! past the end of its own line.
+//!
 //! What it refuses: a line that does not match its shape, as a winnow backtrack; and text
 //! `sqlparser` will not parse, which [`crate::codec`] files as an invalid statement with the
 //! author's bytes intact.
@@ -32,24 +35,46 @@ use std::ops::ControlFlow;
 use std::ops::Not;
 use std::str;
 use std::str::FromStr;
-use winnow::ascii::{
-    Caseless, alpha1, alphanumeric1, digit1, float, line_ending, multispace0, multispace1,
-    till_line_ending,
-};
-use winnow::combinator::repeat;
-use winnow::combinator::{alt, trace};
-use winnow::combinator::{not, opt};
-use winnow::combinator::{preceded, terminated};
+use winnow::ascii::{Caseless, alphanumeric1, digit1, float, multispace0, space0, space1};
+use winnow::combinator::{alt, cut_err, eof, not, opt, peek, preceded, repeat, separated, trace};
 use winnow::error::{ContextError, ErrMode, InputError, Needed};
 // Aliased: `sqlparser` exports a `ParserError` of its own and both are used in this file.
 use winnow::error::ParserError as WinnowError;
-use winnow::stream::{AsBytes, StreamIsPartial};
-use winnow::token::{any, literal, take, take_till, take_until};
+use winnow::stream::{AsBytes, AsChar, StreamIsPartial};
+use winnow::token::{any, literal, rest, take, take_till, take_while};
 use winnow::{ModalResult, Parser, Partial, seq};
-use winnow_datetime::DateTime;
+use winnow_datetime::{Date, DateTime, Time};
 use winnow_iso8601::datetime::datetime;
 
 pub type Stream<'i> = Partial<&'i [u8]>;
+
+/// The next line, without its line ending.
+///
+/// A partial stream holds a line only once its `\n` has arrived; at the end of a complete stream
+/// the rest of the input is the last line. A `\r` before the `\n` belongs to the line ending.
+pub(crate) fn line<'i>(i: &mut Stream<'i>) -> ModalResult<&'i [u8]> {
+    trace("line", move |input: &mut Stream<'i>| {
+        let l: &[u8] = take_till(0.., b'\n').parse_next(input)?;
+        let _ = opt(literal("\n")).parse_next(input)?;
+        Ok(l.strip_suffix(b"\r").unwrap_or(l))
+    })
+    .parse_next(i)
+}
+
+/// Decimal digits as a number, or `None` where they do not fit in `T`.
+fn decimal<T: FromStr>(digits: &[u8]) -> Option<T> {
+    str::from_utf8(digits).ok()?.parse().ok()
+}
+
+/// The bytes with surrounding whitespace removed, or `None` where nothing is left.
+fn written(b: &[u8]) -> Option<Bytes> {
+    let b = b.trim_ascii();
+    b.is_empty().not().then(|| Bytes::copy_from_slice(b))
+}
+
+fn refused<T>() -> ModalResult<T> {
+    Err(ErrMode::Backtrack(ContextError::new()))
+}
 
 /// A struct holding a `DateTime` parsed from the Time: line of the entry
 /// ex: `# Time: 2018-02-05T02:46:43.015898Z`
@@ -66,19 +91,76 @@ impl TimeLine {
 }
 
 /// Parses an entry's `# Time:` line into a `DateTime`.
-// # Time: 2015-06-26T16:43:23+0200
+///
+/// Two spellings: the ISO 8601 form MySQL 5.7 and later write (`2018-02-05T02:46:43.015898Z`,
+/// `2015-06-26T16:43:23+02:00`), and the `yymmdd h:mm:ss` form MySQL before 5.7 and MariaDB
+/// write (`180205  2:46:47`). The second states no zone, so its offset is `None`, and its
+/// two-digit year reads as 1969 to 2068.
 pub fn parse_entry_time(i: &mut Stream) -> ModalResult<DateTime> {
     trace("parse_entry_time", move |input: &mut Stream| {
-        let dt = seq!(
-            _: literal("# Time:"),
-            _: multispace1,
-            datetime,
-        )
-        .parse_next(input)?;
+        let mut l = preceded(peek(literal("# Time:")), line).parse_next(input)?;
 
-        Ok(dt.0)
+        seq!(
+            _: literal("# Time:"),
+            _: space1,
+            alt((datetime, legacy_datetime)),
+            _: space0,
+            _: eof,
+        )
+        .map(|t| t.0)
+        .parse_next(&mut l)
     })
     .parse_next(i)
+}
+
+/// `yymmdd h:mm:ss`, the hour padded with a space rather than a zero, and an optional fraction.
+fn legacy_datetime(i: &mut &[u8]) -> ModalResult<DateTime> {
+    let (yy, month, day, hour, minute, second, fraction): (i32, u32, u32, u32, u32, u32, _) = seq!(
+        take_while(2, AsChar::is_dec_digit).verify_map(decimal),
+        take_while(2, AsChar::is_dec_digit).verify_map(decimal),
+        take_while(2, AsChar::is_dec_digit).verify_map(decimal),
+        _: space1,
+        take_while(1..=2, AsChar::is_dec_digit).verify_map(decimal),
+        _: literal(":"),
+        take_while(2, AsChar::is_dec_digit).verify_map(decimal),
+        _: literal(":"),
+        take_while(2, AsChar::is_dec_digit).verify_map(decimal),
+        opt(preceded(literal("."), digit1)),
+    )
+    .parse_next(i)?;
+
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return refused();
+    }
+    if hour > 23 || minute > 59 || second > 60 {
+        return refused();
+    }
+
+    // Everything after the `.`, scaled to nanoseconds; digits past the ninth are dropped.
+    let nanosecond = match fraction {
+        Some(f) => {
+            let f: &[u8] = &f[..f.len().min(9)];
+            decimal::<u32>(f).unwrap_or(0) * 10u32.pow(9 - f.len() as u32)
+        }
+        None => 0,
+    };
+
+    Ok(DateTime {
+        date: Date::YMD {
+            year: if yy >= 69 { 1900 + yy } else { 2000 + yy },
+            month,
+            day,
+        },
+        time: Time {
+            hour,
+            minute,
+            second,
+            nanosecond,
+            offset: None,
+            time_zone: None,
+            calendar: None,
+        },
+    })
 }
 
 /// The values of an entry's `# User@Host:` line.
@@ -90,11 +172,12 @@ pub struct SessionLine {
     pub(crate) sys_user: Bytes,
     pub(crate) host: Option<Bytes>,
     pub(crate) ip_address: Option<Bytes>,
-    pub(crate) thread_id: u32,
+    pub(crate) thread_id: Option<u32>,
 }
 
 impl SessionLine {
-    /// The user name before the brackets: the account MySQL matched for privileges.
+    /// The user name before the brackets: the account MySQL matched for privileges. Empty where
+    /// the server wrote none, as for a replication applier thread.
     pub fn user(&self) -> Bytes {
         self.user.clone()
     }
@@ -109,13 +192,14 @@ impl SessionLine {
         self.host.clone()
     }
 
-    /// The client's IPv4 address, where the line carried one.
+    /// The client's IP address as the server wrote it, IPv4 or IPv6, where the line carried one.
     pub fn ip_address(&self) -> Option<Bytes> {
         self.ip_address.clone()
     }
 
-    /// The connection's thread id, the line's `Id:`.
-    pub fn thread_id(&self) -> u32 {
+    /// The connection's thread id, the line's `Id:`. `None` where the server wrote no `Id:`, as
+    /// MySQL 5.5 and MariaDB do.
+    pub fn thread_id(&self) -> Option<u32> {
         self.thread_id
     }
 }
@@ -131,6 +215,7 @@ pub struct HeaderLines {
     version: Bytes,
     tcp_port: Option<usize>,
     socket: Option<Bytes>,
+    named_pipe: Option<Bytes>,
 }
 
 impl HeaderLines {
@@ -153,34 +238,73 @@ impl HeaderLines {
     pub fn socket(&self) -> Option<&Bytes> {
         self.socket.as_ref()
     }
+
+    /// The Windows named pipe, where the line carried one. A server on Windows writes
+    /// `TCP Port: 3306, Named Pipe: MySQL` where a unix server writes its socket.
+    pub fn named_pipe(&self) -> Option<&Bytes> {
+        self.named_pipe.as_ref()
+    }
 }
 
+/// Parses one header block: the `<program>, Version: <version> started with:` line, the line
+/// naming the port and the socket or named pipe, and the `Time  Id Command  Argument` column
+/// line where it follows.
+///
+/// Refused as a backtrack where the first line is not a header's, and as a cut where it is and
+/// the next line is not the listener line.
 pub fn log_header(i: &mut Stream<'_>) -> ModalResult<HeaderLines> {
     trace("log_header", move |input: &mut Stream<'_>| {
-        // check for the '#' since the last parser in the set is greedy
-        let head = seq!{
-            HeaderLines {
-                _: not(literal("#")),
-                _: take_until(1.., ", Version: "),
-                _:  (", Version: "),
-                version: take_until(1.., " started with:").map(|v: &[u8]| v.to_owned().into()),
-                _: literal(" started with:"),
-                _: multispace1,
-                _: literal("Tcp port:"),
-                _: multispace1,
-                tcp_port: opt(digit1).map(|v: Option<&[u8]>| v.map(|d| str::from_utf8(d).unwrap().parse().unwrap())),
-                _: multispace1,
-                _: literal("Unix socket: "),
-                socket: opt(take_till(1.., "\n".as_bytes())).map(|v: Option<&[u8]>| v.map(|d| d.to_owned().into())),
-                _: till_line_ending,
-                _: line_ending,
-                _: till_line_ending,
-                _: line_ending,
-            }
-        }.parse_next(input)?;
+        not(literal("#")).parse_next(input)?;
+        let first = line
+            .verify(|l: &[u8]| is_header_start(l))
+            .parse_next(input)?;
+        let version = header_version(first).unwrap_or_default();
 
-        Ok(head)
-    }).parse_next(i)
+        let mut listener = cut_err(line).parse_next(input)?;
+        let (tcp_port, socket, named_pipe) = cut_err(listener_line).parse_next(&mut listener)?;
+
+        let _ = opt(line.verify(|l: &[u8]| l.starts_with(b"Time"))).parse_next(input)?;
+
+        Ok(HeaderLines {
+            version,
+            tcp_port,
+            socket,
+            named_pipe,
+        })
+    })
+    .parse_next(i)
+}
+
+/// Whether `line` opens a header block: `<program>, Version: <version> started with:`.
+pub(crate) fn is_header_start(line: &[u8]) -> bool {
+    !line.starts_with(b"#") && header_version(line).is_some()
+}
+
+/// The version between `, Version: ` and a trailing ` started with:`, where both are there and
+/// something is between them.
+fn header_version(line: &[u8]) -> Option<Bytes> {
+    const MARK: &[u8] = b", Version: ";
+    let start = line.windows(MARK.len()).position(|w| w == MARK)? + MARK.len();
+    let end = line.trim_ascii_end().strip_suffix(b" started with:")?.len();
+    (start < end).then(|| Bytes::copy_from_slice(&line[start..end]))
+}
+
+/// `Tcp port: 12345  Unix socket: /tmp/mysql.sock`, or `TCP Port: 3306, Named Pipe: MySQL`.
+#[allow(clippy::type_complexity)]
+fn listener_line(i: &mut &[u8]) -> ModalResult<(Option<usize>, Option<Bytes>, Option<Bytes>)> {
+    let port = preceded(
+        (literal(Caseless("Tcp port:")), space0),
+        opt(digit1.verify_map(decimal)),
+    )
+    .parse_next(i)?;
+
+    alt((
+        preceded((space1, literal("Unix socket:")), rest).map(|s: &[u8]| (written(s), None)),
+        preceded((space0, literal(","), space0, literal("Named Pipe:")), rest)
+            .map(|p: &[u8]| (None, written(p))),
+    ))
+    .map(|(socket, pipe)| (port, socket, pipe))
+    .parse_next(i)
 }
 
 /// The statement's bytes, up to and including the first `;` that is not inside a quote.
@@ -248,127 +372,44 @@ pub(crate) fn statement_end(bytes: &[u8]) -> Option<usize> {
     None
 }
 
-pub fn alphanumerichyphen1<'a>(i: &mut Stream<'a>) -> ModalResult<&'a [u8]> {
-    alt((alphanumeric1, literal("_"), literal("-"))).parse_next(i)
-}
-
-pub fn host_name(i: &mut Stream<'_>) -> ModalResult<Bytes> {
-    trace("host_name", move |input: &mut Stream<'_>| {
-        let (mut first, second): (Vec<&[u8]>, &[u8]) = alt((
-            (
-                repeat(1.., terminated(alphanumerichyphen1, literal("."))),
-                alpha1,
-            ),
-            (repeat(1, alphanumerichyphen1), take(0_usize)),
-        ))
-        .parse_next(input)?;
-
-        if !second.is_empty() {
-            first.push(second);
-        }
-
-        let b = first
-            .iter()
-            .enumerate()
-            .fold(BytesMut::new(), |mut acc, (c, p)| {
-                if c > 0 {
-                    acc.put_slice(".".as_bytes());
-                }
-
-                acc.put_slice(p);
-                acc
-            });
-
-        Ok(b.freeze())
-    })
-    .parse_next(i)
-}
-
-/// ip address handler that only handles IPv4
-pub fn ip_address(i: &mut Stream<'_>) -> ModalResult<Bytes> {
-    trace("ip_address", move |input: &mut Stream<'_>| {
-        let p = seq!(
-            digit1,
-            preceded(literal("."), digit1),
-            preceded(literal("."), digit1),
-            preceded(literal("."), digit1),
-        )
-        .parse_next(input)?;
-
-        let b = [p.0, p.1, p.2, p.3]
-            .iter()
-            .enumerate()
-            .fold(BytesMut::new(), |mut acc, (c, p)| {
-                if c > 0 {
-                    acc.put_slice(".".as_bytes());
-                }
-
-                acc.put_slice(p);
-                acc
-            });
-
-        Ok(b.freeze())
-    })
-    .parse_next(i)
-}
-
-/// thread id parser for 'Id: [\d+]'
-pub fn entry_user_thread_id(i: &mut Stream<'_>) -> ModalResult<u32> {
-    trace("entry_user_thread_id", move |input: &mut Stream<'_>| {
-        let id = seq!(
-            _: literal("Id:"),
-            _: multispace1,
-            digit1
-        )
-        .parse_next(input)?;
-
-        Ok(u32::from_str(str::from_utf8(id.0).unwrap()).unwrap())
-    })
-    .parse_next(i)
-}
-
-pub fn user_name(i: &mut Stream) -> ModalResult<Bytes> {
-    trace("user_name", move |input: &mut Stream<'_>| {
-        let parts: Vec<&[u8]> =
-            repeat(1.., alt((alphanumeric1, literal("_")))).parse_next(input)?;
-
-        let b = parts.iter().fold(BytesMut::new(), |mut acc, p| {
-            acc.put_slice(p);
-            acc
-        });
-
-        Ok(b.freeze())
-    })
-    .parse_next(i)
-}
-
-/// user line parser
+/// Parses an entry's `# User@Host:` line: `priv_user[user] @ host [ip]`, then `Id:` where the
+/// server wrote one.
+///
+/// Every field is read as written up to the delimiter that ends it, so a name may hold `-`, `.`
+/// or digits anywhere, the address may be IPv4 or IPv6, and any of them may be empty: a
+/// replication applier writes `[SQL_SLAVE] @  []`. MySQL 5.5 and MariaDB write no `Id:`.
 pub fn entry_user(i: &mut Stream) -> ModalResult<SessionLine> {
     trace("entry_user", move |input: &mut Stream<'_>| {
-        let s = seq! { SessionLine {
-            _: multispace0,
-            _: literal("# User@Host:"),
-            _: multispace1,
-            user: user_name,
-            _: literal("["),
-            sys_user: user_name,
-            _: literal("]"),
-            _: multispace1,
-            _: literal("@"),
-            _: multispace1,
-            host: opt(host_name),
-            _: multispace0,
-            _: literal("["),
-            _: multispace0,
-            ip_address: opt(ip_address),
-            _: multispace0,
-            _: literal("]"),
-            _: multispace1,
-            thread_id: entry_user_thread_id,
-        }}
-        .parse_next(input)?;
+        let mut l = preceded(peek(literal("# User@Host:")), line).parse_next(input)?;
 
-        Ok(s)
+        let (user, sys_user, host, ip_address, thread_id) = seq!(
+            _: literal("# User@Host:"),
+            _: space0,
+            take_till(0.., b'['),
+            _: literal("["),
+            take_till(0.., b']'),
+            _: literal("]"),
+            _: space0,
+            _: literal("@"),
+            _: space0,
+            take_till(0.., (b' ', b'\t', b'[')),
+            _: space0,
+            _: literal("["),
+            take_till(0.., b']'),
+            _: literal("]"),
+            opt(preceded((space1, literal("Id:"), space0), digit1.verify_map(decimal))),
+            _: space0,
+            _: eof,
+        )
+        .parse_next(&mut l)?;
+
+        Ok(SessionLine {
+            user: Bytes::copy_from_slice(user),
+            sys_user: Bytes::copy_from_slice(sys_user),
+            host: written(host),
+            ip_address: written(ip_address),
+            thread_id,
+        })
     })
     .parse_next(i)
 }
@@ -498,17 +539,34 @@ pub fn details_tag(i: &mut Stream) -> ModalResult<Bytes> {
     .parse_next(i)
 }
 
+pub fn user_name(i: &mut Stream) -> ModalResult<Bytes> {
+    trace("user_name", move |input: &mut Stream<'_>| {
+        let parts: Vec<&[u8]> =
+            repeat(1.., alt((alphanumeric1, literal("_")))).parse_next(input)?;
+
+        let b = parts.iter().fold(BytesMut::new(), |mut acc, p| {
+            acc.put_slice(p);
+            acc
+        });
+
+        Ok(b.freeze())
+    })
+    .parse_next(i)
+}
+
 /// The values of an entry's `# Query_time:` line.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StatsLine {
     /// how long the overall query took, in seconds
     pub(crate) query_time: f64,
     /// how long the query waited to acquire locks, in seconds
     pub(crate) lock_time: f64,
     /// how many rows were sent
-    pub(crate) rows_sent: u32,
+    pub(crate) rows_sent: u64,
     /// how many rows were examined
-    pub(crate) rows_examined: u32,
+    pub(crate) rows_examined: u64,
+    /// the `Name: value` fields after `Rows_examined`, in the order written
+    pub(crate) extra: Vec<(Bytes, Bytes)>,
 }
 
 impl StatsLine {
@@ -522,40 +580,114 @@ impl StatsLine {
     }
 
     /// how many rows were sent
-    pub fn rows_sent(&self) -> u32 {
+    pub fn rows_sent(&self) -> u64 {
         self.rows_sent
     }
     /// how many rows were examined
-    pub fn rows_examined(&self) -> u32 {
+    pub fn rows_examined(&self) -> u64 {
         self.rows_examined
+    }
+
+    /// Every further `Name: value` field of the entry's comment lines, in the order written, names
+    /// and values as the server spelled them.
+    pub fn extra(&self) -> &[(Bytes, Bytes)] {
+        &self.extra
     }
 }
 
-/// parse '# Query_time:...' entry line
+/// Parses an entry's `# Query_time:` line, and the `# Name: value` lines around it.
+///
+/// `Query_time`, `Lock_time`, `Rows_sent` and `Rows_examined` in that order, then any number of
+/// further `Name: value` fields: MySQL 8.0 writes them under `log_slow_extra`, and Percona Server
+/// writes `Rows_affected`. The row counts are 64-bit; one that does not fit is refused.
+///
+/// MariaDB and Percona Server also write whole lines of such fields before and after it, as in
+/// `# Thread_id: 8  Schema: shop  QC_hit: No` and `# Rows_affected: 0  Bytes_sent: 60`. Their
+/// fields join the line's own in [`StatsLine::extra`], in the order written. A comment line that
+/// is not `Name: value` fields is refused, as is MariaDB's `# explain:` block.
 pub fn parse_entry_stats(i: &mut Stream<'_>) -> ModalResult<StatsLine> {
     trace("parse_entry_stats", move |input: &mut Stream<'_>| {
-        let stats = seq! {StatsLine {
-            _: literal("#"),
-            _: multispace1,
-            _: literal("Query_time:"),
-            _: multispace1,
-            query_time: float,
-            _: multispace1,
-            _: literal("Lock_time:"),
-            _: multispace1,
-            lock_time: float,
-            _: multispace1,
-            _: literal("Rows_sent:"),
-            _: multispace1,
-            rows_sent: digit1.map(|d| str::from_utf8(d).unwrap().parse().unwrap()),
-            _: multispace1,
-            _: literal("Rows_examined:"),
-            _: multispace1,
-            rows_examined: digit1.map(|d| str::from_utf8(d).unwrap().parse().unwrap()),
-        }}
-        .parse_next(input)?;
+        let mut extra = Vec::new();
 
-        Ok(stats)
+        while opt(peek(literal("# Query_time:")))
+            .parse_next(input)?
+            .is_none()
+        {
+            extra.extend(field_line(input)?);
+        }
+
+        let mut l = line(input)?;
+        let (query_time, lock_time, rows_sent, rows_examined, fields): (_, _, _, _, Vec<_>) = seq!(
+            _: literal("#"),
+            _: space1,
+            _: literal("Query_time:"),
+            _: space1,
+            float,
+            _: space1,
+            _: literal("Lock_time:"),
+            _: space1,
+            float,
+            _: space1,
+            _: literal("Rows_sent:"),
+            _: space1,
+            digit1.verify_map(decimal),
+            _: space1,
+            _: literal("Rows_examined:"),
+            _: space1,
+            digit1.verify_map(decimal),
+            repeat(0.., stats_field),
+            _: space0,
+            _: eof,
+        )
+        .parse_next(&mut l)?;
+        extra.extend(fields);
+
+        while let Some(fields) = opt(field_line).parse_next(input)? {
+            extra.extend(fields);
+        }
+
+        Ok(StatsLine {
+            query_time,
+            lock_time,
+            rows_sent,
+            rows_examined,
+            extra,
+        })
+    })
+    .parse_next(i)
+}
+
+/// A comment line made only of `Name: value` fields, as MariaDB and Percona Server write around
+/// the `# Query_time:` line. The lines that open an entry or a statement are not among them.
+fn field_line(i: &mut Stream<'_>) -> ModalResult<Vec<(Bytes, Bytes)>> {
+    not(alt((
+        literal("# Time:"),
+        literal("# User@Host:"),
+        literal("# Query_time:"),
+        literal("# administrator command:"),
+    )))
+    .parse_next(i)?;
+
+    let mut l = preceded(peek(literal("#")), line).parse_next(i)?;
+    seq!(_: literal("#"), repeat(1.., stats_field), _: space0, _: eof)
+        .map(|t| t.0)
+        .parse_next(&mut l)
+}
+
+/// One `Name: value` field of a comment line.
+///
+/// One space at most after the `:`, because a server writes an empty value as nothing: MariaDB's
+/// `Schema:   QC_hit: No` is a `Schema` with no database followed by `QC_hit`.
+fn stats_field(i: &mut &[u8]) -> ModalResult<(Bytes, Bytes)> {
+    seq!(
+        _: space1,
+        take_while(1.., (AsChar::is_alphanum, b'_')),
+        _: literal(":"),
+        _: opt(literal(" ")),
+        take_till(0.., (b' ', b'\t')),
+    )
+    .map(|(name, value): (&[u8], &[u8])| {
+        (Bytes::copy_from_slice(name), Bytes::copy_from_slice(value))
     })
     .parse_next(i)
 }
@@ -572,7 +704,7 @@ pub fn admin_command(i: &mut Stream) -> ModalResult<EntryAdminCommand> {
     trace("admin_command", move |input: &mut Stream<'_>| {
         let command = seq!(
             _: literal("# administrator command:"),
-            _: multispace1,
+            _: space1,
             // To the `;` and not one word, because many of MySQL's administrator commands carry
             // a space: `Init DB`, `Register Slave`, `Binlog Dump`, `Table Dump`, `Change user`,
             // `Close stmt`, `Reset stmt`, `Long Data`, `Set option`, `Field List`, `Create DB`,
@@ -587,45 +719,123 @@ pub fn admin_command(i: &mut Stream) -> ModalResult<EntryAdminCommand> {
         .parse_next(input)?;
 
         Ok(EntryAdminCommand {
-            // `multispace1` ate the leading run; trailing spaces before the `;` are ours.
+            // `space1` ate the leading run; trailing spaces before the `;` are ours.
             command: command.0.trim_ascii_end().to_owned().into(),
         })
     })
     .parse_next(i)
 }
 
-/// parses the `use <database>;` line that precedes some entries' `SET timestamp`
+/// Parses the `use <database>;` line that precedes an entry's `SET timestamp` where the
+/// database changed.
+///
+/// MySQL writes the name as it is and unquoted, so everything between `use` and the `;` that
+/// ends the line is the name, `-` and `.` included. A name wrapped in backticks is unquoted,
+/// with a doubled backtick read as one.
 pub fn use_database(i: &mut Stream) -> ModalResult<Bytes> {
     trace("use_database", move |input: &mut Stream<'_>| {
-        let db_name = seq!(
-            _: literal(Caseless("USE")),
-            _: multispace1,
-            user_name,
-            _: multispace0,
-            _: literal(";"),
-        )
-        .parse_next(input)?;
+        let mut l = preceded(peek(literal(Caseless("use"))), line).parse_next(input)?;
 
-        Ok(db_name.0)
+        let after = preceded((literal(Caseless("use")), space1), rest).parse_next(&mut l)?;
+        let Some(name) = after.trim_ascii_end().strip_suffix(b";") else {
+            return refused();
+        };
+        let name = name.trim_ascii();
+
+        let name = match name.strip_prefix(b"`").and_then(|n| n.strip_suffix(b"`")) {
+            Some(quoted) => unquote_backticks(quoted),
+            None => Bytes::copy_from_slice(name),
+        };
+
+        if name.is_empty() {
+            return refused();
+        }
+        Ok(name)
     })
     .parse_next(i)
 }
 
-/// parses the `SET timestamp=<unix seconds>;` line that precedes every statement
-pub fn start_timestamp_command(i: &mut Stream) -> ModalResult<u32> {
-    trace("start_timestamp_command", move |input: &mut Stream<'_>| {
-        let time = seq!(
-            _: literal("SET timestamp"),
-            _: multispace0,
-            _: literal("="),
-            _: multispace0,
-            digit1,
-            _: multispace0,
-            _: literal(";"),
-        )
-        .parse_next(input)?;
+/// The inside of a backtick-quoted identifier, with each doubled backtick read as one.
+fn unquote_backticks(quoted: &[u8]) -> Bytes {
+    let mut out = Vec::with_capacity(quoted.len());
+    let mut i = 0;
+    while i < quoted.len() {
+        out.push(quoted[i]);
+        i += if quoted[i] == b'`' && quoted.get(i + 1) == Some(&b'`') {
+            2
+        } else {
+            1
+        };
+    }
+    Bytes::from(out)
+}
 
-        Ok(u32::from_str(str::from_utf8(time.0).unwrap()).unwrap())
+/// The values of the `SET …;` line that precedes every statement.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct SetLine {
+    pub(crate) timestamp: u32,
+    pub(crate) last_insert_id: Option<u64>,
+    pub(crate) insert_id: Option<u64>,
+}
+
+/// Parses the `SET timestamp=<unix seconds>;` line that precedes every statement.
+///
+/// MySQL writes `last_insert_id=` and `insert_id=` in front of `timestamp=` where the statement
+/// read `LAST_INSERT_ID()` or generated an auto-increment value, as in
+/// `SET insert_id=7,timestamp=1517798807;`. Refused: a line with no `timestamp`, a name outside
+/// those three or written twice, and a value that does not fit, the timestamp being a `u32`.
+pub fn start_timestamp_command(i: &mut Stream) -> ModalResult<SetLine> {
+    trace("start_timestamp_command", move |input: &mut Stream<'_>| {
+        let mut l = preceded(peek(literal("SET ")), line).parse_next(input)?;
+
+        let (assignments,): (Vec<(&[u8], u64)>,) = seq!(
+            _: literal("SET"),
+            _: space1,
+            separated(
+                1..,
+                seq!(
+                    take_while(1.., (AsChar::is_alpha, b'_')),
+                    _: space0,
+                    _: literal("="),
+                    _: space0,
+                    digit1.verify_map(decimal),
+                ),
+                (space0, literal(","), space0),
+            ),
+            _: space0,
+            _: literal(";"),
+            _: space0,
+            _: eof,
+        )
+        .parse_next(&mut l)?;
+
+        let mut timestamp = None;
+        let mut set = SetLine::default();
+        for (name, value) in assignments {
+            let slot = match name {
+                b"timestamp" if timestamp.is_none() => {
+                    timestamp = u32::try_from(value).ok();
+                    if timestamp.is_none() {
+                        return refused();
+                    }
+                    continue;
+                }
+                b"last_insert_id" => &mut set.last_insert_id,
+                b"insert_id" => &mut set.insert_id,
+                _ => return refused(),
+            };
+            if slot.replace(value).is_some() {
+                return refused();
+            }
+        }
+
+        match timestamp {
+            Some(t) => Ok(SetLine {
+                timestamp: t,
+                ..set
+            }),
+            None => refused(),
+        }
     })
     .parse_next(i)
 }
@@ -1629,14 +1839,30 @@ mod every_literal_binding {
 mod tests {
     use crate::EntryMasking;
     use crate::parser::{
-        EntryAdminCommand, HeaderLines, SessionLine, StatsLine, Stream, admin_command,
-        details_comment, entry_user, host_name, ip_address, log_header, parse_entry_stats,
-        parse_entry_time, parse_sql, sql_lines, start_timestamp_command, use_database,
+        EntryAdminCommand, HeaderLines, SessionLine, SetLine, StatsLine, Stream, admin_command,
+        details_comment, entry_user, log_header, parse_entry_stats, parse_entry_time, parse_sql,
+        sql_lines, start_timestamp_command, use_database,
     };
     use bytes::Bytes;
     use std::assert_eq;
     use std::collections::HashMap;
+    use winnow::combinator::opt;
+    use winnow::error::ErrMode;
+    use winnow::stream::{AsBytes, StreamIsPartial};
+    use winnow::{ModalResult, Parser};
     use winnow_datetime::{Date, DateTime, Offset, Time};
+
+    /// A finished slice: the end of these bytes is the end of the input.
+    fn complete(s: &str) -> Stream<'_> {
+        let mut i = Stream::new(s.as_bytes());
+        let _ = i.complete();
+        i
+    }
+
+    /// A refusal and never `Incomplete`: the line is all there, so there is nothing to wait for.
+    fn refused<T: std::fmt::Debug>(r: ModalResult<T>) -> bool {
+        matches!(r, Err(ErrMode::Backtrack(_) | ErrMode::Cut(_)))
+    }
 
     /// THE MICROSECONDS A SLOW LOG WRITES ARE KEPT.
     ///
@@ -1645,15 +1871,15 @@ mod tests {
     /// winnow_datetime 0.4, whose `Time` carries nanoseconds.
     #[test]
     fn a_time_line_keeps_its_microseconds() {
-        let mut i = Stream::new("# Time: 2018-02-05T02:46:43.015898Z".as_bytes());
+        let mut i = Stream::new("# Time: 2018-02-05T02:46:43.015898Z\n".as_bytes());
         let dt = parse_entry_time(&mut i).unwrap();
 
         assert_eq!(dt.time.second, 43);
         assert_eq!(dt.time.nanosecond, 15_898_000, ".015898 is 15_898_000ns");
 
         // and two instants a microsecond apart stay two instants
-        let mut a = Stream::new("# Time: 2018-02-05T02:46:43.015898Z".as_bytes());
-        let mut b = Stream::new("# Time: 2018-02-05T02:46:43.015899Z".as_bytes());
+        let mut a = Stream::new("# Time: 2018-02-05T02:46:43.015898Z\n".as_bytes());
+        let mut b = Stream::new("# Time: 2018-02-05T02:46:43.015899Z\n".as_bytes());
         assert_ne!(
             parse_entry_time(&mut a).unwrap().time.nanosecond,
             parse_entry_time(&mut b).unwrap().time.nanosecond,
@@ -1662,7 +1888,7 @@ mod tests {
 
     #[test]
     fn parses_time_line() {
-        let i = "# Time: 2015-06-26T16:43:23+0200";
+        let i = "# Time: 2015-06-26T16:43:23+0200\n";
 
         let expected = DateTime {
             date: Date::YMD {
@@ -1687,85 +1913,158 @@ mod tests {
 
         let mut s = Stream::new(i.as_bytes());
 
-        //TODO: check for leftovers
         let dt = parse_entry_time(&mut s).unwrap();
         assert_eq!(expected, dt);
+        assert!(s.as_bytes().is_empty(), "the line and its line ending");
     }
 
+    /// MySQL before 5.7 and MariaDB write `yymmdd h:mm:ss`, the hour padded with a space.
     #[test]
-    fn parses_use_database() {
-        let i = "use mysql;";
-        let mut s = Stream::new(i.as_bytes());
+    fn parses_the_pre_5_7_time_line() {
+        let at = |s: &str| parse_entry_time(&mut Stream::new(s.as_bytes())).unwrap();
 
-        let res = use_database(&mut s).unwrap();
+        let dt = at("# Time: 180205  2:46:47\n");
         assert_eq!(
-            (s, res),
-            (Stream::new("".as_bytes()), "mysql".trim().into())
+            dt.date,
+            Date::YMD {
+                year: 2018,
+                month: 2,
+                day: 5
+            }
         );
+        assert_eq!((dt.time.hour, dt.time.minute, dt.time.second), (2, 46, 47));
+        assert_eq!(dt.time.offset, None, "the line states no zone");
+
+        assert_eq!(at("# Time: 180205 12:46:47\n").time.hour, 12);
+        assert_eq!(
+            at("# Time: 130601  8:01:06.058915\n").time.nanosecond,
+            58_915_000
+        );
+        assert_eq!(
+            at("# Time: 991231 23:59:59\n").date,
+            Date::YMD {
+                year: 1999,
+                month: 12,
+                day: 31
+            }
+        );
+
+        for bad in [
+            "# Time: 181305  2:46:47\n",
+            "# Time: 180205 24:46:47\n",
+            "# Time: 18020  2:46:47\n",
+            "# Time: yesterday\n",
+        ] {
+            assert!(
+                refused(parse_entry_time(&mut Stream::new(bad.as_bytes()))),
+                "{bad}"
+            );
+        }
     }
 
+    /// Every shape of the `# User@Host:` line: `priv_user[user] @ host [ip]`, then `Id:` where
+    /// the server wrote one. Each field is read to the delimiter that ends it.
     #[test]
-    fn parses_localhost_host_name() {
-        let i = "localhost ";
+    fn parses_every_session_line() {
+        type Want = (
+            &'static str,
+            &'static str,
+            Option<&'static str>,
+            Option<&'static str>,
+        );
+        let cases: &[(&str, Want, Option<u32>)] = &[
+            (
+                "# User@Host: msandbox[msandbox] @ localhost []  Id:     3",
+                ("msandbox", "msandbox", Some("localhost"), None),
+                Some(3),
+            ),
+            (
+                "# User@Host: lobster[lobster] @ [192.168.56.1]  Id:   190",
+                ("lobster", "lobster", None, Some("192.168.56.1")),
+                Some(190),
+            ),
+            (
+                "# User@Host: root[root] @ local.tests.rs [127.0.0.2]  Id: 7",
+                ("root", "root", Some("local.tests.rs"), Some("127.0.0.2")),
+                Some(7),
+            ),
+            (
+                "# User@Host: app-rw[app-rw] @ db-01.example.com []  Id:     3",
+                ("app-rw", "app-rw", Some("db-01.example.com"), None),
+                Some(3),
+            ),
+            (
+                "# User@Host: svc.batch[svc.batch] @ ip-10-0-0-5.ec2.internal [10.0.0.5]  Id: 9",
+                (
+                    "svc.batch",
+                    "svc.batch",
+                    Some("ip-10-0-0-5.ec2.internal"),
+                    Some("10.0.0.5"),
+                ),
+                Some(9),
+            ),
+            (
+                "# User@Host: app[app] @ node1.cluster01 []  Id:     3",
+                ("app", "app", Some("node1.cluster01"), None),
+                Some(3),
+            ),
+            (
+                "# User@Host: app[app] @ localhost [::1]  Id:     3",
+                ("app", "app", Some("localhost"), Some("::1")),
+                Some(3),
+            ),
+            (
+                "# User@Host: app[app] @  [::ffff:10.0.0.7]  Id:     3",
+                ("app", "app", None, Some("::ffff:10.0.0.7")),
+                Some(3),
+            ),
+            // A replication applier: no account, no host, no address.
+            (
+                "# User@Host: [SQL_SLAVE] @  []  Id:     1",
+                ("", "SQL_SLAVE", None, None),
+                Some(1),
+            ),
+            // MySQL 5.5 and MariaDB write no `Id:`, which is not an `Id:` of zero.
+            (
+                "# User@Host: root[root] @ localhost []",
+                ("root", "root", Some("localhost"), None),
+                None,
+            ),
+        ];
 
-        let mut s = Stream::new(i.as_bytes());
-        let res = host_name(&mut s).unwrap();
+        for (line, (user, sys_user, host, ip), id) in cases {
+            let text = format!("{line}\n");
+            let mut s = Stream::new(text.as_bytes());
+            let got = entry_user(&mut s).unwrap_or_else(|e| panic!("{line}: {e:?}"));
 
-        assert_eq!(res, i.trim());
+            assert_eq!(
+                got,
+                SessionLine {
+                    user: Bytes::from(*user),
+                    sys_user: Bytes::from(*sys_user),
+                    host: host.map(Bytes::from),
+                    ip_address: ip.map(Bytes::from),
+                    thread_id: *id,
+                },
+                "{line}"
+            );
+            assert!(s.as_bytes().is_empty(), "{line}");
+        }
     }
 
+    /// A thread id past `u32` and a line of another shape are refusals, never a panic.
     #[test]
-    fn parses_full_host_name() {
-        let i = "local.tests.rs ";
-
-        let mut s = Stream::new(i.as_bytes());
-        let res = host_name(&mut s).unwrap();
-
-        assert_eq!(res, Bytes::from("local.tests.rs".trim()));
-    }
-
-    #[test]
-    fn parses_ip_address() {
-        let i = "127.0.0.2 ";
-
-        let mut s = Stream::new(i.as_bytes());
-        let res = ip_address(&mut s).unwrap();
-
-        assert_eq!(res, Bytes::from(i.trim()));
-    }
-
-    #[test]
-    fn parses_user_line_no_ip() {
-        let i = "# User@Host: msandbox[msandbox] @ localhost []  Id:     3\n";
-
-        let expected = SessionLine {
-            user: Bytes::from("msandbox"),
-            sys_user: Bytes::from("msandbox"),
-            host: Some(Bytes::from("localhost")),
-            ip_address: None,
-            thread_id: 3,
-        };
-
-        let mut s = Stream::new(i.as_bytes());
-        let res = entry_user(&mut s).unwrap();
-        //TODO: check for left overs
-        assert_eq!(expected, res);
-    }
-
-    #[test]
-    fn parses_user_line_no_host() {
-        let i = "# User@Host: lobster[lobster] @ [192.168.56.1]  Id:   190\n";
-        let mut s = Stream::new(i.as_bytes());
-        let expected = SessionLine {
-            user: Bytes::from("lobster"),
-            sys_user: Bytes::from("lobster"),
-            host: None,
-            ip_address: Some(Bytes::from("192.168.56.1")),
-            thread_id: 190,
-        };
-
-        let res = entry_user(&mut s).unwrap();
-        assert_eq!(expected, res);
+    fn a_session_line_that_does_not_fit_is_refused() {
+        for bad in [
+            "# User@Host: root[root] @ localhost []  Id: 99999999999\n",
+            "# User@Host: root[root] localhost []  Id: 3\n",
+            "# User@Host: root[root] @ localhost []  Id: 3 extra\n",
+        ] {
+            assert!(
+                refused(entry_user(&mut Stream::new(bad.as_bytes()))),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
@@ -1777,12 +2076,126 @@ mod tests {
             lock_time: 2.0,
             rows_sent: 3,
             rows_examined: 4,
+            extra: vec![],
         };
 
-        let mut s = Stream::new(i.as_bytes());
+        let mut s = complete(i);
         let res = parse_entry_stats(&mut s).unwrap();
-        //TODO: check for leftovers
         assert_eq!(expected, res);
+        assert!(s.as_bytes().is_empty());
+    }
+
+    /// Row counts are 64-bit: a scan past four billion rows is a number a server writes.
+    #[test]
+    fn row_counts_are_64_bit_and_one_past_that_is_refused() {
+        let i =
+            "# Query_time: 1.0  Lock_time: 0.0 Rows_sent: 4294967296  Rows_examined: 5000000000\n";
+        let res = parse_entry_stats(&mut complete(i)).unwrap();
+        assert_eq!(
+            (res.rows_sent, res.rows_examined),
+            (4_294_967_296, 5_000_000_000)
+        );
+
+        let i =
+            "# Query_time: 1.0  Lock_time: 0.0 Rows_sent: 0  Rows_examined: 99999999999999999999\n";
+        assert!(refused(parse_entry_stats(&mut complete(i))));
+    }
+
+    /// `log_slow_extra` appends fields to the line, and every one of them is carried, in order.
+    #[test]
+    fn a_log_slow_extra_line_is_read_whole() {
+        let i = "# Query_time: 0.000352  Lock_time: 0.000100 Rows_sent: 1  Rows_examined: 2 \
+                 Thread_id: 10 Errno: 0 Killed: 0 Bytes_received: 27 Bytes_sent: 60 \
+                 Read_first: 0 Read_last: 0 Read_key: 1 Read_next: 0 Read_prev: 0 Read_rnd: 0 \
+                 Read_rnd_next: 3 Sort_merge_passes: 0 Sort_range_count: 0 Sort_rows: 0 \
+                 Sort_scan_count: 0 Created_tmp_disk_tables: 0 Created_tmp_tables: 0 \
+                 Count_hit_tmp_table_size: 0 Start: 2019-01-01T12:00:00.000000Z \
+                 End: 2019-01-01T12:00:00.000352Z\n";
+        let res = parse_entry_stats(&mut complete(i)).unwrap();
+
+        assert_eq!((res.rows_sent, res.rows_examined), (1, 2));
+        let names: Vec<&[u8]> = res.extra.iter().map(|(n, _)| n.as_ref()).collect();
+        assert_eq!(names.len(), 21);
+        assert_eq!(names[0], b"Thread_id");
+        assert_eq!(names[20], b"End");
+        assert_eq!(
+            res.extra[19],
+            (
+                Bytes::from("Start"),
+                Bytes::from("2019-01-01T12:00:00.000000Z")
+            )
+        );
+        assert_eq!(
+            res.extra[3],
+            (Bytes::from("Bytes_received"), Bytes::from("27"))
+        );
+
+        // Percona Server's one further field, after two spaces.
+        let i =
+            "# Query_time: 0.1  Lock_time: 0.0  Rows_sent: 1  Rows_examined: 1  Rows_affected: 0\n";
+        let res = parse_entry_stats(&mut complete(i)).unwrap();
+        assert_eq!(
+            res.extra,
+            vec![(Bytes::from("Rows_affected"), Bytes::from("0"))]
+        );
+    }
+
+    /// MariaDB and Percona Server write whole lines of fields around the `# Query_time:` line,
+    /// and their fields join the line's own, in the order written.
+    #[test]
+    fn the_field_lines_around_the_stats_line_join_its_fields() {
+        let mariadb = "# Thread_id: 36  Schema:   QC_hit: No
+# Query_time: 0.000094  Lock_time: 0.000028  Rows_sent: 1  Rows_examined: 1
+# Rows_affected: 0  Bytes_sent: 57
+SET timestamp=1680698153;\n";
+        let mut s = Stream::new(mariadb.as_bytes());
+        let res = parse_entry_stats(&mut s).unwrap();
+
+        assert_eq!((res.rows_sent, res.rows_examined), (1, 1));
+        let fields: Vec<(&[u8], &[u8])> = res
+            .extra
+            .iter()
+            .map(|(n, v)| (n.as_ref(), v.as_ref()))
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                (&b"Thread_id"[..], &b"36"[..]),
+                (b"Schema", b""),
+                (b"QC_hit", b"No"),
+                (b"Rows_affected", b"0"),
+                (b"Bytes_sent", b"57"),
+            ]
+        );
+        assert_eq!(s.as_bytes(), b"SET timestamp=1680698153;\n");
+
+        let percona = "# Schema: test  Last_errno: 0  Killed: 0
+# Query_time: 0.000291  Lock_time: 0.000127  Rows_sent: 1  Rows_examined: 1  Rows_affected: 0
+# Bytes_sent: 106  Tmp_tables: 0  Tmp_disk_tables: 0  Tmp_table_sizes: 0
+# InnoDB_trx_id: 0
+#   InnoDB_IO_r_ops: 0  InnoDB_IO_r_bytes: 0  InnoDB_IO_r_wait: 0.000000
+SET timestamp=1547113018;\n";
+        let res = parse_entry_stats(&mut Stream::new(percona.as_bytes())).unwrap();
+        assert_eq!(res.extra.len(), 12);
+        assert_eq!(
+            res.extra[3],
+            (Bytes::from("Rows_affected"), Bytes::from("0"))
+        );
+        assert_eq!(
+            res.extra[11],
+            (Bytes::from("InnoDB_IO_r_wait"), Bytes::from("0.000000"))
+        );
+
+        // A comment line of another shape is refused, and so is a stats line that never comes.
+        for bad in [
+            "# No InnoDB statistics available for this query\n# Query_time: 1.0  Lock_time: 0.0 Rows_sent: 0  Rows_examined: 0\n",
+            "# Thread_id: 1\n# Time: 2018-02-05T02:46:43Z\n",
+        ] {
+            assert!(
+                refused(parse_entry_stats(&mut Stream::new(bad.as_bytes()))),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
@@ -1794,9 +2207,89 @@ mod tests {
         };
 
         let mut s = Stream::new(i.as_bytes());
-        //TODO: check for leftovers
         let res = admin_command(&mut s).unwrap();
         assert_eq!(expected, res);
+    }
+
+    #[test]
+    fn parses_use_database() {
+        let i = "use mysql;\n";
+        let mut s = Stream::new(i.as_bytes());
+
+        let res = use_database(&mut s).unwrap();
+        assert_eq!(res, Bytes::from("mysql"));
+        assert!(s.as_bytes().is_empty());
+    }
+
+    /// MySQL writes the name unquoted and as it is, so the name is everything up to the `;` that
+    /// ends the line.
+    #[test]
+    fn a_database_name_is_everything_up_to_the_semicolon() {
+        for (line, name) in [
+            ("use my-app;\n", "my-app"),
+            ("use shop.v2;\n", "shop.v2"),
+            ("use 2024_archive;\n", "2024_archive"),
+            ("USE mysql;\n", "mysql"),
+            ("use a;b;\n", "a;b"),
+            ("use `my-app`;\n", "my-app"),
+            ("use `we``ird`;\n", "we`ird"),
+            ("use mysql;\r\n", "mysql"),
+        ] {
+            let got = use_database(&mut Stream::new(line.as_bytes()))
+                .unwrap_or_else(|e| panic!("{line}: {e:?}"));
+            assert_eq!(got, Bytes::from(name), "{line}");
+        }
+
+        for bad in ["use ;\n", "use mysql\n", "SET timestamp=1;\n"] {
+            let mut s = Stream::new(bad.as_bytes());
+            assert_eq!(opt(use_database).parse_next(&mut s).unwrap(), None, "{bad}");
+            assert_eq!(s.as_bytes(), bad.as_bytes(), "a refusal consumes nothing");
+        }
+    }
+
+    #[test]
+    fn parses_start_timestamp() {
+        let l = "SET timestamp=1517798807;\n";
+        let mut s = Stream::new(l.as_bytes());
+        let res = start_timestamp_command(&mut s).unwrap();
+
+        assert_eq!(
+            res,
+            SetLine {
+                timestamp: 1517798807,
+                last_insert_id: None,
+                insert_id: None
+            }
+        );
+        assert!(s.as_bytes().is_empty());
+    }
+
+    /// MySQL writes `last_insert_id=` and `insert_id=` in front of `timestamp=` on the same line.
+    #[test]
+    fn a_set_line_carries_the_insert_ids() {
+        let l = "SET last_insert_id=5,insert_id=6,timestamp=1517798807;\n";
+        assert_eq!(
+            start_timestamp_command(&mut Stream::new(l.as_bytes())).unwrap(),
+            SetLine {
+                timestamp: 1517798807,
+                last_insert_id: Some(5),
+                insert_id: Some(6)
+            }
+        );
+
+        for bad in [
+            "SET timestamp=4294967296;\n",
+            "SET timestamp=99999999999999999999999;\n",
+            "SET insert_id=6;\n",
+            "SET names=1,timestamp=2;\n",
+            "SET timestamp=1,timestamp=2;\n",
+            "SET NAMES utf8;\n",
+        ] {
+            assert!(
+                refused(start_timestamp_command(&mut Stream::new(bad.as_bytes()))),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
@@ -1864,17 +2357,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_start_timestamp() {
-        let l = "SET timestamp=1517798807;";
-        let mut s = Stream::new(l.as_bytes());
-        let res = start_timestamp_command(&mut s).unwrap();
-
-        let expected = (Stream::new("".as_bytes()), 1517798807);
-
-        assert_eq!((s, res), expected);
-    }
-
-    #[test]
     fn parses_masked_selects() {
         let sql0 = "SELECT a, b, 123, 'abcd', myfunc(b) \
            FROM table_1 \
@@ -1899,7 +2381,7 @@ mod tests {
            WHERE a > b AND b < 100 \
            ORDER BY a DESC, b;";
 
-        let mut s = Stream::new(sql.as_bytes());
+        let mut s = complete(sql);
         let res = sql_lines(&mut s).unwrap();
 
         assert_eq!(res, sql);
@@ -1909,7 +2391,7 @@ mod tests {
     fn parses_setter_sql() {
         let sql = "/*!40101 SET NAMES utf8 */;\n";
 
-        let mut s = Stream::new(sql.as_bytes());
+        let mut s = complete(sql);
         let res = sql_lines(&mut s).unwrap();
 
         assert_eq!(res, sql.trim());
@@ -1937,10 +2419,11 @@ AS film_info
 FROM sakila.actor a;
 ";
 
-        let mut s = Stream::new(sql.as_bytes());
+        let mut s = complete(sql);
         let res = sql_lines(&mut s).unwrap();
 
-        assert_eq!((s, res), (Stream::new("\n".as_bytes()), sql.trim().into()));
+        assert_eq!(res, sql.trim());
+        assert_eq!(s.as_bytes(), b"\n");
     }
 
     #[test]
@@ -1965,7 +2448,7 @@ AS film_info
 FROM sakila.actor a;
 "#;
 
-        let mut s = Stream::new(sql.as_bytes());
+        let mut s = complete(sql);
         let res = sql_lines(&mut s).unwrap();
 
         assert_eq!(res, sql.trim());
@@ -1982,16 +2465,59 @@ Time                 Id Command    Argument\n";
         let res = log_header(&mut s).unwrap();
 
         assert_eq!(
-            (s, res),
-            (
-                Stream::new("".as_bytes()),
-                HeaderLines {
-                    version: Bytes::from("5.7.20-log (MySQL Community Server (GPL))."),
-                    tcp_port: Some(12345),
-                    socket: Some(Bytes::from("/tmp/12345/mysql_sandbox12345.sock")),
-                }
-            )
+            res,
+            HeaderLines {
+                version: Bytes::from("5.7.20-log (MySQL Community Server (GPL))."),
+                tcp_port: Some(12345),
+                socket: Some(Bytes::from("/tmp/12345/mysql_sandbox12345.sock")),
+                named_pipe: None,
+            }
         );
+        assert!(s.as_bytes().is_empty());
+    }
+
+    /// A server on Windows names a pipe where a unix server names its socket.
+    #[test]
+    fn parses_a_windows_header() {
+        let h = "C:\\Program Files\\MySQL\\MySQL Server 8.0\\bin\\mysqld.exe, Version: 8.0.36 (MySQL Community Server - GPL). started with:\r
+TCP Port: 3306, Named Pipe: MySQL\r
+Time                 Id Command    Argument\r\n";
+
+        let res = log_header(&mut Stream::new(h.as_bytes())).unwrap();
+
+        assert_eq!(
+            res,
+            HeaderLines {
+                version: Bytes::from("8.0.36 (MySQL Community Server - GPL)."),
+                tcp_port: Some(3306),
+                socket: None,
+                named_pipe: Some(Bytes::from("MySQL")),
+            }
+        );
+    }
+
+    /// Text that is not a header is refused on its own first line. The header grammar reads one
+    /// line at a time, so a `started with:` further down cannot pull it across the file.
+    #[test]
+    fn a_header_is_read_one_line_at_a_time() {
+        let not_a_header = "SELECT 1, Version: 2;
+# Time: 2018-02-05T02:46:43.015898Z
+x started with:
+Tcp port: 1  Unix socket: /tmp/s
+";
+        let mut s = Stream::new(not_a_header.as_bytes());
+        assert_eq!(opt(log_header).parse_next(&mut s).unwrap(), None);
+        assert_eq!(s.as_bytes(), not_a_header.as_bytes());
+
+        // And a partial first line waits for its line ending rather than deciding.
+        let mut s = Stream::new(&not_a_header.as_bytes()[..10]);
+        assert!(matches!(log_header(&mut s), Err(ErrMode::Incomplete(_))));
+
+        // A port past `usize` is a refusal, never a panic.
+        let h = "mysqld, Version: 5.7.20-log (x). started with:
+Tcp port: 99999999999999999999999  Unix socket: /tmp/s
+Time                 Id Command    Argument\n";
+        assert!(refused(log_header(&mut Stream::new(h.as_bytes()))));
     }
 }
 

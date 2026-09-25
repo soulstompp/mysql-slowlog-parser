@@ -71,8 +71,8 @@ impl Entry {
         self.session.ip_address_bytes()
     }
 
-    /// returns the thread id of the session which requested the command
-    pub fn thread_id(&self) -> u32 {
+    /// returns the thread id of the session which requested the command, where the log wrote one
+    pub fn thread_id(&self) -> Option<u32> {
         self.session.thread_id()
     }
 
@@ -92,12 +92,12 @@ impl Entry {
     }
 
     /// returns number of rows returned when query was executed
-    pub fn rows_sent(&self) -> u32 {
+    pub fn rows_sent(&self) -> u64 {
         self.stats.rows_sent()
     }
 
     /// returns how many rows were examined to execute the query
-    pub fn rows_examined(&self) -> u32 {
+    pub fn rows_examined(&self) -> u64 {
         self.stats.rows_examined()
     }
 }
@@ -502,16 +502,19 @@ impl Display for EntrySqlType {
 /// struct containing information about the connection where the query originated
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntrySession {
-    /// user name of the connected user who ran the query
+    /// the account MySQL matched for privileges, the name before the brackets; empty where the
+    /// server wrote none, as for a replication applier thread
     pub user_name: Bytes,
-    /// system user name of the connected user who ran the query
+    /// the name the client connected as, the name inside the brackets
     pub sys_user_name: Bytes,
     /// hostname of the connected user who ran the query
     pub host_name: Option<Bytes>,
-    /// ip address of the connected user who ran the query
+    /// ip address of the connected user who ran the query, IPv4 or IPv6 as the server wrote it
     pub ip_address: Option<Bytes>,
-    /// the thread id that the session was connected on
-    pub thread_id: u32,
+    /// the thread id that the session was connected on, the `# User@Host:` line's `Id:`; `None`
+    /// where the line has none, as MySQL 5.5 and MariaDB write it. MariaDB writes the id on a
+    /// `# Thread_id:` line instead, which is in [`EntryStats::extra`].
+    pub thread_id: Option<u32>,
 }
 
 impl From<SessionLine> for EntrySession {
@@ -571,8 +574,8 @@ impl EntrySession {
         self.ip_address.clone()
     }
 
-    /// returns the thread id of the session which requested the command
-    pub fn thread_id(&self) -> u32 {
+    /// returns the thread id of the session which requested the command, where the log wrote one
+    pub fn thread_id(&self) -> Option<u32> {
         self.thread_id
     }
 }
@@ -638,18 +641,27 @@ impl EntrySqlAttributes {
 /// `SET timestamp`)
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntryCall {
-    /// time recorded for the log entry
+    /// time recorded for the log entry; where the log omitted the entry's `# Time:` line, as
+    /// MySQL before 5.7 does for an entry in the same second as the one before, that entry's time
     pub log_time: DateTime,
     /// effective time of NOW() during the query run, in seconds since the Unix epoch
     pub set_timestamp: u32,
+    /// the value `LAST_INSERT_ID()` had for the statement, where the `SET` line carried
+    /// `last_insert_id=`: MySQL writes it where the statement read it
+    pub last_insert_id: Option<u64>,
+    /// the first auto-increment value the statement generated, where the `SET` line carried
+    /// `insert_id=`
+    pub insert_id: Option<u64>,
 }
 
 impl EntryCall {
-    /// create a new instance of EntryCall
+    /// create a new instance of EntryCall, with no `last_insert_id` or `insert_id`
     pub fn new(log_time: DateTime, set_timestamp: u32) -> Self {
         Self {
             log_time,
             set_timestamp,
+            last_insert_id: None,
+            insert_id: None,
         }
     }
 
@@ -662,19 +674,38 @@ impl EntryCall {
     pub fn set_timestamp(&self) -> u32 {
         self.set_timestamp
     }
+
+    /// returns the `last_insert_id=` the `SET` line carried, where it carried one
+    pub fn last_insert_id(&self) -> Option<u64> {
+        self.last_insert_id
+    }
+
+    /// returns the `insert_id=` the `SET` line carried, where it carried one
+    pub fn insert_id(&self) -> Option<u64> {
+        self.insert_id
+    }
 }
 
 /// struct with stats on how long a query took and number of rows examined
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, PartialEq, PartialOrd)]
 pub struct EntryStats {
     /// how long the query took, in seconds
     pub query_time: f64,
     /// how long the query waited to acquire locks, in seconds
     pub lock_time: f64,
     /// how many rows were returned to the client
-    pub rows_sent: u32,
+    pub rows_sent: u64,
     /// how many rows were scanned to find result
-    pub rows_examined: u32,
+    pub rows_examined: u64,
+    /// Every further `Name: value` field of the entry's comment lines, in the order written, names
+    /// and values as the server spelled them and unparsed.
+    ///
+    /// MySQL 8.0 appends them to the `# Query_time:` line under `log_slow_extra=ON`: `Thread_id`,
+    /// `Errno`, `Killed`, `Bytes_received`, `Bytes_sent`, the `Read_*`, `Sort_*` and
+    /// `Created_tmp_*` counters, and `Start` and `End` as ISO 8601 times. MariaDB and Percona
+    /// Server write whole lines of them around it: `Thread_id`, `Schema`, `QC_hit`,
+    /// `Rows_affected`, `Bytes_sent` and more. Empty where the server wrote none.
+    pub extra: Vec<(Bytes, Bytes)>,
 }
 
 impl EntryStats {
@@ -689,13 +720,27 @@ impl EntryStats {
     }
 
     /// returns number of rows returned when query was executed
-    pub fn rows_sent(&self) -> u32 {
+    pub fn rows_sent(&self) -> u64 {
         self.rows_sent
     }
 
     /// returns how many rows were examined to execute the query
-    pub fn rows_examined(&self) -> u32 {
+    pub fn rows_examined(&self) -> u64 {
         self.rows_examined
+    }
+
+    /// returns every further `Name: value` field of the entry's comment lines, in the order
+    /// written
+    pub fn extra(&self) -> &[(Bytes, Bytes)] {
+        &self.extra
+    }
+
+    /// returns the value of the first further field named `name`, as written
+    pub fn extra_value(&self, name: &str) -> Option<&Bytes> {
+        self.extra
+            .iter()
+            .find(|(n, _)| n.as_ref() == name.as_bytes())
+            .map(|(_, v)| v)
     }
 }
 
@@ -706,6 +751,7 @@ impl From<StatsLine> for EntryStats {
             lock_time: line.lock_time,
             rows_sent: line.rows_sent,
             rows_examined: line.rows_examined,
+            extra: line.extra,
         }
     }
 }
