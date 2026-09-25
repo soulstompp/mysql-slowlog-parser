@@ -714,6 +714,7 @@ pub struct LiteralColumn {
 /// honours no mode, so this arm records the default reading. A slow log does not carry the mode,
 /// so nothing here can decide it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum LiteralKind {
     /// a numeric literal
     Number,

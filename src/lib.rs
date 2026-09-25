@@ -77,6 +77,7 @@ pub use types::{
 /// Only a statement the grammar parses is masked. A refused statement is carried as the log's
 /// own bytes, values included, and so is an administrator command.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub enum EntryMasking {
     /// Every recorded literal is rendered as a `?` placeholder, so two calls of one query that
     /// differ only in their values render to the same text. A bit literal (`b'1'`) is not

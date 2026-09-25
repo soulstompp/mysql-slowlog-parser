@@ -49,6 +49,7 @@ use winnow_datetime::DateTime;
 ///
 /// The decoder builds an entry only once every field is set, so it never returns this.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum EntryError {
     /// a field is missing from the entry
     #[error("entry field is missing: {0}")]
@@ -60,6 +61,7 @@ pub enum EntryError {
 
 /// Errors for problems when reading frames from the source
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum CodecError {
     /// An error from the reader, or bytes left unparsed at end of input, which
     /// [`Decoder::decode_eof`] reports as an `io::Error` of kind `Other`.

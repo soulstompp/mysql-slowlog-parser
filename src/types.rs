@@ -294,6 +294,7 @@ impl EntrySqlStatementObject {
 /// * InvalidStatement: statement text the SQL parser could not read
 #[derive(Clone, Debug, PartialEq)]
 #[allow(clippy::large_enum_variant)] // the large variant is the common one
+#[non_exhaustive]
 pub enum EntryStatement {
     /// An `# administrator command:` line: a protocol command such as `Quit`, `Ping` or
     /// `Init DB` rather than SQL.
@@ -348,6 +349,7 @@ impl EntryStatement {
 /// NOTE: this is a MySQL specific sub-set of the entries in `sqlparser::ast::Statement`. This is
 /// a simpler enum to match against and displays as the start of the SQL command.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
 pub enum EntrySqlType {
     /// SELECT
     Query,

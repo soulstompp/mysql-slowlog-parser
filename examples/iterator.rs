@@ -20,6 +20,7 @@ async fn main() {
                 EntryStatement::SqlStatement(s) => s.sql_type().to_string(),
                 EntryStatement::AdminCommand(_) => "administrator command".to_string(),
                 EntryStatement::InvalidStatement(_) => "refused by the grammar".to_string(),
+                _ => "other".to_string(),
             };
             *acc.entry(kind).or_insert(0) += 1;
 

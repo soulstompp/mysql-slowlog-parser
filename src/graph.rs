@@ -62,6 +62,7 @@ use std::ops::ControlFlow;
 /// writes to and the tables it reads from into one collection with nothing separating them, so a
 /// reader summing over "the tables this statement touched" sums a write and a read together.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
 pub enum RelationRole {
     /// the first relation of a `FROM` clause
     From,
@@ -128,6 +129,7 @@ pub enum RelationRole {
 /// under [`ScopeKind::Statement`] was visited. `objects()` spells the two the same, so a sum over
 /// tables weighted by query time can be drawn entirely from statements that never touched them.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
 pub enum ScopeKind {
     /// the statement's own top level
     Statement,
@@ -145,6 +147,7 @@ pub enum ScopeKind {
 
 /// How two relation occurrences were put together.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
 pub enum JoinOp {
     /// `JOIN` / `INNER JOIN`
     Inner,
@@ -183,6 +186,7 @@ pub enum JoinOp {
 
 /// What the join said about how to match rows.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
 pub enum ConstraintKind {
     /// `ON <predicate>`
     On,
@@ -198,6 +202,7 @@ pub enum ConstraintKind {
 ///
 /// On an outer join `ON p` and `WHERE p` are different queries, so this is not decoration.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
 pub enum Clause {
     /// A join's `ON`.
     On,
@@ -213,6 +218,7 @@ pub enum Clause {
 
 /// A boolean connective, as a step on the path from a scope's root to one comparison.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
 pub enum Connective {
     /// `AND`
     And,
@@ -238,6 +244,7 @@ pub struct PathStep {
 /// The subquery arms are the shape MySQL plans differently: `IN (SELECT …)` admits semi-join and
 /// materialisation, `EXISTS` is a correlated probe, and a scalar subquery is evaluated once.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
 pub enum PredicateOp {
     /// `=`
     Eq,
@@ -299,6 +306,7 @@ pub enum PredicateOp {
 /// `Subquery` is what makes the walk recursive: a subselect is an operand of a split rather than a
 /// scope that merely exists, so [`Predicate::rhs_scope`] leads to its own predicates.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
 pub enum RhsKind {
     /// Another column, which is what makes a split a relationship.
     Column,
@@ -368,6 +376,7 @@ pub struct Predicate {
 /// `UNION` deduplicates and `UNION ALL` does not, which is a sort or a temporary table. `INTERSECT`
 /// and `EXCEPT` are MySQL 8.0.31 and later, so a log from an older server cannot contain one.
 #[derive(Copy, Clone, Debug, Default, Eq, Hash, PartialEq)]
+#[non_exhaustive]
 pub enum SetOperator {
     /// `UNION`, which deduplicates.
     Union,
@@ -390,6 +399,7 @@ pub enum SetOperator {
 
 /// The directions an `ORDER BY` wrote, which decide whether an index can be walked to satisfy it.
 #[derive(Copy, Clone, Debug, Default, Eq, Hash, PartialEq)]
+#[non_exhaustive]
 pub enum SortDirections {
     /// Every term ascending, written or defaulted.
     Asc,
@@ -407,6 +417,7 @@ pub enum SortDirections {
 /// A scope with `None` here is an ordinary read, whose isolation from a concurrent write is
 /// decided by the transaction isolation level. The other two are taken whatever that level is.
 #[derive(Copy, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
 pub enum LockStrength {
     /// no locking clause
     #[default]
@@ -425,6 +436,7 @@ pub enum LockStrength {
 /// `Wait` is the default and is what `Lock_time` measures. Under the other two a statement
 /// reports no lock wait by construction, so a zero there is not evidence of no contention.
 #[derive(Copy, Clone, Debug, Default, Eq, Hash, PartialEq)]
+#[non_exhaustive]
 pub enum LockWait {
     /// block until the lock is available, or until `innodb_lock_wait_timeout`
     #[default]
@@ -441,6 +453,7 @@ pub enum LockWait {
 /// also makes a table scan maximally expensive, and `IGNORE` removes the named indexes from
 /// consideration.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
 pub enum IndexHintKind {
     /// `USE INDEX (…)`
     Use,
@@ -455,6 +468,7 @@ pub enum IndexHintKind {
 /// `Any` is a hint written without a `FOR` clause, which MySQL applies to every part. It is a
 /// written absence and not a blank: the author wrote a hint and named no scope for it.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
 pub enum IndexHintScope {
     /// no `FOR` clause
     Any,
