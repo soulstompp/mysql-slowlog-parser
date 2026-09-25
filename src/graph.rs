@@ -26,10 +26,10 @@
 //! ## What the walk refuses, and what it declines to interpret
 //!
 //! Text `sqlparser` builds and MySQL cannot write is not filed as though the server ran it: the
-//! landing arms [`JoinOp::NotMySql`], [`PredicateOp::NotMySql`], [`SetOperator::NotMySql`],
-//! [`LockStrength::NotMySql`] and [`Stages::not_mysql`] say that the grammar accepted something
-//! this server has no syntax for. A claim about MySQL's behaviour holds inside a server
-//! version, and these arms are where the two regimes are kept apart.
+//! landing arms [`JoinOp::NotMySql`], [`PredicateOp::NotMySql`], [`SetOperator::NotMySql`] and
+//! [`Stages::not_mysql`] say that the grammar accepted something this server has no syntax for.
+//! A claim about MySQL's behaviour holds inside a server version, and these arms are where the two
+//! regimes are kept apart.
 //!
 //! Some constructs are read and deliberately not decomposed. An optimizer hint is carried as the
 //! author's own bytes, because `sqlparser` hands the whole comment body over unstructured and
@@ -537,10 +537,12 @@ vocabulary!(SortDirections {
     NotApplicable => "not_applicable",
 });
 
-/// The row lock a scope's `FOR UPDATE` / `FOR SHARE` clause asks for.
+/// The row lock a `FOR UPDATE` / `FOR SHARE` clause asks for.
 ///
-/// A scope with `None` here is an ordinary read, whose isolation from a concurrent write is
-/// decided by the transaction isolation level. The other two are taken whatever that level is.
+/// `None` is an ordinary read, whose isolation from a concurrent write is decided by the
+/// transaction isolation level. The other two are taken whatever that level is.
+///
+/// Ordered by strength, so the stronger of two claims on one relation is the greater.
 #[derive(Copy, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
 pub enum LockStrength {
@@ -551,15 +553,11 @@ pub enum LockStrength {
     Shared,
     /// `FOR UPDATE`: readers of the same rows under a locking read excluded, and writers
     Exclusive,
-    /// A locking clause MySQL has no syntax for — `FOR UPDATE OF t`, which names the table to
-    /// lock. A diagnostic and not data.
-    NotMySql,
 }
 
 vocabulary!(LockStrength {
     Exclusive => "exclusive",
     None => "none",
-    NotMySql => "not_mysql",
     Shared => "shared",
 });
 
@@ -707,25 +705,25 @@ pub struct Scope {
     /// `Query_time` for the whole pipeline and nothing per stage, so no per-stage cost is
     /// available here at any setting.
     pub stages: Stages,
-    /// The row lock this scope's own `FOR UPDATE` / `FOR SHARE` asks for.
+    /// The strongest row lock this scope's own `FOR UPDATE` / `FOR SHARE` clauses ask for.
     ///
     /// Per scope, because MySQL locks the tables of the block the clause is written in: a
-    /// subquery under a locking outer select is not itself locked unless it says so.
+    /// subquery under a locking outer select is not itself locked unless it says so. Which of the
+    /// scope's relations a clause locks is on the occurrence, [`RelationOccurrence::locking`],
+    /// because `FOR UPDATE OF t` restricts it to the relations it names.
     pub locking: LockStrength,
     /// What this scope does when the rows it wants are already locked. `Wait` where
-    /// [`Self::locking`] is [`LockStrength::None`], since nothing is being waited for.
+    /// [`Self::locking`] is [`LockStrength::None`], since nothing is being waited for. With
+    /// several clauses, the last one that does not wait.
     pub lock_wait: LockWait,
 }
 
 /// The lock a `FOR UPDATE` / `FOR SHARE` clause asks for, and what it does when it cannot have
 /// it.
 fn locking_of(lock: &LockClause) -> (LockStrength, LockWait) {
-    let strength = match (&lock.of, &lock.lock_type) {
-        // `FOR UPDATE OF t` names the table to lock. MySQL has no such clause, so a tree
-        // carrying one is not a tree this server could have run.
-        (Some(_), _) => LockStrength::NotMySql,
-        (None, LockType::Share) => LockStrength::Shared,
-        (None, LockType::Update) => LockStrength::Exclusive,
+    let strength = match lock.lock_type {
+        LockType::Share => LockStrength::Shared,
+        LockType::Update => LockStrength::Exclusive,
     };
     let wait = match lock.nonblock {
         None => LockWait::Wait,
@@ -876,6 +874,18 @@ pub struct RelationOccurrence {
     /// caller asking which physical tables a statement touched skips an occurrence that
     /// resolves, and one asking what the statement wrote carries the role over to the referent.
     pub resolves_to_occ: Option<u32>,
+    /// The row lock its scope's `FOR UPDATE` / `FOR SHARE` clauses take on this relation's rows.
+    ///
+    /// A clause with no `OF` locks every relation its scope reads, [`RelationRole::From`] and
+    /// [`RelationRole::Join`]; `FOR UPDATE OF t` locks only the relation it names, by its
+    /// identity. So in `SELECT … FROM a JOIN b … FOR UPDATE OF a` the row of `b` is a snapshot
+    /// read, and `FOR SHARE OF a FOR UPDATE OF b` locks the two differently. MySQL's list form
+    /// `OF a, b` is refused by this grammar, which reads one name per clause, and reaches a caller
+    /// as an invalid statement.
+    pub locking: LockStrength,
+    /// What the clause that locks this relation does when the rows are already locked. `Wait`
+    /// where [`Self::locking`] is [`LockStrength::None`].
+    pub lock_wait: LockWait,
 }
 
 impl RelationOccurrence {
@@ -1088,6 +1098,9 @@ struct Builder {
     /// Which scope each subquery expression opened, keyed on its address — see
     /// [`Builder::note_subquery_scope`].
     subquery_scopes: std::collections::BTreeMap<usize, u32>,
+    /// The non-recursive CTEs whose own definitions are being walked, which a name inside them
+    /// does not resolve to.
+    defining: Vec<u32>,
 }
 
 impl Builder {
@@ -1148,8 +1161,38 @@ impl Builder {
             // list is written before the `FROM` it refers to, so nothing to resolve against
             // exists yet at this point.
             resolves_to_occ: None,
+            // Set once the scope's query has been walked, by `lock_occurrences`.
+            locking: LockStrength::None,
+            lock_wait: LockWait::Wait,
         });
         occ
+    }
+
+    /// Applies one locking clause to the relations of its scope: every relation the scope reads,
+    /// or the one its `OF` names. The stronger clause holds where two reach one relation.
+    fn lock_occurrences(
+        &mut self,
+        scope: u32,
+        of: Option<&ObjectName>,
+        strength: LockStrength,
+        wait: LockWait,
+    ) {
+        let named = of.map(|n| {
+            let (schema, name) = split_name(n);
+            name.and_then(|name| self.find_in_scope(&Qualifier { schema, name }, scope))
+        });
+        for o in self.graph.occurrences.iter_mut() {
+            let locked = match named {
+                Some(target) => target == Some(o.occ),
+                None => {
+                    o.scope == scope && matches!(o.role, RelationRole::From | RelationRole::Join)
+                }
+            };
+            if locked && strength > o.locking {
+                o.locking = strength;
+                o.lock_wait = wait;
+            }
+        }
     }
 
     /// Resolves a target list against the relations the statement already introduced, because a
@@ -1185,6 +1228,10 @@ impl Builder {
         }
     }
 
+    /// The CTE a name resolves to from `scope`, innermost first.
+    ///
+    /// Only CTEs already built are candidates, which is MySQL's own rule: a CTE may refer to the
+    /// ones defined before it in the same `WITH` and not to those defined after.
     fn cte_in_scope(&self, scope: u32, name: &Bytes) -> Option<u32> {
         let mut at = Some(scope);
         while let Some(id) = at {
@@ -1195,6 +1242,7 @@ impl Builder {
                 c.kind == ScopeKind::Cte
                     && c.parent == Some(id)
                     && c.name.as_ref().is_some_and(|n| n == name)
+                    && !self.defining.contains(&c.id)
             }) {
                 return Some(found.id);
             }
@@ -1460,9 +1508,11 @@ impl Builder {
             }
             Statement::CreateTable(ct) => {
                 self.push_occurrence(scope, Some(&ct.name), None, RelationRole::CreateTarget);
+                // `CREATE TABLE t AS SELECT …` reads every row its query selects, as
+                // `INSERT … SELECT` does, so the query is walked into the statement's own scope
+                // beside the target. A view body is named and never read; this one runs.
                 if let Some(q) = &ct.query {
-                    let body = self.push_scope(Some(scope), ScopeKind::ViewBody, None, false);
-                    self.walk_query(q, body);
+                    self.walk_query(q, scope);
                 }
             }
             // An `ALTER` and a `DROP` name a relation that already exists and take
@@ -1616,7 +1666,16 @@ impl Builder {
                 // relation ends up filed as one by `objects()`.
                 let name = Some(ident_bytes(&alias.name));
                 let cte = self.push_scope(Some(scope), ScopeKind::Cte, name, with.recursive);
+                // Only `WITH RECURSIVE` puts a CTE in scope inside its own definition. Without it
+                // `WITH t AS (SELECT … FROM t)` reads whatever `t` named outside: the base table,
+                // or an enclosing CTE of that name.
+                if !with.recursive {
+                    self.defining.push(cte);
+                }
                 self.walk_query(query, cte);
+                if !with.recursive {
+                    self.defining.pop();
+                }
             }
         }
         // `ORDER BY` and `LIMIT` hang off the `Query` and not off the `Select`, so they are read
@@ -1651,6 +1710,11 @@ impl Builder {
             }
         }
         self.walk_set_expr(&query.body, scope);
+        // After the body, whose relations are the ones a clause locks.
+        for lock in &query.locks {
+            let (strength, wait) = locking_of(lock);
+            self.lock_occurrences(scope, lock.of.as_ref(), strength, wait);
+        }
         // `ORDER BY (SELECT …)` sorts on a relation no `FROM` names. Walked after the body so
         // the scope is the one the body established.
         self.walk_expr(&query.order_by, scope);
@@ -3110,18 +3174,11 @@ mod tests {
 
     /// A construct this grammar accepts and MySQL cannot write lands in a diagnostic arm.
     ///
-    /// `FOR UPDATE OF t` names the table to lock and MySQL has no such clause; `NULLS FIRST` is
-    /// not MySQL either, which sorts NULLs first ascending and last descending with no way to say
-    /// otherwise. Both are trees the server could not have run, so the artifact says so rather
-    /// than filing them as ordinary.
+    /// `NULLS FIRST` is not MySQL, which sorts NULLs first ascending and last descending with no
+    /// way to say otherwise. It is a tree the server could not have run, so the artifact says so
+    /// rather than filing it as ordinary.
     #[test]
     fn a_clause_mysql_cannot_write_is_marked_and_not_filed_as_ordinary() {
-        let g = graph("SELECT id FROM t FOR UPDATE");
-        assert_eq!(g.scopes[0].locking, LockStrength::Exclusive);
-
-        let g = graph("SELECT id FROM t FOR UPDATE OF t");
-        assert_eq!(g.scopes[0].locking, LockStrength::NotMySql);
-
         assert!(!st("SELECT id FROM t ORDER BY a DESC").not_mysql);
         assert!(st("SELECT id FROM t ORDER BY a ASC NULLS FIRST").not_mysql);
         assert!(st("SELECT id FROM t ORDER BY a NULLS LAST").not_mysql);
@@ -4875,6 +4932,154 @@ mod tests {
                 .any(|e| e.crosses_scope && (e.lhs, e.rhs) == (2, 0)),
             "{:?}",
             g.edges
+        );
+    }
+
+    /// `CREATE TABLE … AS SELECT` READS WHAT IT SELECTS. It is `INSERT … SELECT` into a table
+    /// that did not exist, so its relations are read in the statement's own scope — not named in a
+    /// body that ran once and read nothing, which is what a view is.
+    #[test]
+    fn a_create_table_as_select_reads_its_source() {
+        let g = graph("CREATE TABLE t2 AS SELECT a.id FROM t1 a JOIN t3 ON a.id = t3.id");
+        assert!(g.scopes.iter().all(|s| s.kind != ScopeKind::ViewBody));
+        let roles: Vec<(String, RelationRole)> = ids(&g)
+            .into_iter()
+            .zip(g.occurrences.iter().map(|o| o.role))
+            .collect();
+        assert_eq!(
+            roles,
+            vec![
+                ("t2".into(), RelationRole::CreateTarget),
+                ("a".into(), RelationRole::From),
+                ("t3".into(), RelationRole::Join),
+            ]
+        );
+        assert!(g.occurrences.iter().all(|o| !g.in_view_body(o.occ)));
+        assert!(g.occurrences.iter().all(|o| o.scope == 0));
+        assert_eq!(g.edges.len(), 1);
+    }
+
+    /// A NON-RECURSIVE CTE IS NOT IN SCOPE INSIDE ITS OWN DEFINITION, and a CTE sees only the
+    /// ones defined before it.
+    ///
+    /// `WITH orders AS (SELECT * FROM orders …)` reads the base table `orders`; resolved to the
+    /// CTE, the only physical relation the statement touches would be filed as a reference to
+    /// itself.
+    #[test]
+    fn a_cte_does_not_see_itself_unless_it_is_recursive() {
+        let cte_of = |g: &StatementGraph| -> Vec<Option<u32>> {
+            g.occurrences.iter().map(|o| o.resolves_to_cte).collect()
+        };
+
+        let g = graph("WITH orders AS (SELECT * FROM orders WHERE total > 5) SELECT * FROM orders");
+        assert_eq!(g.occurrences[0].scope, 1, "the definition's own orders");
+        assert_eq!(cte_of(&g), vec![None, Some(1)]);
+
+        // Inside its own definition the name reads whatever it named outside, here an enclosing
+        // CTE of the same name.
+        let g = graph(
+            "WITH orders AS (SELECT 1 AS id) \
+             SELECT * FROM (WITH orders AS (SELECT * FROM orders) SELECT * FROM orders) d",
+        );
+        let outer = g
+            .scopes
+            .iter()
+            .find(|s| s.kind == ScopeKind::Cte && s.parent == Some(0))
+            .unwrap()
+            .id;
+        let inner = g
+            .scopes
+            .iter()
+            .find(|s| s.kind == ScopeKind::Cte && s.id != outer)
+            .unwrap()
+            .id;
+        let resolved: Vec<Option<u32>> = g
+            .occurrences
+            .iter()
+            .filter(|o| o.object_name.as_deref() == Some(b"orders".as_ref()))
+            .map(|o| o.resolves_to_cte)
+            .collect();
+        assert_eq!(resolved, vec![Some(outer), Some(inner)]);
+
+        // `WITH RECURSIVE` is the one form that sees itself.
+        let g = graph(
+            "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 5) \
+             SELECT * FROM r",
+        );
+        assert_eq!(cte_of(&g), vec![Some(1), Some(1)]);
+
+        // A later CTE sees an earlier one, and not the reverse.
+        let g = graph("WITH a AS (SELECT * FROM b), b AS (SELECT * FROM a) SELECT * FROM b");
+        let got: Vec<(String, Option<u32>)> = ids(&g).into_iter().zip(cte_of(&g)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("b".into(), None),
+                ("a".into(), Some(1)),
+                ("b".into(), Some(2))
+            ]
+        );
+    }
+
+    /// `FOR UPDATE OF t` IS MYSQL 8.0, and it locks the relations it names and no others.
+    ///
+    /// A relation the clause leaves out is a snapshot read, so a reader treating the whole scope
+    /// as locked would pair it with every writer, and one treating the clause as foreign would
+    /// pair it with none.
+    #[test]
+    fn a_locking_clause_locks_the_relations_it_names() {
+        let locks = |sql: &str| -> Vec<(String, LockStrength, LockWait)> {
+            let g = graph(sql);
+            ids(&g)
+                .into_iter()
+                .zip(g.occurrences.iter().map(|o| (o.locking, o.lock_wait)))
+                .map(|(i, (s, w))| (i, s, w))
+                .collect()
+        };
+        use LockStrength::*;
+        use LockWait::*;
+        assert_eq!(
+            locks("SELECT * FROM t1 JOIN t2 ON t1.id = t2.id FOR UPDATE"),
+            vec![
+                ("t1".into(), Exclusive, Wait),
+                ("t2".into(), Exclusive, Wait)
+            ]
+        );
+        assert_eq!(
+            locks("SELECT * FROM t1 a JOIN t2 ON a.id = t2.id FOR UPDATE OF a"),
+            vec![("a".into(), Exclusive, Wait), ("t2".into(), None, Wait)]
+        );
+        assert_eq!(
+            locks("SELECT * FROM t1, t2 FOR SHARE OF t1 FOR UPDATE OF t2 NOWAIT"),
+            vec![
+                ("t1".into(), Shared, Wait),
+                ("t2".into(), Exclusive, NoWait)
+            ]
+        );
+        let g = graph("SELECT * FROM t1, t2 FOR SHARE OF t1 FOR UPDATE OF t2 NOWAIT");
+        assert_eq!(
+            (g.scopes[0].locking, g.scopes[0].lock_wait),
+            (Exclusive, NoWait)
+        );
+
+        // The clause locks what the query reads, and not the table an `INSERT … SELECT` writes;
+        // nor a subquery's relations, which are another block.
+        assert_eq!(
+            locks("INSERT INTO t SELECT * FROM u FOR UPDATE"),
+            vec![("t".into(), None, Wait), ("u".into(), Exclusive, Wait)]
+        );
+        assert_eq!(
+            locks("SELECT * FROM t WHERE id IN (SELECT id FROM u) FOR UPDATE"),
+            vec![("t".into(), Exclusive, Wait), ("u".into(), None, Wait)]
+        );
+
+        // MySQL's list form is the grammar's refusal and not the server's.
+        assert!(
+            Parser::parse_sql(
+                &MySqlDialect {},
+                "SELECT * FROM t1, t2 FOR UPDATE OF t1, t2"
+            )
+            .is_err()
         );
     }
 }
