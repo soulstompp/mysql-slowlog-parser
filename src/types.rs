@@ -643,7 +643,7 @@ pub struct EntrySqlAttributes {
     /// Three different things, and [`Self::statement`]'s arm is what says which.
     pub sql: Bytes,
     /// The author's own bytes, exactly as the log carried them, `;` included. A leading `--`
-    /// comment is not among them; it is read for key/value pairs instead.
+    /// comment that reads as key/value pairs is not among them; it is read into the context.
     ///
     /// `None` only for an administrator command, where a different parser consumed the line and
     /// its framing -- and there `sql` is already the log's own bytes, so nothing is lost.

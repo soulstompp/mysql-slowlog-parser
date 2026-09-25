@@ -117,19 +117,21 @@ pub use types::{
     EntrySqlType, EntryStatement, EntryStats,
 };
 
-/// How a parsed statement's values are rendered in [`EntrySqlAttributes::sql()`].
+/// How a statement's values are rendered in [`EntrySqlAttributes::sql()`].
 ///
 /// Masking changes the rendering and nothing else: [`EntrySqlAttributes::sql_raw`] and
 /// [`EntrySqlAttributes::literals`] hold what the author wrote under either setting.
 ///
-/// Only a statement the grammar parses is masked. A refused statement is carried as the log's
-/// own bytes, values included, and so is an administrator command.
+/// A parsed statement is masked in its tree. A statement the grammar refuses is masked token by
+/// token over the author's text, every other byte kept, so a type length such as `CHAR(60)` is
+/// masked too. An administrator command carries no values and is rendered as written.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub enum EntryMasking {
-    /// Every recorded literal is rendered as a `?` placeholder, so two calls of one query that
-    /// differ only in their values render to the same text. A bit literal (`b'1'`) is not
-    /// recorded and is not masked.
+    /// Every literal is rendered as a `?` placeholder, so two calls of one query that differ only
+    /// in their values render to the same text. A negative number is one literal. A value inside
+    /// an optimizer hint (`/*+ ... */`) of a parsed statement is not masked, because the grammar
+    /// hands the hint over as text.
     PlaceHolder,
     /// Literals are rendered as written.
     #[default]
