@@ -1144,6 +1144,8 @@ struct Builder {
     /// The non-recursive CTEs whose own definitions are being walked, which a name inside them
     /// does not resolve to.
     defining: Vec<u32>,
+    /// The relations each parenthesised join groups, keyed on the relation that stands for it.
+    groups: std::collections::BTreeMap<u32, Vec<u32>>,
 }
 
 impl Builder {
@@ -1980,8 +1982,11 @@ impl Builder {
                         );
                     }
                 }
+                // A relation inside a parenthesised right side is already joined within it, so
+                // only a relation outside the group draws an edge to the one standing for it.
+                let inside = self.groups.get(&rhs).cloned().unwrap_or_else(|| vec![rhs]);
                 let mut drawn = false;
-                for lhs in named.into_iter().filter(|o| *o != rhs) {
+                for lhs in named.into_iter().filter(|o| !inside.contains(o)) {
                     self.push_edge(lhs, rhs, op, constraint);
                     drawn = true;
                 }
@@ -2058,7 +2063,7 @@ impl Builder {
             // `(a JOIN b ON …)` groups relations and is not one: it adds no node, its first
             // relation takes the role the group holds, and it stands for the group wherever the
             // enclosing join needs one relation — the right side a split names as its join, and
-            // the fallback end of an edge.
+            // the end of the edge the enclosing join draws.
             TableFactor::NestedJoin {
                 table_with_joins,
                 alias,
@@ -2067,9 +2072,16 @@ impl Builder {
                 if alias.is_some() {
                     self.graph.scopes[scope as usize].stages.not_mysql = true;
                 }
+                let first = self.graph.occurrences.len();
                 let group = std::slice::from_ref(table_with_joins.as_ref());
                 let ids = self.collect_from(group, scope, role);
                 self.join_edges(group, scope, &ids);
+                let members = self.graph.occurrences[first..]
+                    .iter()
+                    .filter(|o| o.scope == scope)
+                    .map(|o| o.occ)
+                    .collect();
+                self.groups.insert(ids[0][0], members);
                 ids[0][0]
             }
             TableFactor::Function {
@@ -4603,7 +4615,7 @@ mod tests {
             "SELECT * FROM a WHERE NOT (id IN (SELECT id FROM b))",
             "SELECT a.actor_id, GROUP_CONCAT(CONCAT(c.name, (SELECT t FROM f))) \
              FROM actor a JOIN category c ON a.id = c.id",
-            // The positions and forms a list of named `Expr` arms missed.
+            // Clauses beyond `WHERE`, and `Expr` forms a hand-listed descent does not reach.
             "SELECT * FROM a LEFT JOIN b ON b.id = (SELECT MAX(id) FROM c WHERE c.a_id = a.id)",
             "SELECT SUBSTRING((SELECT name FROM b LIMIT 1), 1, 2) FROM a",
             "SELECT CONVERT((SELECT name FROM b LIMIT 1), CHAR) FROM a",
@@ -4902,13 +4914,17 @@ mod tests {
             "SELECT * FROM (a JOIN b ON a.id = b.id) JOIN c ON c.id = a.id",
             "SELECT * FROM a JOIN (b JOIN c ON b.id = c.id) ON a.id = b.id",
             "SELECT * FROM (a JOIN b ON a.id = b.id) LEFT JOIN c USING (id)",
+            // The outer `ON` names a relation deep inside the group, which is joined there
+            // already: one edge in from outside, and no second route to close a cycle.
+            "SELECT * FROM a JOIN (b JOIN (c JOIN d ON d.id = c.id) ON b.id = c.id) ON a.id = d.id",
         ] {
             let g = graph(sql);
-            assert_eq!(ids(&g), vec!["a", "b", "c"], "{sql}");
+            let n = g.occurrences.len();
+            assert_eq!(ids(&g), ["a", "b", "c", "d"][..n].to_vec(), "{sql}");
             let m = g.measures();
             assert_eq!(
                 (m.nodes, m.edges, m.components, m.cycle_space),
-                (3, 2, 1, 0),
+                (n, n - 1, 1, 0),
                 "{sql}: {:?}",
                 g.edges
             );
