@@ -21,7 +21,7 @@
 //! to, which MySQL does not write down.
 
 use crate::EntryMasking;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, Expr, ObjectName, SetExpr, Statement, Value, ValueWithSpan,
     VisitMut, VisitorMut,
@@ -35,13 +35,13 @@ use std::ops::ControlFlow;
 use std::ops::Not;
 use std::str;
 use std::str::FromStr;
-use winnow::ascii::{Caseless, alphanumeric1, digit1, float, multispace0, space0, space1};
+use winnow::ascii::{Caseless, digit1, float, space0, space1};
 use winnow::combinator::{alt, cut_err, eof, not, opt, peek, preceded, repeat, separated, trace};
-use winnow::error::{ContextError, ErrMode, InputError, Needed};
+use winnow::error::{ContextError, ErrMode, Needed};
 // Aliased: `sqlparser` exports a `ParserError` of its own and both are used in this file.
 use winnow::error::ParserError as WinnowError;
 use winnow::stream::{AsBytes, AsChar, StreamIsPartial};
-use winnow::token::{any, literal, rest, take, take_till, take_while};
+use winnow::token::{literal, rest, take, take_till, take_while};
 use winnow::{ModalResult, Parser, Partial, seq};
 use winnow_datetime::{Date, DateTime, Time};
 use winnow_iso8601::datetime::datetime;
@@ -447,8 +447,14 @@ pub fn entry_user(i: &mut Stream) -> ModalResult<SessionLine> {
 /// The key/value pairs parsed from the comment preceding a SQL statement.
 ///
 /// The comment is a `--` line immediately before the statement, as in
-/// `-- file: app.rb, line: 12`: a key is ASCII letters, digits and `_`, followed by `:` or `=`,
-/// and pairs are separated by `,` or `;`.
+/// `-- file: app.rb, line: 12`. Pairs are separated by `,` or `;`, and a pair is a key of ASCII
+/// letters, digits and `_`, then `:` or `=`, then the value, trimmed. A piece between separators
+/// that does not open with a key continues the value before it, so `-- caller: foo(a, b)` is one
+/// pair whose value is `foo(a, b)`.
+///
+/// A comment that does not read that way carries no context and stays part of the statement's
+/// text: one with no pair (`--`, `-- hello`), text before the first key (`-- TODO, a: 1`), an
+/// empty piece (`-- a: 1,`), or a key written twice.
 ///
 /// Whatever the comment said, under the names it used. Applications annotate with whatever keys
 /// they like, so a fixed set of fields would admit only those. Deciding that two logs' keys name
@@ -502,86 +508,92 @@ impl SqlStatementContext {
     }
 }
 
+/// Parses a `--` comment line into its key/value pairs, by the rule on [`SqlStatementContext`].
+///
+/// A comment that does not read as pairs is refused as a backtrack, having consumed the line;
+/// the caller rewinds, and the comment stays part of the statement.
 pub fn details_comment(i: &mut Stream) -> ModalResult<HashMap<Bytes, Bytes>> {
     trace("details_comment", move |input: &mut Stream<'_>| {
-        let mut name: Option<Bytes> = None;
+        let comment = preceded(literal("--"), line).parse_next(input)?;
 
-        let mut res: HashMap<Bytes, BytesMut> = HashMap::new();
+        match comment_pairs(comment) {
+            Some(pairs) => Ok(pairs),
+            None => refused(),
+        }
+    })
+    .parse_next(i)
+}
 
-        let _ = literal("--").parse_next(input)?;
+/// The pairs of a comment's text, by the rule on [`SqlStatementContext`].
+fn comment_pairs(comment: &[u8]) -> Option<HashMap<Bytes, Bytes>> {
+    let mut pairs: Vec<(&[u8], Vec<u8>)> = Vec::new();
+    let mut rest = comment;
+    let mut separator = None;
 
-        loop {
-            if name.is_none()
-                && let Ok(n) = details_tag(input)
-            {
-                name.replace(n.clone());
-                if res.insert(n, BytesMut::new()).is_some() {
-                    // A key written twice is refused rather than overwritten.
-                    return Err(ErrMode::Cut(ContextError::new()));
+    loop {
+        let end = rest.iter().position(|&b| b == b',' || b == b';');
+        let piece = &rest[..end.unwrap_or(rest.len())];
+
+        if piece.trim_ascii().is_empty() {
+            return None;
+        }
+
+        match comment_key(piece) {
+            Some((key, value)) => {
+                if pairs.iter().any(|(k, _)| *k == key) {
+                    return None;
                 }
+                pairs.push((key, value.to_vec()));
             }
-
-            if let Ok(c) = any::<Partial<&[u8]>, InputError<_>>(input) {
-                let c = c as char;
-
-                if c == '\n' || c == '\r' {
-                    break;
-                }
-
-                if c == ';' || c == ',' {
-                    name = None;
-                    continue;
-                }
-
-                if let Some(k) = &name {
-                    let v = &mut res.get_mut(k).ok_or(ErrMode::Cut(ContextError::new()))?;
-
-                    v.put_bytes(c as u8, 1);
-                } else {
-                    // A value with no key before it is refused.
-                    return Err(ErrMode::Cut(ContextError::new()));
-                }
-
-                continue;
-            } else {
-                break;
+            None => {
+                // Text before any key is not a pair, and nothing earlier can take it.
+                let (_, value) = pairs.last_mut()?;
+                value.push(separator?);
+                value.extend_from_slice(piece);
             }
         }
 
-        Ok(res.into_iter().map(|(k, v)| (k, v.freeze())).collect())
-    })
-    .parse_next(i)
+        match end {
+            Some(n) => {
+                separator = Some(rest[n]);
+                rest = &rest[n + 1..];
+            }
+            None => break,
+        }
+    }
+
+    Some(
+        pairs
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    Bytes::copy_from_slice(k),
+                    Bytes::copy_from_slice(v.trim_ascii()),
+                )
+            })
+            .collect(),
+    )
 }
 
-pub fn details_tag(i: &mut Stream) -> ModalResult<Bytes> {
-    trace("details_tag", move |input: &mut Stream<'_>| {
-        let name = seq!(
-            _: multispace0,
-            user_name,
-            _: multispace0,
-            _: alt((literal(":"), literal("="))),
-            _: multispace0,
-        )
-        .parse_next(input)?;
+/// A key and its `:` or `=` at the head of `piece`, and what follows; `None` where the piece does
+/// not open with one.
+fn comment_key(piece: &[u8]) -> Option<(&[u8], &[u8])> {
+    let piece = piece.trim_ascii_start();
+    let n = piece
+        .iter()
+        .position(|&b| !(b.is_ascii_alphanumeric() || b == b'_'))
+        .unwrap_or(piece.len());
+    if n == 0 {
+        return None;
+    }
 
-        Ok(name.0)
-    })
-    .parse_next(i)
-}
+    let (key, after) = piece.split_at(n);
+    let after = after.trim_ascii_start();
+    let value = after
+        .strip_prefix(b":")
+        .or_else(|| after.strip_prefix(b"="))?;
 
-pub fn user_name(i: &mut Stream) -> ModalResult<Bytes> {
-    trace("user_name", move |input: &mut Stream<'_>| {
-        let parts: Vec<&[u8]> =
-            repeat(1.., alt((alphanumeric1, literal("_")))).parse_next(input)?;
-
-        let b = parts.iter().fold(BytesMut::new(), |mut acc, p| {
-            acc.put_slice(p);
-            acc
-        });
-
-        Ok(b.freeze())
-    })
-    .parse_next(i)
+    Some((key, value))
 }
 
 /// The values of an entry's `# Query_time:` line.
@@ -2328,62 +2340,75 @@ SET timestamp=1547113018;\n";
         let s1 = "-- Id: 123, long: some kind of details here, caller : hello_world()\n";
         let s2 = "-- Id= 123, long = some kind of details here, caller= hello_world()\n";
 
-        let expected = (
-            Stream::new("".as_bytes()),
-            HashMap::from([
-                ("Id".into(), "123".into()),
-                ("long".into(), "some kind of details here".into()),
-                ("caller".into(), "hello_world()".into()),
-            ]),
-        );
+        let expected = HashMap::from([
+            ("Id".into(), "123".into()),
+            ("long".into(), "some kind of details here".into()),
+            ("caller".into(), "hello_world()".into()),
+        ]);
 
-        let mut s = Stream::new(s0.as_bytes());
-        let res = details_comment(&mut s).unwrap();
-        //TODO: Stream ToString and ToStr
-        assert_eq!((s, res), expected);
-
-        let mut s = Stream::new(s1.as_bytes());
-        let res = details_comment(&mut s).unwrap();
-        assert_eq!((s, res), expected);
-
-        let mut s = Stream::new(s2.as_bytes());
-        let res = details_comment(&mut s).unwrap();
-
-        assert_eq!((s, res), expected);
+        for c in [s0, s1, s2] {
+            let mut s = Stream::new(c.as_bytes());
+            let res = details_comment(&mut s).unwrap();
+            assert_eq!(res, expected, "{c}");
+            assert!(s.as_bytes().is_empty(), "{c}");
+        }
     }
 
     #[test]
     fn parses_details_comment_trailing_key() {
-        let i = "-- Id: 123, long: some kind of details here, caller: hello_world():52\n";
-        let mut s = Stream::new(i.as_bytes());
+        for (c, caller) in [
+            (
+                "-- Id: 123, long: some kind of details here, caller: hello_world():52\n",
+                "hello_world():52",
+            ),
+            (
+                "-- Id: 123, long: some kind of details here, caller: hello_world(): 52\n",
+                "hello_world(): 52",
+            ),
+        ] {
+            let res = details_comment(&mut Stream::new(c.as_bytes())).unwrap();
+            assert_eq!(
+                res,
+                HashMap::from([
+                    ("Id".into(), "123".into()),
+                    ("long".into(), "some kind of details here".into()),
+                    ("caller".into(), Bytes::from(caller)),
+                ])
+            );
+        }
+    }
 
-        let res = details_comment(&mut s).unwrap();
-
-        let expected = (
-            Stream::new("".as_bytes()),
+    /// A separator inside a value does not end it where what follows opens no key.
+    #[test]
+    fn a_separator_inside_a_value_stays_in_the_value() {
+        let c = "-- caller: foo(a, b), line: 12\n";
+        assert_eq!(
+            details_comment(&mut Stream::new(c.as_bytes())).unwrap(),
             HashMap::from([
-                ("Id".into(), "123".into()),
-                ("long".into(), "some kind of details here".into()),
-                ("caller".into(), "hello_world():52".into()),
-            ]),
+                ("caller".into(), "foo(a, b)".into()),
+                ("line".into(), "12".into()),
+            ])
         );
+    }
 
-        assert_eq!((s, res), expected);
+    /// A comment that is not pairs is refused, and `opt` leaves every byte where it was.
+    #[test]
+    fn a_comment_that_is_not_pairs_is_refused() {
+        for c in [
+            "-- hello\nSELECT 1;",
+            "--\nSELECT 1;",
+            "-- TODO\nSELECT 1;",
+            "-- TODO, a: 1\nSELECT 1;",
+            "-- a: 1,\nSELECT 1;",
+            "-- a: 1, a: 2\nSELECT 1;",
+        ] {
+            let mut s = Stream::new(c.as_bytes());
+            assert!(refused(details_comment(&mut s)), "{c}");
 
-        let i = "-- Id: 123, long: some kind of details here, caller: hello_world(): 52\n";
-        let mut s = Stream::new(i.as_bytes());
-
-        let res = details_comment(&mut s).unwrap();
-        let expected = (
-            Stream::new("".as_bytes()),
-            HashMap::from([
-                ("Id".into(), "123".into()),
-                ("long".into(), "some kind of details here".into()),
-                ("caller".into(), "hello_world(): 52".into()),
-            ]),
-        );
-
-        assert_eq!((s, res), expected);
+            let mut s = Stream::new(c.as_bytes());
+            assert_eq!(opt(details_comment).parse_next(&mut s).unwrap(), None);
+            assert_eq!(s.as_bytes(), c.as_bytes(), "{c}");
+        }
     }
 
     #[test]

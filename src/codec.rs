@@ -387,11 +387,18 @@ impl EntryCodec {
                         statement: EntryStatement::AdminCommand(c),
                     });
                 } else {
-                    let mut details = None;
-
-                    if let Ok(Some(d)) = opt(details_comment).parse_next(i) {
-                        details = Some(d);
-                    }
+                    // A comment that does not read as pairs is refused after its line was
+                    // consumed, and a cut would not be rewound by `opt`, so the rewind is
+                    // explicit: on any refusal the comment stays part of the statement.
+                    let checkpoint = i.checkpoint();
+                    let details = match details_comment(i) {
+                        Ok(d) => Some(d),
+                        Err(ErrMode::Incomplete(_)) => return Err(Halt::Incomplete),
+                        Err(_) => {
+                            i.reset(&checkpoint);
+                            None
+                        }
+                    };
 
                     let mut sql_lines = sql_lines(i)?;
 
@@ -1536,6 +1543,35 @@ select * from t1 where a=1;
         assert_eq!(e.call.set_timestamp, 1517798803);
         assert_eq!(e.call.last_insert_id(), Some(4));
         assert_eq!(e.call.insert_id(), Some(7));
+    }
+
+    /// A comment that is not pairs stays part of the statement, and one that is leaves it.
+    #[test]
+    fn a_comment_that_is_not_pairs_stays_in_the_statement() {
+        for comment in ["-- hello", "--", "-- TODO", "-- a: 1,", "-- a: 1, a: 2"] {
+            let e = both(&format!(
+                "{TIME}{SESSION}{STATS}{SET}{comment}\nSELECT a FROM t;\n"
+            ));
+            let a = &e.sql_attributes;
+
+            assert_eq!(
+                a.sql_raw.as_deref(),
+                Some(format!("{comment}\nSELECT a FROM t;").as_bytes()),
+            );
+            assert_eq!(a.sql(), "SELECT a FROM t", "{comment}");
+            assert_eq!(a.statement.sql_context(), None, "{comment}");
+        }
+
+        let e = both(&format!(
+            "{TIME}{SESSION}{STATS}{SET}-- caller: foo(a, b), line: 3\nSELECT a FROM t;\n"
+        ));
+        let context = e.sql_attributes.statement.sql_context().unwrap();
+        assert_eq!(context.get("caller").as_deref(), Some("foo(a, b)"));
+        assert_eq!(context.get("line").as_deref(), Some("3"));
+        assert_eq!(
+            e.sql_attributes.sql_raw.as_deref(),
+            Some(&b"SELECT a FROM t;"[..])
+        );
     }
 
     /// MySQL before 5.7 writes `yymmdd h:mm:ss`, and writes no `# Time:` line at all for an
