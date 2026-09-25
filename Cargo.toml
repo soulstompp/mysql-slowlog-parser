@@ -8,6 +8,11 @@ readme = "README.md"
 repository = "https://github.com/soulstompp/mysql-slowlog-parser"
 documentation = "https://docs.rs/mysql-slowlog-parser/"
 keywords = [ "mysql", "slowlog", "parser", "winnow" ]
+categories = [ "parser-implementations", "database" ]
+# Edition 2024 needs 1.85; `psm`, which `sqlparser`'s recursion guard pulls in, needs 1.88.
+rust-version = "1.88"
+# Neither the CI workflow nor the ignore rules are of any use to a consumer of the crate.
+exclude = [ ".github/", ".gitignore" ]
 
 [dependencies]
 bytes = "1.10.0"

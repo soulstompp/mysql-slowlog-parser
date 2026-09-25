@@ -1,8 +1,8 @@
 //! Timing harness: read a log through `FramedRead<EntryCodec>` three ways and report each.
-//! Not a test and not shipped — `cargo run --release --example throughput -- <path>...`.
+//! Run it with `cargo run --release --example throughput -- <path>...`.
 //!
 //! The three routes separate the decoder's own cost from the plumbing around it:
-//!   `file/8k`  — what `mysql-slowlog-analyzer` does today: `tokio::fs::File`, default buffer
+//!   `file/8k`  — `tokio::fs::File` with `FramedRead`'s default buffer
 //!   `file/64k` — the same, with `FramedRead::with_capacity`
 //!   `memory`   — the bytes already in RAM, so the number is the codec alone
 use futures::StreamExt;

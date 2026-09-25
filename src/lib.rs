@@ -1,39 +1,33 @@
-//! # parse-mysql-slowlog streams a slow query and returns a stream of entries from slow logs
-//!   from your `FramedReader` tokio input of choice.
+//! A streaming parser for MySQL slow query logs.
 //!
-//!## Example:
+//! [`EntryCodec`] is a [`Decoder`](tokio_util::codec::Decoder) that turns the bytes of a slow log
+//! into [`Entry`] values, so anything [`FramedRead`](tokio_util::codec::FramedRead) can wrap can
+//! be read without holding the log in memory. Each entry carries the call, the session, the stats
+//! and the statement. A statement the SQL grammar accepts also carries its [`sqlparser`] AST and a
+//! [`StatementGraph`] of the relations it names.
 //!
-//!```rust
+//! # Example
+//!
+//! ```rust
 //! use futures::StreamExt;
-//! use mysql_slowlog_parser::{CodecError, Entry, EntryCodec};
-//! use std::ops::AddAssign;
-//! use std::time::Instant;
+//! use mysql_slowlog_parser::EntryCodec;
 //! use tokio::fs::File;
 //! use tokio_util::codec::FramedRead;
 //!
 //! #[tokio::main]
 //! async fn main() {
-//! let start = Instant::now();
+//!     let file = File::open("assets/slow-test-queries.log").await.unwrap();
+//!     let mut entries = FramedRead::new(file, EntryCodec::default());
 //!
-//! let fr = FramedRead::with_capacity(
-//!     File::open("assets/slow-test-queries.log")
-//!     .await
-//!     .unwrap(),
-//!     EntryCodec::default(),
-//!        400000,
-//!);
+//!     let mut count = 0;
+//!     while let Some(entry) = entries.next().await {
+//!         let entry = entry.unwrap();
+//!         println!("{:.6}s {}", entry.query_time(), entry.sql_attributes.sql());
+//!         count += 1;
+//!     }
 //!
-//!    let mut i = 0;
-//!
-//!    let future = fr.for_each(|re: Result<Entry, CodecError>| async move {
-//!        let _ = re.unwrap();
-//!
-//!        i.add_assign(1);
-//!    });
-//!
-//!    future.await;
-//!    println!("parsed {} entries in: {}", i, start.elapsed().as_secs_f64());
-//!}
+//!     println!("parsed {count} entries");
+//! }
 //! ```
 
 #![deny(
@@ -44,8 +38,6 @@
     unused_qualifications,
     missing_docs
 )]
-
-extern crate core;
 
 use std::collections::HashMap;
 use std::default::Default;
@@ -77,30 +69,44 @@ pub use types::{
     EntrySqlType, EntryStatement, EntryStats,
 };
 
-/// types of masking to apply when parsing SQL statements
-/// * PlaceHolder - mask all sql values with a '?' placeholder
-/// * None - leave all values in place
+/// How a parsed statement's values are rendered in [`EntrySqlAttributes::sql()`].
+///
+/// Masking changes the rendering and nothing else: [`EntrySqlAttributes::sql_raw`] and
+/// [`EntrySqlAttributes::literals`] hold what the author wrote under either setting.
+///
+/// Only a statement the grammar parses is masked. A refused statement is carried as the log's
+/// own bytes, values included, and so is an administrator command.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum EntryMasking {
-    /// A placeholder `?` is used when a binding is found in a query
+    /// Every recorded literal is rendered as a `?` placeholder, so two calls of one query that
+    /// differ only in their values render to the same text. A bit literal (`b'1'`) is not
+    /// recorded and is not masked.
     PlaceHolder,
-    /// No placeholder mask
+    /// Literals are rendered as written.
     #[default]
     None,
 }
 
-/// Struct to pass along configuration values to codec
+/// Configuration for [`EntryCodec::new`].
 #[derive(Copy, Clone, Default)]
 pub struct EntryCodecConfig {
-    /// type of masking to use when parsing SQL
+    /// How values are rendered in [`EntrySqlAttributes::sql()`].
     pub masking: EntryMasking,
-    /// mapping function in order to find specific key entries
+    /// Maps the key/value pairs of the comment preceding a statement to its
+    /// [`SqlStatementContext`]. `None` keeps every pair under the key the comment used; a
+    /// function can filter or rename pairs, or return `None` to drop the context.
+    #[allow(clippy::type_complexity)]
     pub map_comment_context: Option<fn(HashMap<Bytes, Bytes>) -> Option<SqlStatementContext>>,
 }
 
 impl Debug for EntryCodecConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.masking)?;
-        write!(f, "map_comment_context: fn")
+        f.debug_struct("EntryCodecConfig")
+            .field("masking", &self.masking)
+            .field(
+                "map_comment_context",
+                &self.map_comment_context.map(|_| "fn"),
+            )
+            .finish()
     }
 }

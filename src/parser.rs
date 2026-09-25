@@ -65,8 +65,8 @@ impl TimeLine {
     }
 }
 
-/// parses "# Time: .... entry line and returns a `DateTime`
-// # Time: 2015-06-26T16:43:23+0200";
+/// Parses an entry's `# Time:` line into a `DateTime`.
+// # Time: 2015-06-26T16:43:23+0200
 pub fn parse_entry_time(i: &mut Stream) -> ModalResult<DateTime> {
     trace("parse_entry_time", move |input: &mut Stream| {
         let dt = seq!(
@@ -81,8 +81,9 @@ pub fn parse_entry_time(i: &mut Stream) -> ModalResult<DateTime> {
     .parse_next(i)
 }
 
-/// values from the User: entry line
-/// ex. # User@Host: msandbox\[msandbox\] @ localhost []  Id:     3
+/// The values of an entry's `# User@Host:` line.
+///
+/// ex. `# User@Host: msandbox[msandbox] @ localhost []  Id:     3`
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionLine {
     pub(crate) user: Bytes,
@@ -93,27 +94,27 @@ pub struct SessionLine {
 }
 
 impl SessionLine {
-    /// returns user as`Bytes`
+    /// The user name before the brackets: the account MySQL matched for privileges.
     pub fn user(&self) -> Bytes {
         self.user.clone()
     }
 
-    /// returns sys_user as`Bytes`
+    /// The user name inside the brackets: the name the client connected as.
     pub fn sys_user(&self) -> Bytes {
         self.sys_user.clone()
     }
 
-    /// returns possible host as`Option<Bytes>`
+    /// The client's host name, where the line carried one.
     pub fn host(&self) -> Option<Bytes> {
         self.host.clone()
     }
 
-    /// returns possible ip_address as `Option<Bytes>`
+    /// The client's IPv4 address, where the line carried one.
     pub fn ip_address(&self) -> Option<Bytes> {
         self.ip_address.clone()
     }
 
-    /// returns thread_id as `Bytes`
+    /// The connection's thread id, the line's `Id:`.
     pub fn thread_id(&self) -> u32 {
         self.thread_id
     }
@@ -154,7 +155,7 @@ impl HeaderLines {
     }
 }
 
-pub fn log_header<'a>(i: &mut Stream<'_>) -> ModalResult<HeaderLines> {
+pub fn log_header(i: &mut Stream<'_>) -> ModalResult<HeaderLines> {
     trace("log_header", move |input: &mut Stream<'_>| {
         // check for the '#' since the last parser in the set is greedy
         let head = seq!{
@@ -167,10 +168,10 @@ pub fn log_header<'a>(i: &mut Stream<'_>) -> ModalResult<HeaderLines> {
                 _: multispace1,
                 _: literal("Tcp port:"),
                 _: multispace1,
-                tcp_port: opt(digit1).map(|v: Option<&[u8]>| v.and_then(|d| Some(str::from_utf8(d).unwrap().parse().unwrap()))),
+                tcp_port: opt(digit1).map(|v: Option<&[u8]>| v.map(|d| str::from_utf8(d).unwrap().parse().unwrap())),
                 _: multispace1,
                 _: literal("Unix socket: "),
-                socket: opt(take_till(1.., "\n".as_bytes())).map(|v: Option<&[u8]>| v.and_then(|d| Some(d.to_owned().into()))),
+                socket: opt(take_till(1.., "\n".as_bytes())).map(|v: Option<&[u8]>| v.map(|d| d.to_owned().into())),
                 _: till_line_ending,
                 _: line_ending,
                 _: till_line_ending,
@@ -251,14 +252,14 @@ pub fn alphanumerichyphen1<'a>(i: &mut Stream<'a>) -> ModalResult<&'a [u8]> {
     alt((alphanumeric1, literal("_"), literal("-"))).parse_next(i)
 }
 
-pub fn host_name<'a>(i: &mut Stream<'_>) -> ModalResult<Bytes> {
+pub fn host_name(i: &mut Stream<'_>) -> ModalResult<Bytes> {
     trace("host_name", move |input: &mut Stream<'_>| {
         let (mut first, second): (Vec<&[u8]>, &[u8]) = alt((
-            ((
+            (
                 repeat(1.., terminated(alphanumerichyphen1, literal("."))),
                 alpha1,
-            )),
-            ((repeat(1, alphanumerichyphen1), take(0 as usize))),
+            ),
+            (repeat(1, alphanumerichyphen1), take(0_usize)),
         ))
         .parse_next(input)?;
 
@@ -283,8 +284,8 @@ pub fn host_name<'a>(i: &mut Stream<'_>) -> ModalResult<Bytes> {
     .parse_next(i)
 }
 
-/// ip address handler that only handles IP4
-pub fn ip_address<'a>(i: &mut Stream<'_>) -> ModalResult<Bytes> {
+/// ip address handler that only handles IPv4
+pub fn ip_address(i: &mut Stream<'_>) -> ModalResult<Bytes> {
     trace("ip_address", move |input: &mut Stream<'_>| {
         let p = seq!(
             digit1,
@@ -312,7 +313,7 @@ pub fn ip_address<'a>(i: &mut Stream<'_>) -> ModalResult<Bytes> {
 }
 
 /// thread id parser for 'Id: [\d+]'
-pub fn entry_user_thread_id<'a>(i: &mut Stream<'_>) -> ModalResult<u32> {
+pub fn entry_user_thread_id(i: &mut Stream<'_>) -> ModalResult<u32> {
     trace("entry_user_thread_id", move |input: &mut Stream<'_>| {
         let id = seq!(
             _: literal("Id:"),
@@ -374,12 +375,14 @@ pub fn entry_user(i: &mut Stream) -> ModalResult<SessionLine> {
 
 /// The key/value pairs parsed from the comment preceding a SQL statement.
 ///
+/// The comment is a `--` line immediately before the statement, as in
+/// `-- file: app.rb, line: 12`: a key is ASCII letters, digits and `_`, followed by `:` or `=`,
+/// and pairs are separated by `,` or `;`.
+///
 /// Whatever the comment said, under the names it used. Applications annotate with whatever keys
-/// they like, so a fixed set of fields would admit only those, and renaming a key — filing a
-/// comment's `file` under a field called `caller` — would compile a reader's vocabulary into the
-/// parser. Deciding that two logs' keys name the same thing is a judgement that belongs to
-/// whoever is comparing them, and [`crate::EntryCodecConfig::map_comment_context`] is where a
-/// caller says so.
+/// they like, so a fixed set of fields would admit only those. Deciding that two logs' keys name
+/// the same thing is a judgement that belongs to whoever is comparing them, and
+/// [`crate::EntryCodecConfig::map_comment_context`] is where a caller says so.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SqlStatementContext {
     /// Every pair the comment carried, keys and values exactly as written.
@@ -387,8 +390,8 @@ pub struct SqlStatementContext {
 }
 
 impl SqlStatementContext {
-    /// Builds a context from the pairs a comment parsed into. `None` where there were none,
-    /// so an empty comment and an absent one stay distinguishable.
+    /// Builds a context from the pairs a comment parsed into. `None` where there were none, so a
+    /// context always carries at least one pair.
     pub fn new(entries: HashMap<Bytes, Bytes>) -> Option<Self> {
         if entries.is_empty() {
             None
@@ -428,7 +431,7 @@ impl SqlStatementContext {
     }
 }
 
-pub fn details_comment<'a>(i: &mut Stream) -> ModalResult<HashMap<Bytes, Bytes>> {
+pub fn details_comment(i: &mut Stream) -> ModalResult<HashMap<Bytes, Bytes>> {
     trace("details_comment", move |input: &mut Stream<'_>| {
         let mut name: Option<Bytes> = None;
 
@@ -437,13 +440,13 @@ pub fn details_comment<'a>(i: &mut Stream) -> ModalResult<HashMap<Bytes, Bytes>>
         let _ = literal("--").parse_next(input)?;
 
         loop {
-            if name.is_none() {
-                if let Ok(n) = details_tag(input) {
-                    name.replace(n.clone());
-                    if let Some(_) = res.insert(n, BytesMut::new()) {
-                        //TODO: see if you need to set the ErrorKind::Assert specifically, like before
-                        return Err(ErrMode::Cut(ContextError::new()));
-                    }
+            if name.is_none()
+                && let Ok(n) = details_tag(input)
+            {
+                name.replace(n.clone());
+                if res.insert(n, BytesMut::new()).is_some() {
+                    // A key written twice is refused rather than overwritten.
+                    return Err(ErrMode::Cut(ContextError::new()));
                 }
             }
 
@@ -460,12 +463,11 @@ pub fn details_comment<'a>(i: &mut Stream) -> ModalResult<HashMap<Bytes, Bytes>>
                 }
 
                 if let Some(k) = &name {
-                    // TODO: previously this specified ErrorKind::Assert, figure out if this needs to be specificied still
                     let v = &mut res.get_mut(k).ok_or(ErrMode::Cut(ContextError::new()))?;
 
                     v.put_bytes(c as u8, 1);
                 } else {
-                    // TODO: previously this specified ErrorKind::Assert, figure out if this needs to be specificied still
+                    // A value with no key before it is refused.
                     return Err(ErrMode::Cut(ContextError::new()));
                 }
 
@@ -480,7 +482,7 @@ pub fn details_comment<'a>(i: &mut Stream) -> ModalResult<HashMap<Bytes, Bytes>>
     .parse_next(i)
 }
 
-pub fn details_tag<'a>(i: &mut Stream) -> ModalResult<Bytes> {
+pub fn details_tag(i: &mut Stream) -> ModalResult<Bytes> {
     trace("details_tag", move |input: &mut Stream<'_>| {
         let name = seq!(
             _: multispace0,
@@ -491,41 +493,41 @@ pub fn details_tag<'a>(i: &mut Stream) -> ModalResult<Bytes> {
         )
         .parse_next(input)?;
 
-        Ok(name.0.into())
+        Ok(name.0)
     })
     .parse_next(i)
 }
 
-/// values parsed from stats entry line
+/// The values of an entry's `# Query_time:` line.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StatsLine {
-    /// how long the overall query took
+    /// how long the overall query took, in seconds
     pub(crate) query_time: f64,
-    /// how long the query held locks
+    /// how long the query waited to acquire locks, in seconds
     pub(crate) lock_time: f64,
     /// how many rows were sent
     pub(crate) rows_sent: u32,
-    /// how many rows were scanned
+    /// how many rows were examined
     pub(crate) rows_examined: u32,
 }
 
 impl StatsLine {
-    /// how long the overall query took
+    /// how long the overall query took, in seconds
     pub fn query_time(&self) -> f64 {
-        self.query_time.clone()
+        self.query_time
     }
-    /// how long the query held locks
+    /// how long the query waited to acquire locks, in seconds
     pub fn lock_time(&self) -> f64 {
-        self.lock_time.clone()
+        self.lock_time
     }
 
     /// how many rows were sent
     pub fn rows_sent(&self) -> u32 {
-        self.rows_sent.clone()
+        self.rows_sent
     }
-    /// how many rows were scanned
+    /// how many rows were examined
     pub fn rows_examined(&self) -> u32 {
-        self.rows_examined.clone()
+        self.rows_examined
     }
 }
 
@@ -558,15 +560,15 @@ pub fn parse_entry_stats(i: &mut Stream<'_>) -> ModalResult<StatsLine> {
     .parse_next(i)
 }
 
-/// admin command values parsed from sql lines of an entry
+/// An administrator command, `# administrator command: Quit;`, logged in place of a statement.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntryAdminCommand {
-    /// the admin command sent
+    /// The command as the log spelled it, e.g. `Quit` or `Init DB`, without the `;`.
     pub command: Bytes,
 }
 
 /// parse "# administrator command: " entry line
-pub fn admin_command<'a>(i: &mut Stream) -> ModalResult<EntryAdminCommand> {
+pub fn admin_command(i: &mut Stream) -> ModalResult<EntryAdminCommand> {
     trace("admin_command", move |input: &mut Stream<'_>| {
         let command = seq!(
             _: literal("# administrator command:"),
@@ -592,7 +594,7 @@ pub fn admin_command<'a>(i: &mut Stream) -> ModalResult<EntryAdminCommand> {
     .parse_next(i)
 }
 
-/// parses 'USE database=\w+;' command which shows up at the start of some entry sql
+/// parses the `use <database>;` line that precedes some entries' `SET timestamp`
 pub fn use_database(i: &mut Stream) -> ModalResult<Bytes> {
     trace("use_database", move |input: &mut Stream<'_>| {
         let db_name = seq!(
@@ -604,12 +606,12 @@ pub fn use_database(i: &mut Stream) -> ModalResult<Bytes> {
         )
         .parse_next(input)?;
 
-        Ok(db_name.0.into())
+        Ok(db_name.0)
     })
     .parse_next(i)
 }
 
-/// parses 'SET timestamp=\d{10};' command which starts
+/// parses the `SET timestamp=<unix seconds>;` line that precedes every statement
 pub fn start_timestamp_command(i: &mut Stream) -> ModalResult<u32> {
     trace("start_timestamp_command", move |input: &mut Stream<'_>| {
         let time = seq!(
@@ -635,9 +637,8 @@ pub fn start_timestamp_command(i: &mut Stream) -> ModalResult<u32> {
 /// are interchangeable; recording the literal here is what makes masking a grouping choice rather
 /// than an edit to the document.
 ///
-/// No source position: the span lives on `sqlparser::ast::ValueWithSpan`, and nothing this
-/// crate's visitor sees carries it. [`EntryLiteral::ordinal`] is the position, and it is exact
-/// because one pass both records and masks, so the two cannot fall out of step.
+/// No source position: [`EntryLiteral::ordinal`] is the position, and it is exact because one
+/// pass both records and masks, so the two cannot fall out of step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EntryLiteral {
     /// Position in the statement's own value order, counting from zero.
@@ -646,7 +647,9 @@ pub struct EntryLiteral {
     /// `sqlparser_derive`. It is stable within a `sqlparser` version, and nothing promises it
     /// across one.
     pub ordinal: u32,
-    /// The literal as the author wrote it, quoting and all.
+    /// The literal rendered as SQL, quoting and all. The rendering is `sqlparser`'s, so escapes
+    /// are normalised and `0x41` reads `X'41'`; the author's exact bytes are in
+    /// [`crate::EntrySqlAttributes::sql_raw`].
     pub rendered: Bytes,
     /// The payload without its quoting -- what a reader groups by.
     pub value: Bytes,
@@ -656,20 +659,22 @@ pub struct EntryLiteral {
     /// means something only in a domain, and the domain is a column of a relation: without it
     /// `42` the tenant and `42` the row limit are one value.
     ///
-    /// `None` is an absence the parse establishes and not a gap: a `CREATE TABLE` default, a
-    /// `LIMIT`, a `SET` value and a function argument are literals the author wrote in a position
-    /// that names no column, and they select no rows.
+    /// `None` where the value sits in a position that names no column: a `CREATE TABLE` default,
+    /// a `LIMIT`, a `SET` value and a function argument are literals the author wrote there, and
+    /// they select no rows.
     ///
-    /// Four syntactic shapes reach this, and they are not all the same claim. A comparison, an
+    /// Five syntactic shapes reach this, and they are not all the same claim. A comparison, an
     /// `IN` list and a `BETWEEN` bound name the column a value is *sought* in; `UPDATE … SET qty
-    /// = 5` and `INSERT … VALUES` name the column a value is *written* to, which is a key the
-    /// statement creates or changes rather than one it looks up. [`Self::sought`] is what tells
-    /// them apart, because a lock taken to find a row and a lock taken to write one are
-    /// different locks.
+    /// = 5` and `INSERT … (qty) VALUES (5)` name the column a value is *written* to, which is a
+    /// key the statement creates or changes rather than one it looks up. [`Self::sought`] is what
+    /// tells them apart, because a lock taken to find a row and a lock taken to write one are
+    /// different locks. The value must be the shape's direct operand: one under a unary minus,
+    /// in parentheses or behind a charset introducer is `None`, as is one written by
+    /// `INSERT … SET` or `ON DUPLICATE KEY UPDATE`.
     pub column: Option<LiteralColumn>,
     /// Whether the author was **looking for** this value or **writing** it.
     ///
-    /// A log may contain no predicate at all — a restore only ever writes — so a consumer that
+    /// A log may contain no predicate at all — a restore only ever writes — so a caller that
     /// reads only sought values can find nothing where the author bound a great many.
     ///
     /// `false` on an unbound literal, where it asserts nothing.
@@ -702,8 +707,7 @@ pub struct LiteralColumn {
 
 /// What kind of literal an [`EntryLiteral`] is.
 ///
-/// Five arms, and no arm for `E'…'`: MySQL has no such literal, `MySqlDialect` refuses the text,
-/// and an arm no input can reach is one more case every consumer has to handle.
+/// A boolean, a `NULL` and a placeholder are not the author's subject and are never recorded.
 ///
 /// [`Self::DoubleQuotedString`] is the ambiguous one. MySQL reads `"…"` as a string literal under
 /// its default `sql_mode` and as an identifier under `ANSI_QUOTES`; `MySqlDialect` is fixed and
@@ -751,27 +755,30 @@ pub fn parse_sql(
     Ok((statements, pass.literals))
 }
 
-/// Re-render a statement with a substitute in place of chosen literals.
+/// Re-renders one statement's SQL text with a substitute in place of chosen literals, and returns
+/// the rendering.
 ///
 /// `replacements[i]` is the new payload for the `i`-th literal this crate records, in the same
 /// traversal order and under the same arm filter -- so an ordinal from [`EntryLiteral`] indexes
 /// this directly and the two cannot drift apart. `None` leaves a literal alone, and a short slice
 /// leaves the tail alone.
 ///
-/// The kind is taken from the original and never from the caller, which makes the substitution
-/// type-preserving by construction: a number stays a number and a quoted string stays a quoted
-/// string. Swapping them changes the statement, because MySQL compares an integer column against
-/// a string by coercing it and takes a different path through the index.
+/// The text must be the author's or an unmasked rendering of it. A masked rendering carries `?`
+/// where the literals were, a placeholder is not a literal, and nothing is substituted.
+///
+/// The kind is taken from the original and never from the caller: a quoted string stays a quoted
+/// string, with its quotes escaped. Swapping them changes the statement, because MySQL compares
+/// an integer column against a string by coercing it and takes a different path through the
+/// index. A number's or a hex literal's payload is written as given and not checked, so a caller
+/// substituting one must supply digits.
 ///
 /// Returns `None` where the text does not parse or is not exactly one statement. A caller with a
 /// substitute to apply and nothing to apply it to has to withhold, and the `None` is what says
 /// so; returning the original would hand back the author's values from a function that promises
 /// it did not.
 ///
-/// It re-parses rather than taking a tree, because the substitution a caller wants is usually
-/// corpus-scoped: the whole log is read before any substitute is known, and by then the trees are
-/// gone. The text it re-parses is the tree's own rendering, so the traversal it walks is the
-/// traversal that produced the ordinals.
+/// It re-parses rather than taking a tree, because a caller usually knows its substitutes only
+/// once the whole log is read, and by then the trees are gone.
 pub fn rewrite_literals(sql: &str, replacements: &[Option<String>]) -> Option<String> {
     let mut tokenizer = Tokenizer::new(&MySqlDialect {}, sql);
     let tokens = tokenizer.tokenize().ok()?;
@@ -789,7 +796,8 @@ pub fn rewrite_literals(sql: &str, replacements: &[Option<String>]) -> Option<St
     Some(statements[0].to_string())
 }
 
-/// Does this text carry a value the author supplied? `None` where it cannot be tokenized.
+/// Whether `sql` carries a value the author supplied: `Some(true)` where its tokens include a
+/// literal, `Some(false)` where they do not, and `None` where it cannot be tokenized.
 ///
 /// For the statements this grammar refuses, and only those. A statement that parsed has literals
 /// with a position — [`EntryLiteral::column`] says whether the author went for a row with one —
@@ -798,13 +806,10 @@ pub fn rewrite_literals(sql: &str, replacements: &[Option<String>]) -> Option<St
 ///
 /// It over-approximates, and the direction matters: `LIMIT 10` and `SET TIME_ZONE='+00:00'` both
 /// answer `true` while naming nobody. A caller withholding on this answer withholds a little more
-/// than it must, which costs fidelity and not confidentiality. Note that this *decides* and never
-/// edits — a tokenizer-level substitution cannot tell a value from a number the grammar requires,
-/// and turns `CHAR(60)` into `CHAR(?)`.
+/// than it must, which costs fidelity and not confidentiality.
 ///
-/// It opens MySQL version gates, because the two regimes disagree about them: `sqlparser`'s
-/// tokenizer files `/*!40101 … */` as one comment while the server executes what is inside it, so
-/// a literal inside a gate is invisible to a plain token scan.
+/// It reads inside MySQL version gates, `/*!40101 … */`, whatever their version, because the
+/// server executes what is inside one.
 ///
 /// A value written as an identifier is invisible here, and no token scan can see it: in
 /// ``DEFINER=`msandbox`@`%` `` a username and a host are backtick identifiers. A caller must not
@@ -826,7 +831,8 @@ pub fn carries_a_value(sql: &str) -> Option<bool> {
                 | Token::SingleQuotedByteStringLiteral(_)
                 | Token::DoubleQuotedByteStringLiteral(_) => return Some(true),
                 Token::Whitespace(Whitespace::MultiLineComment(body)) => {
-                    // `!40101 SET ...` -- a gate the server would have run.
+                    // `MySqlDialect` expands `/*!40101 … */` into tokens itself; what reaches
+                    // here is a body that starts `!` only after whitespace.
                     if let Some(rest) = body.trim_start().strip_prefix('!') {
                         let inner = rest.trim_start_matches(|c: char| c.is_ascii_digit());
                         if scan(inner, depth + 1)? {
@@ -902,7 +908,7 @@ impl VisitorMut for RewritePass<'_> {
 ///
 /// It reaches a few `Value`s that select no rows -- a `CEIL(x TO 2)` scale, a `TABLESAMPLE` seed.
 /// Those are grammar rather than subject, and masking one is wrong in the same way masking a type
-/// parameter was, but it cannot break a parse: the tree already exists.
+/// parameter would be, but it cannot break a parse: the tree already exists.
 struct LiteralPass {
     literals: Vec<EntryLiteral>,
     mask: bool,
@@ -1159,12 +1165,8 @@ mod every_literal_kind {
             .collect()
     }
 
-    /// ⭐⭐ EVERY ARM OF [`LiteralKind`], AND THERE ARE FIVE BECAUSE ONE WAS NOT MYSQL'S.
-    ///
-    /// Two of the six had a witness — `Number` and `SingleQuotedString`. Of the other four,
-    /// three are ordinary MySQL and one was `E'…'`, which `MySqlDialect` **refuses**, so nothing
-    /// could ever produce it. It is gone rather than documented: this crate reads MySQL slow
-    /// logs, and an arm no input reaches is one more case every consumer has to handle.
+    /// EVERY ARM OF [`LiteralKind`] IS REACHED BY MYSQL TEXT, and `E'…'`, which is not MySQL, is
+    /// refused.
     #[test]
     fn every_arm_that_a_mysql_literal_reaches_has_one() {
         use LiteralKind as K;
@@ -1185,35 +1187,30 @@ mod every_literal_kind {
             );
             seen.insert(format!("{want:?}"));
         }
-        // ⛔ THE GUARD. Five arms, written out because the enum cannot be iterated. It was six
-        // before `EscapedString` went.
+        // THE GUARD. Five arms, written out because the enum cannot be iterated.
         assert_eq!(
             seen.len(),
             5,
             "every LiteralKind arm needs text that reaches it; reached {seen:?}"
         );
 
-        // ⛔ And the arm that was removed stays removed: MySQL has no such literal and this
-        // grammar refuses the text, so there is nothing for an arm to hold.
+        // MySQL has no `E'…'` literal and this grammar refuses the text, so there is nothing for
+        // an arm to hold.
         assert!(
             parse_sql("SELECT 1 FROM t WHERE a = E'x'", &EntryMasking::None).is_err(),
             "E'…' is not MySQL and this parser does not accept it"
         );
     }
 
-    /// ⛔⛔ `"x"` IS A LITERAL OR AN IDENTIFIER AND THE LOG DOES NOT SAY WHICH.
+    /// `"x"` IS A LITERAL OR AN IDENTIFIER AND THE LOG DOES NOT SAY WHICH.
     ///
     /// This is not two dialects disagreeing — it is **MySQL disagreeing with itself** depending
     /// on a setting a slow log never records. By default `"x"` is a string literal; under
     /// `sql_mode = 'ANSI_QUOTES'` the same bytes are a quoted **identifier**, which is a column
-    /// and not a subject at all.
+    /// and not a subject at all. So this arm firing records a literal for text that may have
+    /// been a column name.
     ///
-    /// ⭐ So this arm firing is the `sql_mode` risk made concrete rather than argued: the crate
-    /// files a row in `literals.parquet` — the author's subject — for text that may have been a
-    /// column name. `connection.rs` carries `sql_mode` with its provenance for exactly this, and
-    /// on both corpora it is `opaque` or `unmeasured`, so the question stays open.
-    ///
-    /// ⚠️ The parser is not wrong to pick one: `MySqlDialect` is fixed and honours no mode. What
+    /// The parser is not wrong to pick one: `MySqlDialect` is fixed and honours no mode. What
     /// would be wrong is filing the reading without recording that a reading was made.
     #[test]
     fn a_double_quoted_string_is_the_one_literal_the_mode_can_reinterpret() {
@@ -1222,9 +1219,8 @@ mod every_literal_kind {
         assert_eq!(got[0].0, LiteralKind::DoubleQuotedString);
         assert_eq!(got[0].1, "\"name\"", "the author's own spelling is kept");
 
-        // ⭐ Under `ANSI_QUOTES` this same statement has NO literal and names a column — so the
-        // count this crate files for it is 1 under one mode and 0 under the other. Nothing else
-        // in the record would show that, which is why the mode is carried per connection.
+        // Under `ANSI_QUOTES` this same statement has NO literal and names a column — so the
+        // count this crate files for it is 1 under one mode and 0 under the other.
         assert!(
             kinds("SELECT 'name' FROM person")
                 .iter()
@@ -1234,7 +1230,7 @@ mod every_literal_kind {
     }
 }
 
-/// ⭐⭐⭐ THE SUBSTITUTION, WHICH IS WHAT LETS A STATEMENT SHIP WITHOUT ITS SUBJECT.
+/// THE SUBSTITUTION, WHICH IS WHAT LETS A STATEMENT SHIP WITHOUT ITS SUBJECT.
 #[cfg(test)]
 mod a_literal_can_be_replaced_by_its_surrogate {
     use super::*;
@@ -1248,10 +1244,10 @@ mod a_literal_can_be_replaced_by_its_surrogate {
             .collect()
     }
 
-    /// ⭐⭐ THE ROUND TRIP, WHICH IS THE ONLY THING THAT SAYS THE ORDINALS LINE UP.
+    /// THE ROUND TRIP, WHICH IS THE ONLY THING THAT SAYS THE ORDINALS LINE UP.
     ///
     /// Rewrite every literal to its own recorded value and the statement must come back
-    /// unchanged. ⛔ If [`RewritePass`] counted one arm differently from [`LiteralPass`] -- a
+    /// unchanged. If [`RewritePass`] counted one arm differently from [`LiteralPass`] -- a
     /// `NULL`, a `TRUE`, a `?` -- every ordinal after it would be off by one and this is what
     /// catches it, on a statement built to contain exactly those.
     #[test]
@@ -1267,7 +1263,7 @@ mod a_literal_can_be_replaced_by_its_surrogate {
         );
     }
 
-    /// ⛔ AND THE SUBSTITUTION LANDS WHERE THE ORDINAL SAYS, not one literal over.
+    /// AND THE SUBSTITUTION LANDS WHERE THE ORDINAL SAYS, not one literal over.
     #[test]
     fn a_surrogate_replaces_the_literal_its_ordinal_names() {
         let sql = "SELECT a FROM t WHERE ok = TRUE AND id = 42 AND other = 99";
@@ -1278,7 +1274,7 @@ mod a_literal_can_be_replaced_by_its_surrogate {
         assert!(out.contains("other = 99"), "{out}");
     }
 
-    /// ⛔⛔ THE KIND IS THE ORIGINAL'S AND THE CALLER CANNOT SAY OTHERWISE.
+    /// THE KIND IS THE ORIGINAL'S AND THE CALLER CANNOT SAY OTHERWISE.
     ///
     /// A number that came back quoted would be a different statement: MySQL coerces the
     /// comparison and takes a different route through the index, so a replay of it contends
@@ -1291,14 +1287,14 @@ mod a_literal_can_be_replaced_by_its_surrogate {
         let q = rewrite_literals("SELECT a FROM t WHERE k = '42'", &[Some("7".into())]).unwrap();
         assert!(q.contains("k = '7'"), "{q}");
 
-        // ⭐ And the mapped statement is still SQL, which is the whole difference between this
+        // And the mapped statement is still SQL, which is the whole difference between this
         // and a `?` nobody recorded a bind for.
         for out in [n, q] {
             assert!(parse_sql(&out, &EntryMasking::None).is_ok(), "{out}");
         }
     }
 
-    /// ⛔ TEXT WITH NO PARSE GETS `None` AND NEVER ITS OWN BYTES BACK.
+    /// TEXT WITH NO PARSE GETS `None` AND NEVER ITS OWN BYTES BACK.
     ///
     /// A caller holding a surrogate and no tree to apply it to must **withhold**. Handing back
     /// the original would return the author's values from a call whose name promises it did not.
@@ -1312,7 +1308,7 @@ mod a_literal_can_be_replaced_by_its_surrogate {
             rewrite_literals("LOCK TABLES shop.invoice WRITE", &[]),
             None
         );
-        // ⚠️ And two statements are refused as well: the ordinals would span them and a caller
+        // And two statements are refused as well: the ordinals would span them and a caller
         // asking for one statement's literal would reach another's.
         assert_eq!(
             rewrite_literals("SELECT 1; SELECT 2", &[Some("9".into())]),
@@ -1320,31 +1316,29 @@ mod a_literal_can_be_replaced_by_its_surrogate {
         );
     }
 
-    /// ⚠️ A short slice leaves the tail alone rather than panicking, because the caller's map
-    /// is built per domain and a literal in no domain has no surrogate to offer.
+    /// A short slice leaves the tail alone rather than panicking.
     #[test]
     fn a_literal_with_no_surrogate_is_left_as_the_author_wrote_it() {
         let out = rewrite_literals("SELECT a FROM t WHERE id = 42 LIMIT 10", &[]).unwrap();
         assert!(out.contains("42") && out.contains("10"), "{out}");
     }
 
-    /// ⛔⛔ AN INSERT WITH NO COLUMN LIST IS WRITING DATA, NOT WRITING NOTHING.
+    /// AN INSERT WITH NO COLUMN LIST IS WRITING DATA, NOT WRITING NOTHING.
     ///
     /// `INSERT INTO t VALUES (1, 'kay')` puts a row in a table. Filing those values as "no
-    /// column is named here" — the bucket a `LIMIT` and a `CREATE TABLE` default live in — made
-    /// them look like grammar, and on `slow-test-queries.log` that is **98 literals** a rule
-    /// keyed on the bucket would have published in the clear.
+    /// column is named here" — the bucket a `LIMIT` and a `CREATE TABLE` default live in —
+    /// would make them look like grammar, and a rule keyed on the bucket would publish them in
+    /// the clear.
     ///
-    /// ⚠️ The column really is unrecoverable: it is the table's `n`-th and which one that is
-    /// lives in a catalogue no slow log carries. So the claim is *written*, and *where* is
-    /// declined — two claims that had been one.
+    /// The column's name is unrecoverable: it is the table's `n`-th, and which one that is lives
+    /// in a catalogue no slow log carries. Its position is not.
     #[test]
     fn an_insert_with_no_column_list_writes_to_a_column_it_can_name_by_position() {
         let ls = parse_sql("INSERT INTO t VALUES (1, 'kay')", &EntryMasking::None)
             .unwrap()
             .1;
         assert_eq!(ls.len(), 2);
-        // ⭐⭐ AND THE COLUMN IS RECOVERABLE POSITIONALLY: the `n`-th value reaches the table's
+        // AND THE COLUMN IS RECOVERABLE POSITIONALLY: the `n`-th value reaches the table's
         // `n`-th column, for every such statement against that table.
         assert_eq!(
             ls.iter().map(|l| l.column_position).collect::<Vec<_>>(),
@@ -1352,7 +1346,7 @@ mod a_literal_can_be_replaced_by_its_surrogate {
         );
         assert!(ls.iter().all(|l| l.column.is_none()), "and it is not NAMED");
 
-        // ⭐ A column list names them, so they are named and NOT positional -- the two are
+        // A column list names them, so they are named and NOT positional -- the two are
         // exclusive, and the same statement one clause different proves it.
         let named = parse_sql(
             "INSERT INTO t (a, b) VALUES (1, 'kay')",
@@ -1363,14 +1357,14 @@ mod a_literal_can_be_replaced_by_its_surrogate {
         assert!(named.iter().all(|l| l.column_position.is_none()));
         assert!(named.iter().all(|l| l.column.is_some()));
 
-        // ⛔ And a literal that names nobody is in neither: a `LIMIT` is grammar.
+        // And a literal that names nobody is in neither: a `LIMIT` is grammar.
         let limit = parse_sql("SELECT a FROM t LIMIT 10", &EntryMasking::None)
             .unwrap()
             .1;
         assert_eq!(limit.len(), 1);
         assert!(limit[0].column_position.is_none() && limit[0].column.is_none());
 
-        // ⛔⛔ EVERY ROW OF A MULTI-ROW INSERT COUNTS FROM ZERO AGAIN. A counter that ran on
+        // EVERY ROW OF A MULTI-ROW INSERT COUNTS FROM ZERO AGAIN. A counter that ran on
         // across rows would file the second row's first value in the table's third column.
         let rows = parse_sql("INSERT INTO t VALUES (1, 2), (3, 4)", &EntryMasking::None)
             .unwrap()
@@ -1381,11 +1375,10 @@ mod a_literal_can_be_replaced_by_its_surrogate {
         );
     }
 
-    /// ⛔⛔ THE VERSION GATE IS THE WHOLE DIFFICULTY, and a plain token scan misses it.
+    /// THE VERSION GATE IS THE WHOLE DIFFICULTY.
     ///
-    /// `sqlparser` files `/*!40101 ... */` as one comment; MySQL executes it. A scan that does
-    /// not open the gate answers `false` on a statement that sets a value, which on
-    /// `slow-test-queries.log` is eight statements' worth of difference.
+    /// MySQL executes `/*!40101 ... */`. A scan that read the gate as a comment would answer
+    /// `false` on a statement that sets a value.
     #[test]
     fn a_value_inside_a_version_gate_is_still_a_value() {
         assert_eq!(
@@ -1396,7 +1389,7 @@ mod a_literal_can_be_replaced_by_its_surrogate {
             carries_a_value("/*!40014 SET UNIQUE_CHECKS=0 */;"),
             Some(true)
         );
-        // ⭐ And the same gate with nothing in it stays false, so the recursion is not a
+        // And a gate with no value in it stays false, so reading inside a gate is not a
         // blanket `true` on every gated statement.
         assert_eq!(
             carries_a_value("/*!40101 SET character_set_client = utf8 */;"),
@@ -1404,8 +1397,7 @@ mod a_literal_can_be_replaced_by_its_surrogate {
         );
     }
 
-    /// ⭐ The statements this grammar refuses and that carry nothing -- which on the shipped
-    /// corpus is 122 of 131, and is why withholding them all would be withholding for nothing.
+    /// Statements this grammar refuses and that carry nothing.
     #[test]
     fn a_statement_with_no_value_carries_none() {
         for sql in [
@@ -1424,9 +1416,9 @@ mod a_literal_can_be_replaced_by_its_surrogate {
         }
     }
 
-    /// ⚠️ AND A VALUE WRITTEN AS AN IDENTIFIER IS INVISIBLE, which is stated rather than
-    /// implied. `DEFINER=`msandbox`@`%`` is a username and a host, and no scan for literals can
-    /// see them -- three of the shipped log's unparseable statements carry exactly that.
+    /// AND A VALUE WRITTEN AS AN IDENTIFIER IS INVISIBLE, which is stated rather than
+    /// implied. ``DEFINER=`msandbox`@`%` `` is a username and a host, and no scan for literals
+    /// can see them.
     #[test]
     fn a_value_written_as_an_identifier_is_not_seen() {
         assert_eq!(
@@ -1440,11 +1432,11 @@ mod a_literal_can_be_replaced_by_its_surrogate {
     }
 }
 
-/// ⭐⭐⭐ THE DOMAIN A VALUE LIVES IN, WHICH THE RECORD THREW AWAY ON EVERY LITERAL.
+/// THE DOMAIN A VALUE LIVES IN.
 ///
-/// `WHERE tenant_id = 42` filed `42` and lost `tenant_id`, so `42` the tenant and `42` the row
-/// limit sat in one pool with nothing separating them. A value means nothing outside a domain,
-/// and for a lock the domain is a column of a relation.
+/// Without `tenant_id`, `42` the tenant and `42` the row limit sit in one pool with nothing
+/// separating them. A value means nothing outside a domain, and for a lock the domain is a
+/// column of a relation.
 #[cfg(test)]
 mod every_literal_binding {
     use super::*;
@@ -1476,19 +1468,19 @@ mod every_literal_binding {
             .collect()
     }
 
-    /// ⭐ Every syntactic shape that names the column a value is **sought** in.
+    /// Every syntactic shape that names the column a value is **sought** in.
     #[test]
     fn a_literal_carries_the_column_the_author_looked_for_it_in() {
         assert_eq!(
             bound("SELECT id FROM t WHERE tenant_id = 42", &EntryMasking::None),
             [("42".into(), "tenant_id".into(), true)]
         );
-        // ⭐ Written either way round: a predicate is a comparison, not an assignment.
+        // Written either way round: a predicate is a comparison, not an assignment.
         assert_eq!(
             bound("SELECT id FROM t WHERE 42 = tenant_id", &EntryMasking::None),
             [("42".into(), "tenant_id".into(), true)]
         );
-        // ⭐ The qualifier the author wrote, which is an alias far more often than a table.
+        // The qualifier the author wrote, which is an alias far more often than a table.
         assert_eq!(
             bound(
                 "SELECT id FROM t e1 WHERE e1.dept_id = 4",
@@ -1496,7 +1488,7 @@ mod every_literal_binding {
             ),
             [("4".into(), "e1.dept_id".into(), true)]
         );
-        // ⭐ An `IN` list: every member is sought in the same column.
+        // An `IN` list: every member is sought in the same column.
         assert_eq!(
             bound(
                 "SELECT id FROM t WHERE id IN (1, 2, 3)",
@@ -1508,7 +1500,7 @@ mod every_literal_binding {
                 ("3".into(), "id".into(), true)
             ]
         );
-        // ⭐⭐ A range, which is where InnoDB's next-key locking actually lives.
+        // A range, which is where InnoDB's next-key locking actually lives.
         assert_eq!(
             bound(
                 "SELECT id FROM t WHERE id BETWEEN 5 AND 9",
@@ -1521,16 +1513,13 @@ mod every_literal_binding {
         );
     }
 
-    /// ⛔⛔ ARITHMETIC IS NOT A KEY LOOKUP, AND THE FIXTURE HAS NINE OF THEM.
+    /// ARITHMETIC IS NOT A KEY LOOKUP.
     ///
     /// `Expr::BinaryOp` covers `+` as well as `=`. A rule taking any binary operator binds the
     /// `1` in `qty - 1` to `qty` and files a computation as a row the statement went for.
-    /// Measured on `structure.log`: **116 bound under the comparison rule against 125 under the
-    /// naive one** — `total + 5`, `n + 1` twice, `n + 2` twice, `qty - 1`, `qty - 2`,
-    /// `price + 1`, and one more.
     #[test]
     fn arithmetic_is_not_a_key_lookup() {
-        // ⚠️ Neither literal is bound: `1` sits under `-`, and `0`'s other side is a
+        // Neither literal is bound: `1` sits under `-`, and `0`'s other side is a
         // computation rather than a column.
         assert_eq!(
             bound("SELECT id FROM t WHERE qty - 1 > 0", &EntryMasking::None),
@@ -1539,7 +1528,7 @@ mod every_literal_binding {
                 ("0".into(), "-".into(), false)
             ]
         );
-        // ⭐ And the same column with a comparison **is** bound, so the rule is about the
+        // And the same column with a comparison **is** bound, so the rule is about the
         // operator and not about the shape.
         assert_eq!(
             bound("SELECT id FROM t WHERE qty > 0", &EntryMasking::None),
@@ -1547,7 +1536,7 @@ mod every_literal_binding {
         );
     }
 
-    /// ⛔ A VALUE SOUGHT AND A VALUE WRITTEN ARE DIFFERENT CLAIMS, and one statement makes both.
+    /// A VALUE SOUGHT AND A VALUE WRITTEN ARE DIFFERENT CLAIMS, and one statement makes both.
     ///
     /// A lock taken to find a row and a lock taken to change one are different locks, so the
     /// column alone would fuse them.
@@ -1562,7 +1551,7 @@ mod every_literal_binding {
         );
     }
 
-    /// ⛔⛔ ONE PAYLOAD WRITTEN TO TWO COLUMNS, which is what rules out matching on the payload.
+    /// ONE PAYLOAD WRITTEN TO TWO COLUMNS, which is what rules out matching on the payload.
     ///
     /// `Assignment` and an insert column list are not expressions, so the binding is taken by
     /// the value's **address** in `pre_visit_statement`. A queue keyed on `5` would hand both
@@ -1578,12 +1567,11 @@ mod every_literal_binding {
         );
     }
 
-    /// ⭐⭐ THE SHIPPED CORPUS SEEKS NOTHING, which a predicate-only rule would have read as
-    /// silence.
+    /// AN INSERT NAMES A DOMAIN WHERE NO PREDICATE DOES, which a predicate-only rule would read
+    /// as silence.
     ///
-    /// `slow-test-queries.log` is a sandbox startup and a `mysqldump` restore: **0 of its 302
-    /// literals sit in a predicate** and all 50 of its bound ones are insert columns. A corpus
-    /// that only ever wrote is a different thing from a corpus with no domains in it.
+    /// A `mysqldump` restore seeks nothing and writes everything. A log that only ever wrote is
+    /// a different thing from a log with no domains in it.
     #[test]
     fn an_insert_names_a_domain_even_where_no_predicate_does() {
         assert_eq!(
@@ -1598,7 +1586,7 @@ mod every_literal_binding {
         );
     }
 
-    /// ⭐ MASKING MOVES THE RENDER AND NOT THE DOMAIN.
+    /// MASKING MOVES THE RENDER AND NOT THE DOMAIN.
     ///
     /// The binding is read in `pre_visit_statement` and `pre_visit_expr`, both of which run
     /// before the value beneath is replaced. A binding computed afterwards would see `?` on
@@ -1613,9 +1601,9 @@ mod every_literal_binding {
             masked.iter().map(|(_, c, s)| (c, s)).collect::<Vec<_>>(),
             "the domain is the author's and masking is the reader's"
         );
-        // ⚠️ `rendered` stays the author's under both settings -- it is a column of THEIR
-        // document, which is the whole point of filing literals through masking. What masking
-        // moves is the statement, so that is where the placeholder is checked.
+        // `rendered` stays the author's under both settings, which is the whole point of
+        // filing literals through masking. What masking moves is the statement, so that is
+        // where the placeholder is checked.
         assert!(
             plain.iter().all(|(r, _, _)| r != "?"),
             "the author's spelling is recorded either way: {plain:?}"
@@ -1641,15 +1629,11 @@ mod tests {
     use std::collections::HashMap;
     use winnow_datetime::{Date, DateTime, Offset, Time};
 
-    /// ⭐⭐ THE MICROSECONDS A SLOW LOG WRITES NOW REACH THE CONSUMER.
+    /// THE MICROSECONDS A SLOW LOG WRITES ARE KEPT.
     ///
-    /// `# Time:` carries six fractional digits and `winnow_datetime::Time` held three, scaled
-    /// to milliseconds, so `.015898` arrived as `15` and everything below a millisecond was
-    /// gone before any consumer saw it. On `assets/slow-test-queries.log` that collapsed 310
-    /// distinct instants onto 80 -- and a downstream writer that truncated further took it to
-    /// 4.
-    ///
-    /// Requires winnow_datetime 0.4. This is the assertion the whole dependency bump is for.
+    /// `# Time:` carries six fractional digits, and a `Time` that held milliseconds would
+    /// read `.015898` as `15` and fold instants a microsecond apart onto one. Requires
+    /// winnow_datetime 0.4, whose `Time` carries nanoseconds.
     #[test]
     fn a_time_line_keeps_its_microseconds() {
         let mut i = Stream::new("# Time: 2018-02-05T02:46:43.015898Z".as_bytes());
@@ -2002,16 +1986,12 @@ Time                 Id Command    Argument\n";
     }
 }
 
-/// ⛔⛔ MASKING USED TO DESTROY STATEMENTS, AND THE CONSUMER'S DEFAULT WAS TO MASK.
+/// MASKING MUST NOT DESTROY STATEMENTS.
 ///
-/// `mask_tokens` runs before the parser, and a tokenizer cannot tell a value from a number the
-/// grammar requires. So `CHAR(60)` became `CHAR(?)` and the whole `CREATE TABLE` stopped
-/// parsing -- not misparsed, *refused*, and filed as an unparseable statement with its raw bytes
-/// as its SQL. On `assets/slow-test-queries.log` that was **35 of 163 parses**.
-///
-/// ⭐ Nothing counted it, because nothing ever recorded the parse population under both settings
-/// at once. It surfaced from the consumer side, where a fold reported 163 members unmasked and
-/// 128 masked over the same file.
+/// A tokenizer cannot tell a value from a number the grammar requires, so masking tokens before
+/// the parse turns `CHAR(60)` into `CHAR(?)` and the whole `CREATE TABLE` is refused -- filed as
+/// an unparseable statement with its raw bytes as its SQL. Masking the tree after the parse
+/// cannot do that.
 #[cfg(test)]
 mod masking_is_not_destructive {
     use crate::EntryMasking::{None as NoMask, PlaceHolder};
@@ -2034,7 +2014,7 @@ mod masking_is_not_destructive {
         }
     }
 
-    /// ⭐ And a value still masks, or the flag would be doing nothing.
+    /// And a value still masks, or the flag would be doing nothing.
     #[test]
     fn a_value_is_still_replaced() {
         let one = parse_sql("SELECT * FROM t WHERE id = 1 AND name = 'a'", &PlaceHolder).unwrap();
@@ -2042,14 +2022,14 @@ mod masking_is_not_destructive {
         assert_eq!(one.0[0].to_string(), two.0[0].to_string());
         assert!(one.0[0].to_string().contains('?'), "{}", one.0[0]);
 
-        // ⛔ NOT VACUOUS: unmasked, the same two statements differ. A masker that replaced
+        // NOT VACUOUS: unmasked, the same two statements differ. A masker that replaced
         // nothing would pass the first assertion on two identical inputs.
         let a = parse_sql("SELECT * FROM t WHERE id = 1", &NoMask).unwrap();
         let b = parse_sql("SELECT * FROM t WHERE id = 2", &NoMask).unwrap();
         assert_ne!(a.0[0].to_string(), b.0[0].to_string());
     }
 
-    /// ⚠️ Masking must not change WHICH statements parse at all, in either direction.
+    /// Masking must not change WHICH statements parse at all, in either direction.
     #[test]
     fn masking_changes_no_statements_parseability() {
         for sql in [
@@ -2068,7 +2048,7 @@ mod masking_is_not_destructive {
     }
 }
 
-/// ⭐⭐ THE AUTHOR'S SUBJECT SURVIVES MASKING, AND THE MASK STAYS A MASK.
+/// THE AUTHOR'S SUBJECT SURVIVES MASKING, AND THE MASK STAYS A MASK.
 #[cfg(test)]
 mod the_author_keeps_their_literals {
     use crate::EntryMasking::{None as NoMask, PlaceHolder};
@@ -2084,9 +2064,8 @@ mod the_author_keeps_their_literals {
         )
     }
 
-    /// ⭐ The literals come back whether or not the statement is masked, so a reader can group on
-    /// the mask and still ask which subject. Before this they existed only inside the AST, which
-    /// masking then overwrote.
+    /// The literals come back whether or not the statement is masked, so a reader can group on
+    /// the mask and still ask which subject.
     #[test]
     fn the_literals_are_recorded_under_either_masking() {
         let sql = "SELECT * FROM t WHERE tenant_id = 42 AND status = 'open' LIMIT 10";
@@ -2105,9 +2084,9 @@ mod the_author_keeps_their_literals {
         assert_eq!(masked.matches('?').count(), 3, "{masked}");
     }
 
-    /// ⛔ THE GAP THE OLD `Expr::Value` PASS HAD. `DATE '2020-01-01'` is an `Expr::TypedString`
-    /// and MySQL's `AGAINST ('term')` is an `Expr::MatchAgainst`; each holds a `Value` without
-    /// being one, so an `Expr`-shaped pass neither masked them nor could have recorded them.
+    /// A VALUE THAT IS NOT AN `Expr::Value`. `DATE '2020-01-01'` is an `Expr::TypedString` and
+    /// MySQL's `AGAINST ('term')` is an `Expr::MatchAgainst`; each holds a `Value` without being
+    /// one, so an `Expr`-shaped pass would neither mask nor record them.
     #[test]
     fn a_value_that_is_not_an_expr_value_is_still_the_authors() {
         for (sql, expected) in [
@@ -2130,10 +2109,10 @@ mod the_author_keeps_their_literals {
         }
     }
 
-    /// ⛔⛔ A MASKED STATEMENT MUST STILL BE SQL. `pre_visit_value` reaches every `Value` in the
+    /// A MASKED STATEMENT MUST STILL BE SQL. `pre_visit_value` reaches every `Value` in the
     /// tree, including a few that are grammar rather than subject -- a `CEIL(x TO 2)` scale, a
     /// `TABLESAMPLE` seed. Masking after the parse cannot break the parse the way masking tokens
-    /// did, but it can render something that will not parse again, and a digest nobody can
+    /// does, but it can render something that will not parse again, and a digest nobody can
     /// re-read is not a digest.
     #[test]
     fn a_masked_statement_still_parses() {
@@ -2153,11 +2132,11 @@ mod the_author_keeps_their_literals {
         }
     }
 
-    /// ⭐⭐ THE ROUND TRIP, which is what makes the record a record rather than a note. Writing
+    /// THE ROUND TRIP, which is what makes the record a record rather than a note. Writing
     /// the filed literals back into the masked statement in the order they were taken must
     /// reproduce exactly what the author wrote.
     ///
-    /// ⛔ The order is why ONE pass does both jobs. `visit_expressions` is pre-order and
+    /// The order is why ONE pass does both jobs. `visit_expressions` is pre-order and
     /// `visit_expressions_mut` is post-order, so a collector and a masker on those two hooks
     /// would disagree on every nested expression and nothing about the result would look wrong.
     #[test]
@@ -2208,29 +2187,28 @@ mod the_author_keeps_their_literals {
                 LiteralKind::HexString
             ]
         );
-        // ⭐ The payload is the value WITHOUT its quoting, which is what a reader groups by.
+        // The payload is the value WITHOUT its quoting, which is what a reader groups by.
         assert_eq!(String::from_utf8_lossy(&ls[1].value), "x");
         assert_eq!(String::from_utf8_lossy(&ls[1].rendered), "'x'");
     }
 }
 
-/// ⛔⛔⛔ SQL QUOTING DOES NOT NEST, AND THE STATEMENT SCANNER TREATED IT AS A STACK.
+/// SQL QUOTING DOES NOT NEST.
 ///
-/// The failure is not a mis-parse. A statement whose terminator is never found consumes the
-/// rest of the buffer, the decoder answers `Incomplete` forever, and at EOF the file reports
-/// `bytes remaining on stream` — which the analyzer files as `Coverage::Truncated`. **One
-/// apostrophe in one double-quoted string ends the log there**, and every entry after it is
-/// gone from every artifact with nothing but the coverage flag to say so.
+/// Reading it as a stack fails without a mis-parse. A statement whose terminator is never found
+/// consumes the rest of the buffer, the decoder answers `Incomplete` forever, and at EOF the
+/// file reports `bytes remaining on stream`: **one apostrophe in one double-quoted string ends
+/// the log there**, and every entry after it is gone.
 #[cfg(test)]
 mod quoting_does_not_nest {
     use crate::parser::statement_end;
 
-    /// The rule, against the cases the stack got wrong and the ones it got right by luck.
+    /// The rule, against the cases a stack gets wrong and the ones it gets right by luck.
     #[test]
     fn a_quote_of_one_kind_inside_another_is_not_a_quote() {
-        // ⛔ The four the stack could not terminate. Under it, `"` pushed, `'` pushed because
-        // it did not match the top, and the closing `"` pushed again — never empty, never a
-        // terminator, and the scan ran off the end of the file.
+        // Four a stack cannot terminate. Under it, `"` pushes, `'` pushes because it does not
+        // match the top, and the closing `"` pushes again — never empty, never a terminator,
+        // and the scan runs off the end of the file.
         for s in [
             r#"SELECT * FROM t WHERE note = "it's here";"#,
             r#"SELECT 'it"s';"#,
@@ -2244,10 +2222,10 @@ mod quoting_does_not_nest {
             );
         }
 
-        // ⚠️ AND THE ONES THAT PASSED BEFORE STILL PASS, INCLUDING THE ONE THAT PASSED FOR THE
-        // WRONG REASON. `'say "hi"'` terminated under the stack because its inner quotes are
-        // **balanced** — two pushes and two pops landing empty — which is why a fixture full of
-        // well-formed strings witnesses nothing.
+        // AND THE ORDINARY SHAPES, INCLUDING ONE A STACK PASSES FOR THE WRONG REASON.
+        // `'say "hi"'` terminates under a stack because its inner quotes are **balanced** — two
+        // pushes and two pops landing empty — which is why a fixture full of well-formed strings
+        // witnesses nothing.
         for s in [
             r#"SELECT 'say "hi"';"#,
             r#"SELECT 'don''t';"#,
@@ -2260,8 +2238,8 @@ mod quoting_does_not_nest {
         }
     }
 
-    /// ⭐ A `;` inside a quote is not a terminator, which is the whole point of tracking quotes
-    /// at all — and the one thing the stack did get right for a single-kind string.
+    /// A `;` inside a quote is not a terminator, which is the whole point of tracking quotes
+    /// at all.
     #[test]
     fn a_semicolon_inside_a_quote_does_not_terminate() {
         let s = r#"SELECT 'a;b', "c;d", `e;f`; SELECT 2;"#;
@@ -2270,23 +2248,23 @@ mod quoting_does_not_nest {
         assert_eq!(&s[..end], r#"SELECT 'a;b', "c;d", `e;f`;"#);
     }
 
-    /// ⚠️ BACKSLASH ESCAPES INSIDE `'` AND `"` AND NOT INSIDE A BACKTICK, which is MySQL's own
-    /// rule rather than a simplification. ⛔ Under `NO_BACKSLASH_ESCAPES` the first two change
-    /// too — and this crate records `sql_mode` as `unmeasured` rather than assuming it, so the
-    /// default is a **reading** and is filed as one. See [`LiteralKind::DoubleQuotedString`].
+    /// BACKSLASH ESCAPES INSIDE `'` AND `"` AND NOT INSIDE A BACKTICK, which is MySQL's own
+    /// rule rather than a simplification. Under `NO_BACKSLASH_ESCAPES` the first two change
+    /// too, and a slow log does not record `sql_mode`, so the default is a **reading**. See
+    /// `LiteralKind::DoubleQuotedString`.
     #[test]
     fn the_escape_rule_is_the_servers_and_stops_at_a_backtick() {
         // The escaped quote does not close the string, so the terminator is the real one.
         let s = r#"SELECT 'a\'b;c';"#;
         assert_eq!(statement_end(s.as_bytes()), Some(s.len()));
 
-        // ⭐ A backslash before a backtick is a backslash. Escaping it would leave the
-        // identifier open and lose the rest of the file, which is the defect one kind over.
+        // A backslash before a backtick is a backslash. Escaping it would leave the
+        // identifier open and lose the rest of the file.
         let s = r#"SELECT `a\`, b FROM t;"#;
         assert_eq!(statement_end(s.as_bytes()), Some(s.len()));
     }
 
-    /// ⭐ `None` is *"not in the bytes I have"* and never *"not in the file"* — the decoder turns
+    /// `None` is *"not in the bytes I have"* and never *"not in the file"* — the decoder turns
     /// it into `Incomplete` and reads more. A scanner that answered `Some(len)` at the end of a
     /// partial buffer would file half a statement as a whole one.
     #[test]
