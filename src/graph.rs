@@ -40,11 +40,11 @@
 //!
 //! ## What the walker does not see
 //!
-//! The walk names the `Expr` forms it descends into and does nothing with the rest, so
-//! a subquery hidden inside a form not listed there is a relation this graph does not hold. That
-//! gap is checkable rather than latent: [`StatementGraph::nested_query_count`] counts the same
-//! subqueries by a second route — `sqlparser`'s own `visit_expressions` — and a test holds the two
-//! together.
+//! The walk names the clauses it reads, and inside each one finds every subquery with
+//! `sqlparser`'s own expression visitor, so no `Expr` form hides one. A subquery in a clause the
+//! walk does not name would be a relation this graph does not hold. That gap is checked rather
+//! than latent: the crate's tests count the same subqueries over the whole statement, by a route
+//! that names no clause, and hold the two counts together.
 
 use bytes::Bytes;
 use sqlparser::ast::{
@@ -53,7 +53,7 @@ use sqlparser::ast::{
     LockType, NonBlock, ObjectName, ObjectNamePart, ObjectType, OnInsert, OptimizerHintStyle,
     OrderByKind, Query, Select, SetExpr, ShowCreateObject, Statement, TableFactor,
     TableIndexHintForClause, TableIndexHintType, TableIndexType, TableObject, TableWithJoins,
-    UpdateTableFromKind, visit_expressions,
+    UpdateTableFromKind, Visit, Visitor, visit_expressions,
 };
 use std::ops::ControlFlow;
 
@@ -786,8 +786,8 @@ pub struct Stages {
     /// The scope carried a construct this grammar reaches and MySQL has no syntax for: `PREWHERE`,
     /// `QUALIFY`, `GROUP BY ALL`, a `GROUP BY` modifier other than `WITH ROLLUP`, `DISTINCT ON`,
     /// Hive's `SORT BY`/`CLUSTER BY`/`DISTRIBUTE BY`, `TOP`, `CONNECT BY`, `ORDER BY ALL`,
-    /// `NULLS FIRST`/`NULLS LAST`, `ORDER BY … USING`, or a `PIVOT`, `UNPIVOT` or
-    /// `MATCH_RECOGNIZE` in its `FROM`.
+    /// `NULLS FIRST`/`NULLS LAST`, `ORDER BY … USING`, a `PIVOT`, `UNPIVOT` or
+    /// `MATCH_RECOGNIZE` in its `FROM`, or an alias on a parenthesised join.
     ///
     /// One flag rather than one per construct, as with [`JoinOp::NotMySql`]: naming them would
     /// put cases that cannot occur in front of every caller. `true` is a diagnostic and not data.
@@ -1061,27 +1061,6 @@ impl StatementGraph {
     pub fn deepest(&self) -> u16 {
         self.scopes.iter().map(|s| s.depth).max().unwrap_or(0)
     }
-
-    /// Subqueries in expression position, counted by `sqlparser`'s own `visit_expressions`
-    /// rather than by this module's walk.
-    ///
-    /// This exists to be compared against the walk. The walk descends into a named list of
-    /// `Expr` forms and does nothing with the rest, so a subquery inside a form it does not name
-    /// would be silently absent. A count taken by a route that shares no code with the
-    /// walk turns that from an invisible omission into a failing test.
-    pub fn nested_query_count(statement: &Statement) -> usize {
-        let mut n = 0usize;
-        let _ = visit_expressions(statement, |e| {
-            if matches!(
-                e,
-                Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. }
-            ) {
-                n += 1;
-            }
-            ControlFlow::<()>::Continue(())
-        });
-        n
-    }
 }
 
 /// Nodes, edges and components of a [`StatementGraph`], and the cycle space they fix.
@@ -1347,6 +1326,7 @@ impl Builder {
             Statement::Insert(Insert {
                 table,
                 source,
+                assignments,
                 on,
                 partitioned,
                 optimizer_hints,
@@ -1375,12 +1355,12 @@ impl Builder {
                 if let Some(q) = source {
                     self.walk_query(q, scope);
                 }
-                // `ON DUPLICATE KEY UPDATE x = (SELECT …)` reads a relation that is not the
-                // insert target, in a clause nothing else here reaches.
+                // MySQL's `INSERT INTO t SET a = (SELECT …)` and `ON DUPLICATE KEY UPDATE
+                // x = (SELECT …)` read a relation that is not the insert target, in clauses
+                // nothing else here reaches.
+                self.walk_expr(assignments, scope);
                 if let Some(OnInsert::DuplicateKeyUpdate(assignments)) = on {
-                    for a in assignments {
-                        self.walk_expr(&a.value, scope);
-                    }
+                    self.walk_expr(assignments, scope);
                 }
             }
             Statement::Update(u) => {
@@ -1403,9 +1383,7 @@ impl Builder {
                 }
                 // `SET n = (SELECT … FROM other)` reads `other`. `objects()` sees it, because
                 // `Assignment.value` carries the `visit_relation` annotation.
-                for a in &u.assignments {
-                    self.walk_expr(&a.value, scope);
-                }
+                self.walk_expr(&u.assignments, scope);
                 // An `UPDATE`/`DELETE` `WHERE` is a filter stage with no `Select` at all, so
                 // it is recorded here or nowhere: a scope is not one `Select`.
                 if let Some(e) = selection {
@@ -1415,12 +1393,17 @@ impl Builder {
                     self.walk_expr(e, scope);
                     self.predicate_edges(e, scope, JoinOp::Predicate, ConstraintKind::On);
                 }
+                // MySQL's single-table `UPDATE … ORDER BY … LIMIT`.
+                self.walk_expr(&u.order_by, scope);
+                self.walk_expr(&u.limit, scope);
             }
             Statement::Delete(Delete {
                 tables,
                 from,
                 using,
                 selection,
+                order_by,
+                limit,
                 optimizer_hints,
                 ..
             }) => {
@@ -1462,6 +1445,9 @@ impl Builder {
                     self.walk_expr(e, scope);
                     self.predicate_edges(e, scope, JoinOp::Predicate, ConstraintKind::On);
                 }
+                // MySQL's single-table `DELETE … ORDER BY … LIMIT`.
+                self.walk_expr(order_by, scope);
+                self.walk_expr(limit, scope);
             }
             Statement::CreateView(cv) => {
                 let (name, query) = (&cv.name, &cv.query);
@@ -1603,6 +1589,8 @@ impl Builder {
                     self.push_occurrence(scope, Some(name), None, RelationRole::FlushTarget);
                 }
             }
+            // `SET @x = (SELECT MAX(id) FROM t)` names no relation of its own and reads `t`.
+            Statement::Set(set) => self.walk_expr(set, scope),
             // What is declined here, and why each is a decision rather than a gap:
             //
             // | statement | names | declined because |
@@ -1611,7 +1599,7 @@ impl Builder {
             // | `GRANT SELECT ON db.* TO …` | a privilege scope | `db.*` is a wildcard over a schema; the statement opens no table and takes no lock on one |
             // | `REVOKE … ON db.* FROM …` | the same | the same |
             // | `CREATE`/`DROP DATABASE db` | a schema | a relation graph has nowhere to put one |
-            // | `SET`, `KILL`, `FLUSH` with no table list, `SAVEPOINT`, `USE` | nothing | no relation is named at all |
+            // | `KILL`, `FLUSH` with no table list, `SAVEPOINT`, `USE` | nothing | no relation is named at all |
             //
             // The first four name something and the last names nothing, which are two different
             // reasons reaching one filing.
@@ -1633,7 +1621,6 @@ impl Builder {
         }
         // `ORDER BY` and `LIMIT` hang off the `Query` and not off the `Select`, so they are read
         // here and filed on the scope the query heads.
-        let mut ordered: Vec<Expr> = Vec::new();
         let st = &mut self.graph.scopes[scope as usize].stages;
         if let Some(o) = &query.order_by {
             match &o.kind {
@@ -1642,7 +1629,6 @@ impl Builder {
                     let (directions, not_mysql) = directions_of(terms);
                     st.sort_directions = directions;
                     st.not_mysql |= not_mysql;
-                    ordered = terms.iter().map(|t| t.expr.clone()).collect();
                 }
                 // `ORDER BY ALL` is not MySQL.
                 OrderByKind::All(_) => st.not_mysql = true,
@@ -1667,9 +1653,8 @@ impl Builder {
         self.walk_set_expr(&query.body, scope);
         // `ORDER BY (SELECT …)` sorts on a relation no `FROM` names. Walked after the body so
         // the scope is the one the body established.
-        for e in &ordered {
-            self.walk_expr(e, scope);
-        }
+        self.walk_expr(&query.order_by, scope);
+        self.walk_expr(&query.limit_clause, scope);
     }
 
     fn walk_set_expr(&mut self, body: &SetExpr, scope: u32) {
@@ -1807,11 +1792,15 @@ impl Builder {
                 &mut path,
             );
         }
+        // Clauses that hold expressions and write no split: a subquery there still reads a
+        // relation.
+        self.walk_expr(&select.group_by, scope);
+        self.walk_expr(&select.named_window, scope);
+        // A correlated subquery can sit inside a function call inside another function call in
+        // the projection, which is why the projection is walked at all.
+        self.walk_expr(&select.projection, scope);
         for item in &select.projection {
-            // A correlated subquery can sit inside a function call inside another function call
-            // in the projection, which is why the projection is walked at all.
             for e in select_item_exprs(item) {
-                self.walk_expr(e, scope);
                 let mut path = Vec::new();
                 self.walk_condition(
                     e,
@@ -1865,8 +1854,10 @@ impl Builder {
                     None => Vec::new(),
                 };
                 // The `ON` condition's splits, with no edges: the pair is drawn below from the
-                // `FROM` structure, so walking for edges here would draw each one twice.
+                // `FROM` structure, so walking for edges here would draw each one twice. Its
+                // subqueries are walked first, so a split comparing against one names its scope.
                 if let Some(e) = constraint_expr(&j.join_operator) {
+                    self.walk_expr(e, scope);
                     let mut path = Vec::new();
                     self.walk_condition(
                         e,
@@ -1984,24 +1975,31 @@ impl Builder {
                 self.walk_query(subquery, inner);
                 occ
             }
+            // `(a JOIN b ON …)` groups relations and is not one: it adds no node, its first
+            // relation takes the role the group holds, and it stands for the group wherever the
+            // enclosing join needs one relation — the right side a split names as its join, and
+            // the fallback end of an edge.
             TableFactor::NestedJoin {
                 table_with_joins,
                 alias,
             } => {
-                let a = alias.as_ref().map(|a| ident_bytes(&a.name));
-                let occ = self.push_occurrence(scope, None, a, role);
-                let ids = self.collect_from(
-                    std::slice::from_ref(table_with_joins),
-                    scope,
-                    RelationRole::From,
-                );
-                self.join_edges(std::slice::from_ref(table_with_joins), scope, &ids);
-                occ
+                // MySQL gives a parenthesised join no alias, so one is the diagnostic arm.
+                if alias.is_some() {
+                    self.graph.scopes[scope as usize].stages.not_mysql = true;
+                }
+                let group = std::slice::from_ref(table_with_joins.as_ref());
+                let ids = self.collect_from(group, scope, role);
+                self.join_edges(group, scope, &ids);
+                ids[0][0]
             }
-            TableFactor::Function { name, alias, .. } => {
+            TableFactor::Function {
+                name, alias, args, ..
+            } => {
                 // Also unannotated, so also absent from `objects()`.
                 let a = alias.as_ref().map(|a| ident_bytes(&a.name));
-                self.push_occurrence(scope, Some(name), a, role)
+                let occ = self.push_occurrence(scope, Some(name), a, role);
+                self.walk_expr(args, scope);
+                occ
             }
             // `PIVOT`, `UNPIVOT` and `MATCH_RECOGNIZE` are other dialects'; MySQL writes
             // conditional aggregation instead. Each wraps a base table, so the relation is kept --
@@ -2014,98 +2012,63 @@ impl Builder {
                 self.graph.scopes[scope as usize].stages.not_mysql = true;
                 self.walk_table_factor(table, scope, role)
             }
+            // `JSON_TABLE(expr, …)` and the other table functions: a relation with no written
+            // name, whose argument may itself be a subquery.
             other => {
                 let a = table_factor_alias(other);
-                self.push_occurrence(scope, None, a, role)
+                let occ = self.push_occurrence(scope, None, a, role);
+                self.walk_expr(other, scope);
+                occ
             }
         }
     }
 
-    /// Descends into an expression looking for subqueries.
+    /// Walks every subquery a node holds in expression position, each into a scope of its own
+    /// under `scope`.
     ///
-    /// The forms named here are the ones this walk descends into. Anything else is a leaf as far
-    /// as this module is concerned, and [`StatementGraph::nested_query_count`] is the second route
-    /// that makes such an omission fail a test rather than pass quietly.
-    fn walk_expr(&mut self, expr: &Expr, scope: u32) {
-        match expr {
-            Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => {
-                let inner = self.push_scope(Some(scope), ScopeKind::Subquery, None, false);
-                self.note_subquery_scope(expr, inner);
-                self.walk_query(q, inner);
-            }
-            outer @ Expr::InSubquery { expr, subquery, .. } => {
-                // `InSubquery.subquery` is a `Query`, so it carries a `with` clause and
-                // `IN (WITH … SELECT …)` reaches the CTE walk as `EXISTS` and a scalar subquery
-                // do. All three go through `walk_query` for that reason.
-                self.walk_expr(expr, scope);
-                let inner = self.push_scope(Some(scope), ScopeKind::Subquery, None, false);
-                self.note_subquery_scope(outer, inner);
-                self.walk_query(subquery, inner);
-            }
-            Expr::BinaryOp { left, right, .. } => {
-                self.walk_expr(left, scope);
-                self.walk_expr(right, scope);
-            }
-            // `> ANY (SELECT …)` and `> ALL (SELECT …)` hold their subquery on the right. Without
-            // this the walk never descends, so the relation they read reaches no artifact and the
-            // split that names them carries a subquery operand with no scope.
-            Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
-                self.walk_expr(left, scope);
-                self.walk_expr(right, scope);
-            }
-            Expr::UnaryOp { expr, .. }
-            | Expr::Nested(expr)
-            | Expr::IsNull(expr)
-            | Expr::IsNotNull(expr)
-            | Expr::IsTrue(expr)
-            | Expr::IsNotTrue(expr)
-            | Expr::IsFalse(expr)
-            | Expr::IsNotFalse(expr)
-            | Expr::Cast { expr, .. }
-            | Expr::Collate { expr, .. } => self.walk_expr(expr, scope),
-            Expr::Between {
-                expr, low, high, ..
-            } => {
-                for e in [expr, low, high] {
-                    self.walk_expr(e, scope);
-                }
-            }
-            Expr::InList { expr, list, .. } => {
-                self.walk_expr(expr, scope);
-                for e in list {
-                    self.walk_expr(e, scope);
-                }
-            }
-            Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-                self.walk_expr(expr, scope);
-                self.walk_expr(pattern, scope);
-            }
-            Expr::Case {
-                operand,
-                conditions,
-                else_result,
-                ..
-            } => {
-                for e in operand.iter().chain(else_result.iter()) {
-                    self.walk_expr(e, scope);
-                }
-                for w in conditions {
-                    self.walk_expr(&w.condition, scope);
-                    self.walk_expr(&w.result, scope);
-                }
-            }
-            Expr::Function(f) => {
-                for e in function_arg_exprs(f) {
-                    self.walk_expr(e, scope);
-                }
-            }
-            Expr::Tuple(es) => {
-                for e in es {
-                    self.walk_expr(e, scope);
-                }
-            }
-            _ => {}
+    /// Found by `sqlparser`'s own expression visitor rather than by naming the `Expr` forms that
+    /// can hold one, so no form hides a subquery: `SUBSTRING((SELECT …), 1)`,
+    /// `INTERVAL (SELECT …) DAY` and a window's `ORDER BY` are reached by the rule that reaches
+    /// `WHERE x IN (SELECT …)`. A subquery nested inside another is left for the inner one's walk,
+    /// which reaches it from that scope.
+    fn walk_expr(&mut self, node: &impl Visit, scope: u32) {
+        struct Finder<'b> {
+            builder: &'b mut Builder,
+            scope: u32,
+            depth: usize,
         }
+        impl Visitor for Finder<'_> {
+            type Break = ();
+            fn pre_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+                self.depth += 1;
+                ControlFlow::Continue(())
+            }
+            fn post_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+                self.depth -= 1;
+                ControlFlow::Continue(())
+            }
+            // On the way out, so the operand of `(SELECT …) IN (SELECT …)` opens its scope
+            // before the subquery it is compared with, in written order.
+            fn post_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+                if self.depth == 0
+                    && let Expr::Subquery(q)
+                    | Expr::Exists { subquery: q, .. }
+                    | Expr::InSubquery { subquery: q, .. } = expr
+                {
+                    let inner =
+                        self.builder
+                            .push_scope(Some(self.scope), ScopeKind::Subquery, None, false);
+                    self.builder.note_subquery_scope(expr, inner);
+                    self.builder.walk_query(q, inner);
+                }
+                ControlFlow::Continue(())
+            }
+        }
+        let _ = node.visit(&mut Finder {
+            builder: self,
+            scope,
+            depth: 0,
+        });
     }
 
     /// Draws edges between the occurrences a predicate names on either side of a comparison.
@@ -2867,6 +2830,7 @@ fn split_name(n: &ObjectName) -> (Option<Bytes>, Option<Bytes>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlparser::ast::{visit_expressions, visit_relations};
     use sqlparser::dialect::MySqlDialect;
     use sqlparser::parser::Parser;
 
@@ -4531,10 +4495,27 @@ mod tests {
         assert_eq!(g.measures().nodes, 3);
     }
 
-    /// THE GUARD ON THIS MODULE'S OWN BLIND SPOT. [`Builder::walk_expr`] descends into a named
-    /// list of `Expr` forms; a subquery inside a form it does not name would simply be missing,
-    /// and nothing about the resulting graph would look wrong. This counts the same subqueries
-    /// through `sqlparser`'s own `visit_expressions`, which shares no code with the walk.
+    /// Subqueries in expression position anywhere in the statement, counted by `sqlparser`'s own
+    /// `visit_expressions`, which names no clause.
+    fn nested_query_count(statement: &Statement) -> usize {
+        let mut n = 0usize;
+        let _ = visit_expressions(statement, |e| {
+            if matches!(
+                e,
+                Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. }
+            ) {
+                n += 1;
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        n
+    }
+
+    /// THE GUARD ON THIS MODULE'S OWN BLIND SPOT. The walk reads the clauses it names, and a
+    /// subquery in a clause it does not name would simply be missing, with nothing about the
+    /// resulting graph looking wrong. This counts the same subqueries over the whole statement by
+    /// a route that names no clause, and holds every relation `visit_relations` finds — which is
+    /// what `objects()` reads — to an occurrence in the graph.
     #[test]
     fn the_two_routes_to_a_subquery_agree() {
         let cases = [
@@ -4547,6 +4528,23 @@ mod tests {
             "SELECT * FROM a WHERE NOT (id IN (SELECT id FROM b))",
             "SELECT a.actor_id, GROUP_CONCAT(CONCAT(c.name, (SELECT t FROM f))) \
              FROM actor a JOIN category c ON a.id = c.id",
+            // The positions and forms a list of named `Expr` arms missed.
+            "SELECT * FROM a LEFT JOIN b ON b.id = (SELECT MAX(id) FROM c WHERE c.a_id = a.id)",
+            "SELECT SUBSTRING((SELECT name FROM b LIMIT 1), 1, 2) FROM a",
+            "SELECT CONVERT((SELECT name FROM b LIMIT 1), CHAR) FROM a",
+            "SELECT TRIM((SELECT name FROM b LIMIT 1)) FROM a",
+            "SELECT d + INTERVAL (SELECT MAX(n) FROM b) DAY FROM a",
+            "SELECT x FROM a GROUP BY (SELECT MAX(id) FROM b)",
+            "SELECT SUM(x) OVER (ORDER BY (SELECT MAX(id) FROM b)) FROM a",
+            "SELECT SUM(x) OVER w FROM a WINDOW w AS (ORDER BY (SELECT MAX(id) FROM b))",
+            "DELETE FROM a ORDER BY (SELECT MAX(id) FROM b) LIMIT 1",
+            "UPDATE a SET x = 1 ORDER BY (SELECT MAX(id) FROM b) LIMIT 1",
+            "INSERT INTO a SET x = (SELECT MAX(id) FROM b)",
+            "SET @x = (SELECT MAX(id) FROM b)",
+            "SELECT * FROM JSON_TABLE((SELECT doc FROM b LIMIT 1), '$[*]' \
+             COLUMNS (x INT PATH '$')) AS jt",
+            "SELECT * FROM a WHERE (SELECT x FROM b) IN (SELECT y FROM c)",
+            "SELECT * FROM a WHERE x = ((SELECT MAX(y) FROM b))",
         ];
         for sql in cases {
             let s = one(sql);
@@ -4558,9 +4556,17 @@ mod tests {
                 .count();
             assert_eq!(
                 walked,
-                StatementGraph::nested_query_count(&s),
+                nested_query_count(&s),
                 "the walk and visit_expressions disagree on: {sql}"
             );
+            let _ = visit_relations(&s, |r| {
+                let name = split_name(r).1;
+                assert!(
+                    g.occurrences.iter().any(|o| o.object_name == name),
+                    "{sql}: {name:?} is a relation the graph does not hold"
+                );
+                ControlFlow::<()>::Continue(())
+            });
         }
     }
 
@@ -4810,5 +4816,65 @@ mod tests {
         let g = graph("SELECT 1 FROM shop.a JOIN other.b ON shop.a.id = other.b.id");
         assert_eq!(g.edges.len(), 1);
         assert_eq!((g.edges[0].lhs, g.edges[0].rhs), (0, 1));
+    }
+
+    /// PARENTHESES GROUP RELATIONS AND ARE NOT ONE. A node for the group would stand for a
+    /// relation nobody named, and since nothing joins to it by name it splits a connected join
+    /// into two components.
+    #[test]
+    fn a_parenthesised_join_adds_no_node() {
+        for sql in [
+            "SELECT * FROM (a JOIN b ON a.id = b.id) JOIN c ON c.id = a.id",
+            "SELECT * FROM a JOIN (b JOIN c ON b.id = c.id) ON a.id = b.id",
+            "SELECT * FROM (a JOIN b ON a.id = b.id) LEFT JOIN c USING (id)",
+        ] {
+            let g = graph(sql);
+            assert_eq!(ids(&g), vec!["a", "b", "c"], "{sql}");
+            let m = g.measures();
+            assert_eq!(
+                (m.nodes, m.edges, m.components, m.cycle_space),
+                (3, 2, 1, 0),
+                "{sql}: {:?}",
+                g.edges
+            );
+            assert!(!g.scopes[0].stages.not_mysql, "{sql}");
+        }
+        // The group's first relation takes the role the group holds.
+        let g = graph("SELECT * FROM a JOIN (b JOIN c ON b.id = c.id) ON a.id = b.id");
+        let roles: Vec<RelationRole> = g.occurrences.iter().map(|o| o.role).collect();
+        assert_eq!(
+            roles,
+            vec![RelationRole::From, RelationRole::Join, RelationRole::Join]
+        );
+        // MySQL gives the group no alias, so one is the grammar's and lands on the diagnostic arm.
+        let g = graph("SELECT * FROM (a JOIN b ON a.id = b.id) AS x");
+        assert_eq!(ids(&g), vec!["a", "b"]);
+        assert!(g.scopes[0].stages.not_mysql);
+    }
+
+    /// A SUBQUERY IN A JOIN'S `ON` IS AN OPERAND LIKE ANY OTHER: the relation it reads is in the
+    /// graph, the split comparing against it names its scope, and its correlation reaches back to
+    /// the relation it names outside.
+    #[test]
+    fn a_subquery_in_an_on_clause_is_walked() {
+        let g = graph(
+            "SELECT * FROM a LEFT JOIN b ON b.id = (SELECT MAX(id) FROM c WHERE c.a_id = a.id)",
+        );
+        assert_eq!(ids(&g), vec!["a", "b", "c"]);
+        let on = g
+            .predicates
+            .iter()
+            .find(|p| p.clause == Clause::On)
+            .unwrap();
+        assert_eq!(on.op, PredicateOp::Scalar);
+        let inner = on.rhs_scope.expect("the split names the subquery's scope");
+        assert_eq!(g.occurrences[2].scope, inner);
+        assert!(
+            g.edges
+                .iter()
+                .any(|e| e.crosses_scope && (e.lhs, e.rhs) == (2, 0)),
+            "{:?}",
+            g.edges
+        );
     }
 }
