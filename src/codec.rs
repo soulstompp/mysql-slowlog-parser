@@ -579,8 +579,8 @@ impl Decoder for EntryCodec {
     /// Each line of an entry is committed as it is read, so a partial entry resumes at the line
     /// it stopped on rather than being re-read from its start.
     ///
-    /// There is no length limit: a statement with no terminating `;` is buffered until one
-    /// arrives or the input ends.
+    /// There is no length limit: a statement is buffered until the `;` that ends it and the
+    /// start of the next entry arrive, or the input ends.
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if src.is_empty() {
             return Ok(None);
@@ -657,7 +657,7 @@ mod tests {
 use mysql;
 SET timestamp=1517798807;
 {}
-{},
+{}
 ",
             time, sql_comment, sql
         );
@@ -1287,8 +1287,8 @@ mod the_author_and_the_reader {
 /// mis-framed first entry would take down with it, and each read in every chunk size.
 #[cfg(test)]
 mod every_shape_a_server_writes {
-    use crate::Entry;
     use crate::codec::{CodecError, EntryCodec};
+    use crate::{Entry, EntryStatement};
     use bytes::{Bytes, BytesMut};
     use tokio_util::codec::Decoder;
     use winnow_datetime::Date;
@@ -1359,6 +1359,59 @@ Time                 Id Command    Argument
         assert_eq!(second.sql_raw.as_deref(), Some(&b"SELECT 2;"[..]));
 
         entries.into_iter().next().unwrap()
+    }
+
+    /// The statement's end is where the next entry begins, whatever the statement holds.
+    #[test]
+    fn a_statement_holds_whatever_its_author_wrote() {
+        for (statement, parses) in [
+            ("/* user's dashboard */ SELECT 1;", true),
+            ("SELECT 1 /* a; b */ FROM dual;", true),
+            ("SELECT 1 -- don't\nFROM dual;", true),
+            ("SELECT \"it's\";", true),
+            ("SELECT 1;;", true),
+            ("SELECT 1 -- note;", true),
+            ("SELECT 'unterminated;", false),
+            ("CREATE PROCEDURE p() BEGIN\n  SELECT 1;\nEND;", false),
+        ] {
+            let e = both(&format!("{TIME}{SESSION}{STATS}{SET}{statement}\n"));
+            let a = &e.sql_attributes;
+
+            assert_eq!(
+                a.sql_raw.as_deref(),
+                Some(statement.as_bytes()),
+                "{statement}"
+            );
+            if parses {
+                assert!(
+                    matches!(a.statement, EntryStatement::SqlStatement(_)),
+                    "{statement} -> {:?}",
+                    a.statement
+                );
+            }
+        }
+    }
+
+    /// The last entry of the input needs no line ending after it, LF or CRLF.
+    #[test]
+    fn the_last_entry_ends_with_the_input() {
+        for end in ["", "\n", "\r\n", "\n\n\n"] {
+            let text = format!("{HEADER}{TIME}{SESSION}{STATS}{SET}SELECT 1;{end}");
+            let (entries, error) = read(&text);
+            assert!(error.is_none(), "{end:?}: {error:?}");
+            assert_eq!(entries.len(), 1, "{end:?}");
+            assert_eq!(
+                entries[0].sql_attributes.sql_raw.as_deref(),
+                Some(&b"SELECT 1;"[..])
+            );
+        }
+
+        // A whole log written with CRLF reads as the same entries.
+        let lf = log(&format!(
+            "{TIME}{SESSION}{STATS}use mysql;\n{SET}SELECT 1;\n"
+        ));
+        let crlf = lf.replace('\n', "\r\n");
+        assert_eq!(read(&crlf).0, read(&lf).0);
     }
 
     #[test]

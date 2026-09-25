@@ -3,7 +3,7 @@
 //!
 //! What it reads: the header block, the `# Time:`, `# User@Host:` and `# Query_time:` lines, the
 //! `USE` and `SET timestamp` commands, an administrator command, a `--` comment's key/value
-//! pairs, and the statement's own bytes up to its terminating `;`. [`parse_sql`] hands the text
+//! pairs, and the statement's own bytes up to the `;` that ends it. [`parse_sql`] hands the text
 //! to `sqlparser` and walks the tree once to record every literal, masking them on the way where
 //! the caller asked for it.
 //!
@@ -307,28 +307,29 @@ fn listener_line(i: &mut &[u8]) -> ModalResult<(Option<usize>, Option<Bytes>, Op
     .parse_next(i)
 }
 
-/// The statement's bytes, up to and including the first `;` that is not inside a quote.
+/// The statement's bytes, up to and including the `;` that ends it.
 ///
-/// SQL quoting does not nest, so the quote state is one `Option<u8>` and never a stack: inside a
-/// quote the only thing that can happen is the end of that quote. A doubled quote — `'don''t'` —
-/// falls out of that rule, since the second closes the span and the third opens a new one over
-/// the same bytes. A stack would treat an apostrophe inside a double-quoted string as a nested
-/// quote, never find its close, and run the scan to the end of the file.
+/// MySQL writes the text the client sent and then `;` and a line ending, whatever that text
+/// ended in, so the terminator is not a SQL token: it can follow an open quote or sit inside a
+/// `--` comment the client left unterminated, and a client's own trailing `;` makes it `;;`. The
+/// rule is positional instead. A statement ends at a `;` that ends its line and whose next line
+/// opens the next entry (`# Time:` or `# User@Host:`), opens a header block, or is the end of the
+/// input; blank lines between the two are allowed. A `;` inside a line or at the end of a line in
+/// a compound body (`BEGIN … END`) does not end it.
 ///
-/// Backslash escaping applies inside `'` and `"` and not inside a backtick, which is MySQL's own
-/// rule under the default `sql_mode`. `NO_BACKSLASH_ESCAPES` changes it; a slow log does not
-/// record the mode, so reading it this way is a decision and not a measurement.
+/// What the rule cannot frame is a statement whose own text holds a line ending in `;` followed
+/// by a line beginning `# Time:` or `# User@Host:`, such as a slow log quoted with raw newlines
+/// in a string or a comment. It ends there, and decoding resumes at the line after.
 ///
 /// The bytes are already contiguous in the buffer the decoder handed over, so the scan decides a
 /// length and `take` takes it in one copy.
 ///
-/// The refusal is winnow's: running out of input is `Incomplete` on a partial stream and a
-/// backtrack on a complete one, which is the distinction the decoder's loop turns into "read
-/// more" against "stop". Both arms are reproduced here rather than collapsed into the one this
-/// crate's own caller needs, so a `parse()` against a finished slice still behaves.
+/// The refusal is winnow's: an end not yet in the bytes is `Incomplete` on a partial stream and
+/// a backtrack on a complete one, which is the distinction the decoder's loop turns into "read
+/// more" against "stop".
 pub fn sql_lines(i: &mut Stream<'_>) -> ModalResult<Bytes> {
     trace("sql_lines", move |input: &mut Stream<'_>| {
-        let end = statement_end(input.as_bytes());
+        let end = statement_end(input.as_bytes(), !input.is_partial());
 
         match end {
             Some(n) => Ok(Bytes::copy_from_slice(take(n).parse_next(input)?)),
@@ -339,37 +340,66 @@ pub fn sql_lines(i: &mut Stream<'_>) -> ModalResult<Bytes> {
     .parse_next(i)
 }
 
-/// One past the first `;` that is not inside a string or a quoted identifier, or `None` where
-/// the bytes in hand do not contain one.
+/// One past the `;` that ends the statement at the head of `bytes`, by the rule in
+/// [`sql_lines`], or `None` where the bytes in hand do not settle it.
 ///
-/// Split out from [`sql_lines`] so the rule can be tested against text directly rather than
-/// only through a decoder over a whole log — see `quoting_does_not_nest`.
-pub(crate) fn statement_end(bytes: &[u8]) -> Option<usize> {
-    let mut quote: Option<u8> = None;
-    let mut escaped = false;
+/// With `complete` the end of `bytes` is the end of the input. Without it, `None` means read
+/// more: deciding needs the rest of the line after a `;`, and enough of the next line to say
+/// whether it opens an entry.
+pub(crate) fn statement_end(bytes: &[u8], complete: bool) -> Option<usize> {
+    let mut from = 0;
 
-    for (idx, c) in bytes.iter().copied().enumerate() {
-        match quote {
-            Some(q) => {
-                if escaped {
-                    escaped = false;
-                } else if c == b'\\' && q != b'`' {
-                    escaped = true;
-                } else if c == q {
-                    quote = None;
-                }
-            }
-            None => {
-                if c == b'\'' || c == b'"' || c == b'`' {
-                    quote = Some(c);
-                } else if c == b';' {
-                    return Some(idx + 1);
-                }
-            }
+    while let Some(at) = bytes[from..].iter().position(|&b| b == b';') {
+        from += at + 1;
+
+        let after = &bytes[from..];
+        let blanks = after
+            .iter()
+            .take_while(|&&b| b == b' ' || b == b'\t')
+            .count();
+        let next = match &after[blanks..] {
+            [] => return complete.then_some(from),
+            [b'\n', ..] => blanks + 1,
+            [b'\r', b'\n', ..] => blanks + 2,
+            [b'\r'] => return complete.then_some(from),
+            _ => continue,
+        };
+
+        match opens_entry(&after[next..], complete) {
+            Some(true) => return Some(from),
+            Some(false) => continue,
+            None => return None,
         }
     }
 
     None
+}
+
+/// Whether the text after a line ending opens the next entry or a header block, or is the end
+/// of the input; `None` where the bytes in hand are too few to say.
+fn opens_entry(rest: &[u8], complete: bool) -> Option<bool> {
+    const ENTRY: [&[u8]; 2] = [b"# Time:", b"# User@Host:"];
+
+    let rest = rest.trim_ascii_start();
+    if rest.is_empty() {
+        return complete.then_some(true);
+    }
+
+    if rest[0] == b'#' {
+        if ENTRY.iter().any(|p| rest.starts_with(p)) {
+            return Some(true);
+        }
+        if !complete && ENTRY.iter().any(|p| p.starts_with(rest)) {
+            return None;
+        }
+        return Some(false);
+    }
+
+    match rest.iter().position(|&b| b == b'\n') {
+        Some(n) => Some(is_header_start(&rest[..n])),
+        None if complete => Some(is_header_start(rest)),
+        None => None,
+    }
 }
 
 /// Parses an entry's `# User@Host:` line: `priv_user[user] @ host [ip]`, then `Id:` where the
@@ -2728,84 +2758,141 @@ mod the_author_keeps_their_literals {
     }
 }
 
-/// SQL QUOTING DOES NOT NEST.
+/// WHERE A STATEMENT ENDS.
 ///
-/// Reading it as a stack fails without a mis-parse. A statement whose terminator is never found
-/// consumes the rest of the buffer, the decoder answers `Incomplete` forever, and at EOF the
-/// file reports `bytes remaining on stream`: **one apostrophe in one double-quoted string ends
-/// the log there**, and every entry after it is gone.
+/// MySQL writes the client's text and then `;` and a line ending, so the terminator is found by
+/// position and never by reading SQL: a scan that tracks quotes or comments cannot see a `;` the
+/// server put after an open quote or inside a `--` comment, and runs to the end of the file.
 #[cfg(test)]
-mod quoting_does_not_nest {
+mod a_statement_ends_where_the_next_entry_begins {
     use crate::parser::statement_end;
 
-    /// The rule, against the cases a stack gets wrong and the ones it gets right by luck.
+    const NEXT: &str = "\n# Time: 2018-02-05T02:46:43.015898Z\n# User@Host: a[a] @ h []  Id: 1\n";
+
+    /// Statement texts that end at their last byte, each a shape that a scan for the first `;`
+    /// outside quotes gets wrong or never finishes.
+    const STATEMENTS: &[&str] = &[
+        "SELECT 1;",
+        "/* user's dashboard */ SELECT 1;",
+        "SELECT 1 /* a; b */ FROM dual;",
+        "SELECT 1 -- don't\nFROM dual;",
+        "SELECT 1 # don't\nFROM dual;",
+        // The client sent its own `;` and the server appended another.
+        "SELECT 1;;",
+        "CREATE PROCEDURE p() BEGIN\n  SELECT 1;\nEND;",
+        "CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW BEGIN\n  SET NEW.a = 1;\n  SET NEW.b = 2;\nEND;",
+        r#"SELECT * FROM t WHERE note = "it's here";"#,
+        r#"INSERT INTO t VALUES ("don't", 'say "no"');"#,
+        r#"SELECT 'a;b', "c;d", `e;f`; SELECT 2;"#,
+        // The server's `;` after a `--` comment the client did not end, and after a quote the
+        // client did not close: MySQL logs a statement that failed to parse like any other.
+        "SELECT 1 -- note;",
+        "SELECT 'unterminated;",
+        "SELECT 'a\\';",
+    ];
+
     #[test]
-    fn a_quote_of_one_kind_inside_another_is_not_a_quote() {
-        // Four a stack cannot terminate. Under it, `"` pushes, `'` pushes because it does not
-        // match the top, and the closing `"` pushes again — never empty, never a terminator,
-        // and the scan runs off the end of the file.
-        for s in [
-            r#"SELECT * FROM t WHERE note = "it's here";"#,
-            r#"SELECT 'it"s';"#,
-            r#"UPDATE t SET name = "O'Brien" WHERE id = 1;"#,
-            r#"INSERT INTO t VALUES ("don't", 'say "no"');"#,
-        ] {
+    fn a_statement_ends_at_the_semicolon_before_the_next_entry() {
+        for s in STATEMENTS {
+            let text = format!("{s}{NEXT}");
             assert_eq!(
-                statement_end(s.as_bytes()),
+                statement_end(text.as_bytes(), false),
                 Some(s.len()),
-                "the terminator is the last byte: {s}"
+                "{s:?}"
+            );
+            assert_eq!(statement_end(text.as_bytes(), true), Some(s.len()), "{s:?}");
+        }
+    }
+
+    /// What opens the next entry: a `# Time:` line, a `# User@Host:` line where the server left
+    /// the time out, a header block, or the end of the input.
+    #[test]
+    fn what_follows_the_terminator_decides_it() {
+        let s = "SELECT 1;";
+        for after in [
+            "\n# Time: 2018-02-05T02:46:43.015898Z\n",
+            "\n# User@Host: a[a] @ h []\n",
+            "\r\n# Time: 2018-02-05T02:46:43.015898Z\r\n",
+            "  \n\n\n# Time: 2018-02-05T02:46:43.015898Z\n",
+            "\n/usr/sbin/mysqld, Version: 5.7.20-log (x). started with:\nTcp port: 1  Unix socket: /tmp/s\n",
+        ] {
+            let text = format!("{s}{after}");
+            assert_eq!(
+                statement_end(text.as_bytes(), false),
+                Some(s.len()),
+                "{after:?}"
             );
         }
 
-        // AND THE ORDINARY SHAPES, INCLUDING ONE A STACK PASSES FOR THE WRONG REASON.
-        // `'say "hi"'` terminates under a stack because its inner quotes are **balanced** — two
-        // pushes and two pops landing empty — which is why a fixture full of well-formed strings
-        // witnesses nothing.
-        for s in [
-            r#"SELECT 'say "hi"';"#,
-            r#"SELECT 'don''t';"#,
-            r#"SELECT "a" FROM t WHERE b = 'c';"#,
-            r#"SELECT `tbl`.`col` FROM t;"#,
-            r#"SELECT 'a\'b';"#,
-            r#"SELECT 1;"#,
+        // At the end of the input, with or without a line ending.
+        for text in [
+            "SELECT 1;",
+            "SELECT 1;\n",
+            "SELECT 1;\r\n",
+            "SELECT 1;\n\n  ",
+            "SELECT 1;\r",
         ] {
-            assert_eq!(statement_end(s.as_bytes()), Some(s.len()), "{s}");
+            assert_eq!(statement_end(text.as_bytes(), true), Some(9), "{text:?}");
+        }
+
+        // And lines that open nothing: the statement goes on.
+        for text in [
+            "SELECT 1;\n# administrator command: Quit;\n",
+            "SELECT 1;\nFROM dual;",
+            "SELECT 1;\n#Time: 2018\n",
+            "SELECT 1; \nx, Version: 1\n",
+        ] {
+            assert_ne!(statement_end(text.as_bytes(), true), Some(9), "{text:?}");
         }
     }
 
-    /// A `;` inside a quote is not a terminator, which is the whole point of tracking quotes
-    /// at all.
+    /// `None` is "not in the bytes I have" and never "not in the file". On a partial buffer
+    /// every prefix of the text answers either `None` or the one right answer, so the decoder
+    /// frames the same statement however the input is cut.
     #[test]
-    fn a_semicolon_inside_a_quote_does_not_terminate() {
-        let s = r#"SELECT 'a;b', "c;d", `e;f`; SELECT 2;"#;
-        let end = statement_end(s.as_bytes()).expect("terminated");
+    fn no_prefix_of_the_input_decides_early() {
+        for s in STATEMENTS {
+            let text = format!("{s}{NEXT}");
+            for k in 0..text.len() {
+                let got = statement_end(&text.as_bytes()[..k], false);
+                assert!(
+                    got.is_none() || got == Some(s.len()),
+                    "{s:?} cut at {k} answered {got:?}"
+                );
+            }
+        }
 
-        assert_eq!(&s[..end], r#"SELECT 'a;b', "c;d", `e;f`;"#);
+        assert_eq!(statement_end(b"SELECT 1", false), None);
+        assert_eq!(
+            statement_end(b"SELECT 1;", false),
+            None,
+            "the line may go on"
+        );
+        assert_eq!(
+            statement_end(b"SELECT 1;\n", false),
+            None,
+            "the next line decides"
+        );
+        assert_eq!(statement_end(b"SELECT 1;\n# Ti", false), None);
+        assert_eq!(statement_end(b"", false), None);
     }
 
-    /// BACKSLASH ESCAPES INSIDE `'` AND `"` AND NOT INSIDE A BACKTICK, which is MySQL's own
-    /// rule rather than a simplification. Under `NO_BACKSLASH_ESCAPES` the first two change
-    /// too, and a slow log does not record `sql_mode`, so the default is a **reading**. See
-    /// `LiteralKind::DoubleQuotedString`.
-    #[test]
-    fn the_escape_rule_is_the_servers_and_stops_at_a_backtick() {
-        // The escaped quote does not close the string, so the terminator is the real one.
-        let s = r#"SELECT 'a\'b;c';"#;
-        assert_eq!(statement_end(s.as_bytes()), Some(s.len()));
-
-        // A backslash before a backtick is a backslash. Escaping it would leave the
-        // identifier open and lose the rest of the file.
-        let s = r#"SELECT `a\`, b FROM t;"#;
-        assert_eq!(statement_end(s.as_bytes()), Some(s.len()));
-    }
-
-    /// `None` is *"not in the bytes I have"* and never *"not in the file"* — the decoder turns
-    /// it into `Incomplete` and reads more. A scanner that answered `Some(len)` at the end of a
-    /// partial buffer would file half a statement as a whole one.
+    /// At the end of the input a statement with no terminator has none.
     #[test]
     fn an_unterminated_statement_is_not_a_statement() {
-        assert_eq!(statement_end(b"SELECT 1"), None);
-        assert_eq!(statement_end(b"SELECT 'unclosed;"), None);
-        assert_eq!(statement_end(b""), None);
+        assert_eq!(statement_end(b"SELECT 1", true), None);
+        assert_eq!(statement_end(b"SELECT 1; SELECT 2", true), None);
+        assert_eq!(statement_end(b"", true), None);
+    }
+
+    /// What the rule cannot frame, pinned so that it is a decision and not a surprise: text that
+    /// quotes a slow log with raw line breaks ends where the quoted entry begins.
+    #[test]
+    fn a_quoted_slow_log_ends_the_statement_early() {
+        let s = "INSERT INTO notes VALUES ('SELECT 1;\n# Time: 2018-02-05T02:46:43Z\n');";
+        assert_eq!(
+            statement_end(s.as_bytes(), true),
+            Some("INSERT INTO notes VALUES ('SELECT 1;".len())
+        );
     }
 }
