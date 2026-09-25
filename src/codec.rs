@@ -6,10 +6,10 @@
 //! [`crate::parser`]; this module is the state machine that orders them and the buffer
 //! arithmetic that lets a partial read resume.
 //!
-//! What it refuses: a malformed entry, which arrives as a winnow backtrack or cut and panics
-//! rather than being skipped, and leftover non-whitespace at end of file, which
-//! [`Decoder::decode_eof`] reports as an `io::Error` so a caller can tell a truncated log from a
-//! complete one.
+//! What it refuses: a line its stage cannot read, which is returned as
+//! [`CodecError::Malformed`] rather than skipped; and input that ends inside an entry, which
+//! [`Decoder::decode_eof`] reports as [`CodecError::Truncated`] so a caller can tell a truncated
+//! log from a complete one.
 //!
 //! What it declines to interpret: the statement text, which is handed to `sqlparser` and filed
 //! as [`EntryStatement::InvalidStatement`] where that refuses it or reads other than exactly one
@@ -20,7 +20,6 @@
 //! Two scopes, and the distinction is load-bearing: [`EntryContext`] is cleared when an entry
 //! completes, [`FileScope`] is not.
 
-use crate::codec::EntryError::MissingField;
 use crate::parser::{
     HeaderLines, Stream, admin_command, details_comment, entry_user, log_header, parse_entry_stats,
     parse_entry_time, parse_sql, sql_lines, start_timestamp_command, use_database,
@@ -33,69 +32,104 @@ use log::debug;
 use std::borrow::Cow;
 use std::default::Default;
 use std::fmt::{Display, Formatter, Write as _};
-use std::ops::AddAssign;
 use thiserror::Error;
 use tokio::io;
 use tokio_util::codec::Decoder;
-use winnow::ModalResult;
-use winnow::Parser;
 use winnow::ascii::multispace0;
 use winnow::combinator::opt;
-use winnow::error::ErrMode;
-use winnow::stream::Stream as _;
+use winnow::error::{ContextError, ErrMode};
+use winnow::stream::{Stream as _, StreamIsPartial};
+use winnow::{ModalResult, Parser};
 use winnow_datetime::DateTime;
 
-/// Error when building an entry.
-///
-/// The decoder builds an entry only once every field is set, so it never returns this.
-#[derive(Error, Debug)]
-#[non_exhaustive]
-pub enum EntryError {
-    /// a field is missing from the entry
-    #[error("entry field is missing: {0}")]
-    MissingField(String),
-    /// an entry contains a duplicate id
-    #[error("duplicate id: {0}")]
-    DuplicateId(String),
-}
+/// The most bytes of a line a [`CodecError`] carries.
+const EXCERPT_MAX: usize = 200;
 
-/// Errors for problems when reading frames from the source
+/// Errors for problems when reading frames from the source.
+///
+/// The decoder does not skip what it cannot read: decoding again from the same state reports
+/// the same error, and `FramedRead` ends the stream after the first one.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum CodecError {
-    /// An error from the reader, or bytes left unparsed at end of input, which
-    /// [`Decoder::decode_eof`] reports as an `io::Error` of kind `Other`.
-    #[error("file read error: {0}")]
+    /// An error from the reader.
+    #[error("I/O error: {0}")]
     IO(#[from] io::Error),
-    // An IO error is the only failure a caller can see. A half-built entry is unreachable: the
-    // state machine reaches `EntryContext::complete` only from the `Sql` arm, by which point
-    // every field is set. `EntryError` is still `complete`'s return type and public API.
+    /// A line the stage the decoder had reached cannot read.
+    #[error("cannot read the {stage} of entry {entry}: {line:?}")]
+    Malformed {
+        /// what the decoder was reading
+        stage: DecodeStage,
+        /// the entry's position in the input, counting from zero, which is how many entries were
+        /// decoded before it
+        entry: usize,
+        /// the first line of what the stage refused, lossily decoded and cut to at most 200
+        /// bytes
+        line: String,
+    },
+    /// Input that ends inside an entry: MySQL ends every entry with its statement and a `;`.
+    #[error("input ends inside the {stage} of entry {entry}: {line:?}")]
+    Truncated {
+        /// what the decoder was reading when the input ended
+        stage: DecodeStage,
+        /// the entry's position in the input, counting from zero
+        entry: usize,
+        /// the first line of what was left, lossily decoded and cut to at most 200 bytes; empty
+        /// where nothing was
+        line: String,
+    },
 }
 
-#[derive(Debug, Default)]
-enum CodecExpect {
+/// The part of an entry the decoder is reading, as a [`CodecError`] reports it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum DecodeStage {
+    /// a header block, which MySQL writes each time it opens the log
     #[default]
     Header,
+    /// the `# Time:` line
     Time,
-    User,
+    /// the `# User@Host:` line
+    Session,
+    /// the `# Query_time:` line
     Stats,
+    /// the `use <db>;` line
     UseDatabase,
-    StartTimeStamp,
-    Sql,
+    /// the `SET timestamp=…;` line
+    SetTimestamp,
+    /// the statement or the administrator command
+    Statement,
 }
 
-impl Display for CodecExpect {
+impl Display for DecodeStage {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let out = match self {
-            CodecExpect::Header => "header",
-            CodecExpect::Time => "time",
-            CodecExpect::User => "user",
-            CodecExpect::Stats => "stats",
-            CodecExpect::UseDatabase => "use database",
-            CodecExpect::StartTimeStamp => "start time stamp statement",
-            CodecExpect::Sql => "sql statement",
+            DecodeStage::Header => "header block",
+            DecodeStage::Time => "time line",
+            DecodeStage::Session => "session line",
+            DecodeStage::Stats => "stats line",
+            DecodeStage::UseDatabase => "use line",
+            DecodeStage::SetTimestamp => "SET timestamp line",
+            DecodeStage::Statement => "statement",
         };
         write!(f, "{}", out)
+    }
+}
+
+/// Why a stage stopped without finishing.
+enum Halt {
+    /// the buffer ends before the stage does
+    Incomplete,
+    /// the stage's grammar refused what is there
+    Refused,
+}
+
+impl From<ErrMode<ContextError>> for Halt {
+    fn from(e: ErrMode<ContextError>) -> Self {
+        match e {
+            ErrMode::Incomplete(_) => Halt::Incomplete,
+            ErrMode::Backtrack(_) | ErrMode::Cut(_) => Halt::Refused,
+        }
     }
 }
 
@@ -107,7 +141,7 @@ impl Display for CodecExpect {
 /// struct is moved rather than copied.
 #[derive(Debug, Default)]
 struct EntryContext {
-    expects: CodecExpect,
+    expects: DecodeStage,
     time: Option<DateTime>,
     user: Option<SessionLine>,
     stats: Option<StatsLine>,
@@ -117,31 +151,22 @@ struct EntryContext {
 }
 
 impl EntryContext {
-    /// Takes the half-read entry's fields and builds the [`Entry`].
+    /// Takes the half-read entry's fields and builds the [`Entry`], or `None` where one is unset.
     ///
     /// `mem::take` is also the reset: the fields are moved out and the default is left behind, so
     /// nothing is copied on the way. `attributes` carries a whole `sqlparser::ast::Statement`,
     /// which a clone would deep-copy node by node.
     ///
-    /// The take happens before the fields are checked, so an error arm leaves the context empty.
-    /// Nothing observes that: the state machine fills all five fields in order before `Sql` is
-    /// reached, so an error here is unreachable and the sole caller `unwrap`s.
-    fn complete(&mut self) -> Result<Entry, EntryError> {
+    /// The state machine fills every field before the statement stage is reached, so `None` is
+    /// unreachable; the caller reports it as the statement stage's refusal rather than panicking.
+    fn complete(&mut self) -> Option<Entry> {
         let ctx = std::mem::take(self);
 
-        let time = ctx.time.ok_or(MissingField("time".into()))?;
-        let session = ctx.user.ok_or(MissingField("user".into()))?;
-        let stats = ctx.stats.ok_or(MissingField("stats".into()))?;
-        let set_timestamp = ctx
-            .set_timestamp
-            .ok_or(MissingField("set timestamp".into()))?;
-        let attributes = ctx.attributes.ok_or(MissingField("sql".into()))?;
-
-        Ok(Entry {
-            call: EntryCall::new(time, set_timestamp),
-            session: session.into(),
-            stats: stats.into(),
-            sql_attributes: attributes,
+        Some(Entry {
+            call: EntryCall::new(ctx.time?, ctx.set_timestamp?),
+            session: ctx.user?.into(),
+            stats: ctx.stats?.into(),
+            sql_attributes: ctx.attributes?,
         })
     }
 }
@@ -187,7 +212,8 @@ impl FileScope {
 /// The [`Decoder`] for a MySQL slow log: bytes in, one [`Entry`] per log entry out.
 ///
 /// It reads the entry format MySQL 5.7 and later write by default, with an ISO 8601 `# Time:`
-/// line on every entry. A line it cannot read panics the decoder rather than being skipped.
+/// line on every entry. A line it cannot read is an error rather than being skipped; see
+/// [`CodecError`].
 #[derive(Debug, Default)]
 pub struct EntryCodec {
     /// File-scoped state, in one place because it is one scope. See [`FileScope`].
@@ -244,13 +270,12 @@ impl EntryCodec {
         }
     }
     /// calls the appropriate parser based on the current state held in the Codec context
-    fn parse_next<'b>(&mut self, i: &mut Stream<'b>) -> ModalResult<Option<Entry>> {
-        let entry = match self.context.expects {
-            CodecExpect::Header => {
-                let _ = multispace0(i)?;
+    fn parse_next(&mut self, i: &mut Stream<'_>) -> Result<Option<Entry>, Halt> {
+        let blank: ModalResult<_> = multispace0.parse_next(i);
+        blank?;
 
-                let res = opt(log_header).parse_next(i)?;
-                self.context.expects = CodecExpect::Time;
+        match self.context.expects {
+            DecodeStage::Header => {
                 // `Option` and not `unwrap_or_default`: a log with no header and a log whose
                 // header carried an empty version must not be the same value, since a rotated or
                 // concatenated slow log genuinely has no header.
@@ -261,57 +286,44 @@ impl EntryCodec {
                 // `None` on the next entry. A second header block mid-file means the log was
                 // reopened, and the entries after it may have been written by a different server,
                 // so the first is kept and the count is recorded.
+                let res = opt(log_header).parse_next(i)?;
+                self.context.expects = DecodeStage::Time;
                 if let Some(h) = res {
                     self.file.headers_seen += 1;
                     if self.file.headers.is_none() {
                         self.file.headers = Some(h);
                     }
                 }
-
-                None
             }
-            CodecExpect::Time => {
-                let _ = multispace0(i)?;
-
+            DecodeStage::Time => {
                 let dt = parse_entry_time(i)?;
                 self.context.time = Some(dt);
-                self.context.expects = CodecExpect::User;
-                None
+                self.context.expects = DecodeStage::Session;
             }
-            CodecExpect::User => {
+            DecodeStage::Session => {
                 let sl = entry_user(i)?;
                 self.context.user = Some(sl);
-                self.context.expects = CodecExpect::Stats;
-                None
+                self.context.expects = DecodeStage::Stats;
             }
-            CodecExpect::Stats => {
-                let _ = multispace0(i)?;
+            DecodeStage::Stats => {
                 let st = parse_entry_stats(i)?;
                 self.context.stats = Some(st);
-                self.context.expects = CodecExpect::UseDatabase;
-                None
+                self.context.expects = DecodeStage::UseDatabase;
             }
-            CodecExpect::UseDatabase => {
-                let _ = multispace0(i)?;
+            DecodeStage::UseDatabase => {
                 // Filed only where the log said it. `USE` is sticky per connection and MySQL
                 // writes it when the database changes, so later entries on the same thread
                 // inherit a database this entry never mentions. Carrying it forward is a
                 // reader's inference over the thread, and it belongs to whoever draws it.
                 self.context.use_database = opt(use_database).parse_next(i)?;
-
-                self.context.expects = CodecExpect::StartTimeStamp;
-                None
+                self.context.expects = DecodeStage::SetTimestamp;
             }
-            CodecExpect::StartTimeStamp => {
-                let _ = multispace0(i)?;
+            DecodeStage::SetTimestamp => {
                 let st = start_timestamp_command(i)?;
                 self.context.set_timestamp = Some(st);
-                self.context.expects = CodecExpect::Sql;
-                None
+                self.context.expects = DecodeStage::Statement;
             }
-            CodecExpect::Sql => {
-                let _ = multispace0(i)?;
-
+            DecodeStage::Statement => {
                 // `opt` and not a bare call: winnow rewinds only where a combinator takes a
                 // checkpoint, so a parser that fails after consuming leaves the stream where it
                 // stopped and `sql_lines` below would read the remainder of the line as the
@@ -402,19 +414,114 @@ impl EntryCodec {
                     });
                 }
 
-                let e = self.context.complete().unwrap();
-                Some(e)
+                let e = self.context.complete().ok_or(Halt::Refused)?;
+                self.file.processed += 1;
+
+                return Ok(Some(e));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Runs the stages over `src` until an entry completes, the buffer runs out, or a stage
+    /// refuses. With `eof` the buffer is the rest of the input and no stage waits for more.
+    ///
+    /// Each stage is committed as it completes, so a partial entry resumes at the stage it
+    /// stopped in rather than being re-read from its start. On an error the buffer is advanced
+    /// only past the committed stages, so decoding again reports the same error.
+    ///
+    /// The buffer is advanced past what was consumed rather than split and refilled, which it
+    /// can be because the parsers copy whatever they keep: every `Bytes` this codec produces is
+    /// built with `copy_from_slice` or accumulated into a `BytesMut`, and nothing borrows the
+    /// input. Consumed is what the stream no longer holds, measured after any reset.
+    fn decode_buffer(
+        &mut self,
+        src: &mut BytesMut,
+        eof: bool,
+    ) -> Result<Option<Entry>, CodecError> {
+        let available = src.len();
+        let mut i = Stream::new(&src[..]);
+        if eof {
+            let _ = i.complete();
+        }
+
+        let mut start = i.checkpoint();
+
+        let outcome = loop {
+            if i.is_empty() {
+                break Ok(None);
+            }
+
+            match self.parse_next(&mut i) {
+                Ok(Some(e)) => break Ok(Some(e)),
+                Ok(None) => {
+                    debug!("preparing input for next parser\n");
+                    start = i.checkpoint();
+                }
+                // Back to the last completed stage, not to the start of the buffer. The stages
+                // before it are committed: their values are in `self.context` and their bytes
+                // are spent, which is what makes this a streaming decoder rather than one that
+                // re-reads a partial entry on every poll.
+                Err(Halt::Incomplete) if !eof => {
+                    i.reset(&start);
+                    break Ok(None);
+                }
+                Err(halt) => {
+                    i.reset(&start);
+                    // A prefix can be refused before its line has arrived. The error waits for
+                    // the whole line, so that what it quotes does not depend on where the reads
+                    // cut the input.
+                    if !eof && !i.trim_ascii_start().contains(&b'\n') {
+                        break Ok(None);
+                    }
+                    break Err(self.error(halt, &i, eof));
+                }
             }
         };
 
-        if let Some(e) = entry {
-            self.file.processed.add_assign(1);
+        let remaining = i.len();
+        src.advance(available - remaining);
 
-            Ok(Some(e))
-        } else {
-            Ok(None)
+        outcome
+    }
+
+    /// The error for a stage that stopped on `rest`.
+    ///
+    /// At the end of the input a statement with no terminator, or a last line with no line
+    /// ending, is the input ending inside the entry rather than a line that cannot be read.
+    fn error(&self, halt: Halt, rest: &[u8], eof: bool) -> CodecError {
+        let stage = self.context.expects;
+        let entry = self.file.processed;
+        let line = excerpt(rest);
+
+        match halt {
+            Halt::Incomplete => CodecError::Truncated { stage, entry, line },
+            Halt::Refused
+                if eof
+                    && (stage == DecodeStage::Statement || !rest.trim_ascii().contains(&b'\n')) =>
+            {
+                CodecError::Truncated { stage, entry, line }
+            }
+            Halt::Refused => CodecError::Malformed { stage, entry, line },
         }
     }
+}
+
+/// The first line of `rest` that is not blank, cut to at most [`EXCERPT_MAX`] bytes at a
+/// character boundary and lossily decoded.
+fn excerpt(rest: &[u8]) -> String {
+    let rest = rest.trim_ascii_start();
+    let line = &rest[..rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len())];
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+
+    let mut end = line.len().min(EXCERPT_MAX);
+    // Back up off a UTF-8 continuation byte, so the cut does not split a character.
+    while end > 0 && end < line.len() && line[end] & 0xC0 == 0x80 {
+        end -= 1;
+    }
+
+    String::from_utf8_lossy(&line[..end]).into_owned()
 }
 
 impl Decoder for EntryCodec {
@@ -426,12 +533,6 @@ impl Decoder for EntryCodec {
     /// Each line of an entry is committed as it is read, so a partial entry resumes at the line
     /// it stopped on rather than being re-read from its start.
     ///
-    /// The buffer is advanced past what was consumed rather than split and refilled, which it
-    /// can be because the parsers copy whatever they keep: every `Bytes` this codec produces is
-    /// built with `copy_from_slice` or accumulated into a `BytesMut`, and nothing borrows the
-    /// input. Both exits share the arithmetic — consumed is what the stream no longer holds,
-    /// measured after any reset.
-    ///
     /// There is no length limit: a statement with no terminating `;` is buffered until one
     /// arrives or the input ends.
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
@@ -439,82 +540,34 @@ impl Decoder for EntryCodec {
             return Ok(None);
         }
 
-        let available = src.len();
-        let b: &[u8] = &src[..];
-        let mut i = Stream::new(b);
-
-        let mut start = i.checkpoint();
-
-        let (entry, remaining) = loop {
-            if i.len() == 0 {
-                break (None, 0);
-            };
-
-            match self.parse_next(&mut i) {
-                Ok(e) => {
-                    if let Some(e) = e {
-                        break (Some(e), i.len());
-                    } else {
-                        debug!("preparing input for next parser\n");
-
-                        start = i.checkpoint();
-
-                        continue;
-                    }
-                }
-                Err(ErrMode::Incomplete(_)) => {
-                    // Back to the last completed stage, not to the start of the buffer. The
-                    // stages before it are committed: their values are in `self.context` and
-                    // their bytes are spent, which is what makes this a streaming decoder rather
-                    // than one that re-reads a partial entry on every poll.
-                    i.reset(&start);
-
-                    break (None, i.len());
-                }
-                Err(ErrMode::Backtrack(e)) => {
-                    panic!(
-                        "unhandled parser backtrack error after {:#?} processed: {}",
-                        e.to_string(),
-                        self.file.processed
-                    );
-                }
-                Err(ErrMode::Cut(e)) => {
-                    panic!(
-                        "unhandled parser cut error after {:#?} processed: {}",
-                        e.to_string(),
-                        self.file.processed
-                    );
-                }
-            }
-        };
-
-        src.advance(available - remaining);
-
-        Ok(entry)
+        self.decode_buffer(src, false)
     }
 
     /// Decodes what is left at end of input and ensures that no unprocessed bytes remain.
     ///
-    /// Anything but whitespace left over is returned as an `io::Error` of kind
-    /// `io::ErrorKind::Other` carrying the leftover text, so a truncated log is an error rather
-    /// than a quiet end.
+    /// Input that ends inside an entry is [`CodecError::Truncated`], so a truncated log is an
+    /// error rather than a quiet end. Whitespace after the last entry is not.
     fn decode_eof(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        match self.decode(buf)? {
-            Some(frame) => Ok(Some(frame)),
-            None => {
-                let p = buf.iter().position(|v| !v.is_ascii_whitespace());
-
-                if p.is_none() {
-                    Ok(None)
-                } else {
-                    let out = format!(
-                        "bytes remaining on stream; {}",
-                        std::str::from_utf8(buf).unwrap()
-                    );
-                    Err(io::Error::other(out).into())
-                }
-            }
+        if let Some(frame) = self.decode_buffer(buf, true)? {
+            return Ok(Some(frame));
         }
+
+        let stage = match self.context.expects {
+            // The `use` line is optional, so what an entry ending there lacks is the next line.
+            DecodeStage::UseDatabase => DecodeStage::SetTimestamp,
+            stage => stage,
+        };
+        let mid_entry = !matches!(stage, DecodeStage::Header | DecodeStage::Time);
+
+        if mid_entry || buf.iter().any(|b| !b.is_ascii_whitespace()) {
+            return Err(CodecError::Truncated {
+                stage,
+                entry: self.file.processed,
+                line: excerpt(buf),
+            });
+        }
+
+        Ok(None)
     }
 }
 
@@ -1180,5 +1233,226 @@ mod the_author_and_the_reader {
         assert_eq!(resumed.file_scope().processed(), whole_n);
         assert_eq!(head_n + tail_n, whole_n, "and the split loses nothing");
         assert!(head_n > 0 && tail_n > 0, "an empty shard would say nothing");
+    }
+}
+
+/// Every shape of entry a MySQL-compatible server writes, each followed by a plain entry that a
+/// mis-framed first entry would take down with it, and each read in every chunk size.
+#[cfg(test)]
+mod every_shape_a_server_writes {
+    use crate::Entry;
+    use crate::codec::{CodecError, EntryCodec};
+    use bytes::BytesMut;
+    use tokio_util::codec::Decoder;
+
+    pub(super) const HEADER: &str = "/home/karl/mysql/my-5.7/bin/mysqld, Version: 5.7.20-log (MySQL Community Server (GPL)). started with:
+Tcp port: 12345  Unix socket: /tmp/12345/mysql_sandbox12345.sock
+Time                 Id Command    Argument
+";
+    pub(super) const TIME: &str = "# Time: 2018-02-05T02:46:43.015898Z\n";
+    pub(super) const SESSION: &str = "# User@Host: msandbox[msandbox] @ localhost []  Id:     3\n";
+    pub(super) const STATS: &str =
+        "# Query_time: 0.000016  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0\n";
+    pub(super) const SET: &str = "SET timestamp=1517798803;\n";
+
+    /// Every entry decoded from `log` fed to the decoder `chunk` bytes at a time, as
+    /// `FramedRead` would, and the first error if there is one.
+    pub(super) fn feed(log: &[u8], chunk: usize) -> (Vec<Entry>, Option<CodecError>) {
+        let mut codec = EntryCodec::default();
+        let mut buf = BytesMut::new();
+        let mut out = Vec::new();
+
+        for piece in log.chunks(chunk.max(1)) {
+            buf.extend_from_slice(piece);
+            loop {
+                match codec.decode(&mut buf) {
+                    Ok(Some(e)) => out.push(e),
+                    Ok(None) => break,
+                    Err(e) => return (out, Some(e)),
+                }
+            }
+        }
+        loop {
+            match codec.decode_eof(&mut buf) {
+                Ok(Some(e)) => out.push(e),
+                Ok(None) => return (out, None),
+                Err(e) => return (out, Some(e)),
+            }
+        }
+    }
+
+    /// `log` read whole and in chunks of 1 to 16 bytes and a few larger, which must all agree.
+    pub(super) fn read(log: &str) -> (Vec<Entry>, Option<CodecError>) {
+        let (whole, error) = feed(log.as_bytes(), log.len());
+        let said = error.as_ref().map(|e| e.to_string());
+
+        for chunk in (1..=16).chain([31, 64, 257]) {
+            let (cut, cut_error) = feed(log.as_bytes(), chunk);
+            assert_eq!(cut, whole, "chunks of {chunk}: {log}");
+            assert_eq!(cut_error.map(|e| e.to_string()), said, "chunks of {chunk}");
+        }
+
+        (whole, error)
+    }
+
+    /// The shipped log, fed a byte at a time and in odd chunks, decodes to exactly what it
+    /// decodes to whole.
+    #[test]
+    fn the_shipped_log_reads_the_same_in_any_chunk_size() {
+        let log = std::fs::read("assets/slow-test-queries.log").unwrap();
+        let (whole, error) = feed(&log, log.len());
+        assert!(error.is_none());
+        assert_eq!(whole.len(), 310);
+
+        for chunk in [1, 7, 4096] {
+            let (cut, error) = feed(&log, chunk);
+            assert!(error.is_none(), "chunks of {chunk}");
+            assert!(cut == whole, "chunks of {chunk}");
+        }
+    }
+}
+
+/// What the decoder cannot read is an error that says where, never a panic and never a skip.
+#[cfg(test)]
+mod a_line_that_cannot_be_read_is_an_error {
+    use super::every_shape_a_server_writes::{HEADER, SESSION, SET, STATS, TIME, feed, read};
+    use crate::codec::{CodecError, DecodeStage, EntryCodec};
+    use bytes::BytesMut;
+    use tokio_util::codec::Decoder;
+
+    /// The stage and the line of a `Malformed`, and nothing else.
+    fn malformed(text: &str) -> (DecodeStage, String) {
+        match read(text) {
+            (_, Some(CodecError::Malformed { stage, line, .. })) => (stage, line),
+            other => panic!("not malformed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_line_its_stage_refuses_names_the_stage_and_the_line() {
+        for (text, stage, line) in [
+            (
+                format!(
+                    "{HEADER}{TIME}# User@Host: root[root] localhost []\n{STATS}{SET}SELECT 1;\n"
+                ),
+                DecodeStage::Session,
+                "# User@Host: root[root] localhost []",
+            ),
+            (
+                format!("{HEADER}not an entry\n{TIME}{SESSION}{STATS}{SET}SELECT 1;\n"),
+                DecodeStage::Time,
+                "not an entry",
+            ),
+            // Refused on its first bytes, and still quoted whole in every chunk size.
+            (
+                format!("{HEADER}{TIME}# Usr@Host: a[a] @ h []  Id: 1\n{STATS}{SET}SELECT 1;\n"),
+                DecodeStage::Session,
+                "# Usr@Host: a[a] @ h []  Id: 1",
+            ),
+            (
+                format!("{HEADER}{TIME}{SESSION}{STATS}SE timestamp=1;\nSELECT 1;\n"),
+                DecodeStage::SetTimestamp,
+                "SE timestamp=1;",
+            ),
+        ] {
+            assert_eq!(malformed(&text), (stage, line.to_string()), "{text}");
+        }
+    }
+
+    /// The error carries at most 200 bytes of the line, cut at a character, and never the rest
+    /// of the file.
+    #[test]
+    fn an_error_quotes_a_bounded_line() {
+        let long = "é".repeat(5_000);
+        let text = format!("{HEADER}# Time: {long}\n{SESSION}{STATS}{SET}SELECT 1;\n");
+
+        let (stage, line) = malformed(&text);
+        assert_eq!(stage, DecodeStage::Time);
+        assert!(line.len() <= 200 && line.len() >= 190, "{}", line.len());
+        assert!(line.starts_with("# Time: é") && !line.contains('\u{FFFD}'));
+
+        let (_, error) = read(&text);
+        let said = error.unwrap().to_string();
+        assert!(
+            said.starts_with("cannot read the time line of entry 0: "),
+            "{said}"
+        );
+        assert!(said.len() < 300 && !said.contains("SELECT"), "{said}");
+    }
+
+    /// Input that ends inside an entry, which MySQL never writes, is `Truncated`: a caller can
+    /// tell a cut log from a whole one.
+    #[test]
+    fn input_that_ends_inside_an_entry_is_truncated() {
+        for (text, stage) in [
+            (
+                format!("{HEADER}{TIME}{SESSION}{STATS}{SET}SELECT 1"),
+                DecodeStage::Statement,
+            ),
+            (
+                format!("{HEADER}{TIME}{SESSION}{STATS}{SET}SELECT 1\n"),
+                DecodeStage::Statement,
+            ),
+            (
+                format!("{HEADER}{TIME}{SESSION}{STATS}{SET}"),
+                DecodeStage::Statement,
+            ),
+            (
+                format!("{HEADER}{TIME}{SESSION}{STATS}"),
+                DecodeStage::SetTimestamp,
+            ),
+            (
+                format!("{HEADER}{TIME}{SESSION}# Query_time: 0.1"),
+                DecodeStage::Stats,
+            ),
+            (format!("{HEADER}{TIME}"), DecodeStage::Session),
+        ] {
+            match read(&text) {
+                (
+                    entries,
+                    Some(CodecError::Truncated {
+                        stage: s, entry: 0, ..
+                    }),
+                ) => {
+                    assert!(entries.is_empty());
+                    assert_eq!(s, stage, "{text:?}");
+                }
+                other => panic!("{text:?}: {other:?}"),
+            }
+        }
+
+        // Bytes that are not UTF-8 are quoted lossily rather than stopping the decoder.
+        let mut text = format!("{HEADER}{TIME}{SESSION}{STATS}{SET}SELECT ").into_bytes();
+        text.extend_from_slice(b"\xff\xfe");
+        match feed(&text, 5) {
+            (_, Some(CodecError::Truncated { line, .. })) => {
+                assert_eq!(line, "SELECT \u{FFFD}\u{FFFD}")
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // And a log that ends between entries is whole.
+        let (entries, error) = read(&format!(
+            "{HEADER}{TIME}{SESSION}{STATS}{SET}SELECT 1;\n\n  \n"
+        ));
+        assert!(error.is_none() && entries.len() == 1);
+        let (entries, error) = read(HEADER);
+        assert!(error.is_none() && entries.is_empty());
+    }
+
+    /// The decoder does not skip what it refused: asked again, it refuses again.
+    #[test]
+    fn an_error_is_not_skipped() {
+        let text = format!("{HEADER}{TIME}# User@Host: nobody\n{STATS}{SET}SELECT 1;\n");
+        let mut codec = EntryCodec::default();
+        let mut buf = BytesMut::from(text.as_bytes());
+
+        let first = codec.decode(&mut buf).unwrap_err().to_string();
+        let second = codec.decode(&mut buf).unwrap_err().to_string();
+        assert_eq!(first, second);
+        assert!(
+            first.starts_with("cannot read the session line of entry 0"),
+            "{first}"
+        );
     }
 }

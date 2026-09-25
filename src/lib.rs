@@ -50,7 +50,7 @@ pub use crate::parser::{
 
 use bytes::Bytes;
 
-pub use crate::codec::{CodecError, EntryCodec, EntryError, FileScope};
+pub use crate::codec::{CodecError, DecodeStage, EntryCodec, FileScope};
 
 /// Declares a public enum's published vocabulary: the string each arm reaches an artifact as.
 ///
