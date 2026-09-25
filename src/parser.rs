@@ -26,13 +26,15 @@ use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, Expr, Ident, ObjectName, SetExpr, Statement, UnaryOperator,
     Value, ValueWithSpan, VisitMut, VisitorMut,
 };
-use sqlparser::dialect::MySqlDialect;
+use sqlparser::dialect::{Dialect, MySqlDialect};
 use sqlparser::parser::{Parser as SQLParser, ParserError};
-use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
+use sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer, Whitespace};
+use std::any::TypeId;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::ops::Not;
+use std::ops::Range;
 use std::str;
 use std::str::FromStr;
 use winnow::ascii::{Caseless, digit1, float, space0, space1};
@@ -1180,6 +1182,216 @@ fn is_literal_token(t: &Token) -> bool {
         Token::Word(w) => w.quote_style.is_none() && bit_digits(&w.value).is_some(),
         _ => false,
     }
+}
+
+/// The rendering of a statement this grammar refused: `raw`, the author's bytes, or under
+/// `EntryMasking::PlaceHolder` its decoded `text` passed through [`mask_refused`].
+pub(crate) fn refused_sql(raw: Bytes, text: &str, mask: &EntryMasking) -> Bytes {
+    match mask {
+        EntryMasking::PlaceHolder => Bytes::from(mask_refused(text)),
+        EntryMasking::None => raw,
+    }
+}
+
+/// `sql` with every literal replaced by `?` and every other byte as the author wrote it.
+///
+/// Token by token, for a statement with no tree to mask. A version gate's body and an optimizer
+/// hint's body are masked too, for the reasons [`carries_a_value`] reads them; any other comment
+/// is kept as written. With no tree there is no telling a value from a number the grammar
+/// requires, so `CHAR(60)` becomes `CHAR(?)`, nor a sign from a subtraction, so `-5` becomes
+/// `-?`. Neither matters in a rendering nothing parses.
+///
+/// Where the text does not tokenize, every quoted run and every word that starts with a digit is
+/// masked instead, so a string cannot leak through the fallback either.
+pub(crate) fn mask_refused(sql: &str) -> String {
+    let mut ranges = Vec::new();
+    if literal_ranges(sql, 0, &mut ranges).is_none() {
+        return mask_runs(sql);
+    }
+    let mut out = String::with_capacity(sql.len());
+    let mut at = 0;
+    for r in ranges {
+        out.push_str(&sql[at..r.start]);
+        out.push('?');
+        at = r.end;
+    }
+    out.push_str(&sql[at..]);
+    out
+}
+
+/// Pushes the byte range of every literal in `sql`, offset by `base`, reading into version gates
+/// and optimizer hints. `None` where `sql`, or a body inside it, does not tokenize.
+fn literal_ranges(sql: &str, base: usize, out: &mut Vec<Range<usize>>) -> Option<()> {
+    let tokens = Tokenizer::new(&MySqlLexer, sql)
+        .tokenize_with_location()
+        .ok()?;
+    let mut at = Offsets::new(sql);
+    for TokenWithSpan { token, span } in &tokens {
+        let (start, end) = (at.seek(&span.start), at.seek(&span.end));
+        if is_literal_token(token) {
+            out.push(base + start..base + end);
+        } else if let Token::Whitespace(Whitespace::MultiLineComment(body)) = token {
+            // The body is verbatim and begins after the `/*`; `prefix` is the `!` and its
+            // version, or the `+`, in bytes.
+            let (prefix, inner) = if let Some(gate) = body.strip_prefix('!') {
+                let inner = gate.trim_start_matches(|c: char| c.is_ascii_digit());
+                (1 + gate.len() - inner.len(), inner)
+            } else if let Some(hint) = body.strip_prefix('+') {
+                (1, hint)
+            } else {
+                continue;
+            };
+            literal_ranges(inner, base + start + 2 + prefix, out)?;
+        }
+    }
+    Some(())
+}
+
+/// Byte offsets for the tokenizer's positions, which count lines and characters from 1.
+///
+/// Forward only: a token stream's positions only increase, so one walk over the text serves the
+/// whole stream.
+struct Offsets<'a> {
+    text: &'a str,
+    byte: usize,
+    line: u64,
+    column: u64,
+}
+
+impl<'a> Offsets<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            byte: 0,
+            line: 1,
+            column: 1,
+        }
+    }
+
+    /// The byte at `to`, counted as the tokenizer counts: a `\n` starts a line, and every other
+    /// character is one column.
+    fn seek(&mut self, to: &Location) -> usize {
+        while (self.line, self.column) < (to.line, to.column) {
+            let Some(c) = self.text[self.byte..].chars().next() else {
+                break;
+            };
+            self.byte += c.len_utf8();
+            if c == '\n' {
+                self.line += 1;
+                self.column = 1;
+            } else {
+                self.column += 1;
+            }
+        }
+        self.byte
+    }
+}
+
+/// MySQL's lexical rules with a version gate kept whole, as the comment it is written as.
+///
+/// `MySqlDialect` tokenizes a gate's body in place and measures the positions of the tokens in it
+/// from the gate's `/*` rather than from where they sit, so a position inside a gate names the
+/// wrong bytes. [`literal_ranges`] tokenizes the body on its own instead.
+///
+/// Every hook `MySqlDialect` overrides that the tokenizer consults is delegated to it, and
+/// `dialect()` answers as `MySqlDialect`, because the tokenizer asks for that type by name for
+/// `b'…'` and for `#` comments.
+#[derive(Debug)]
+struct MySqlLexer;
+
+impl Dialect for MySqlLexer {
+    fn dialect(&self) -> TypeId {
+        TypeId::of::<MySqlDialect>()
+    }
+
+    fn is_identifier_start(&self, ch: char) -> bool {
+        MySqlDialect {}.is_identifier_start(ch)
+    }
+
+    fn is_identifier_part(&self, ch: char) -> bool {
+        MySqlDialect {}.is_identifier_part(ch)
+    }
+
+    fn is_delimited_identifier_start(&self, ch: char) -> bool {
+        MySqlDialect {}.is_delimited_identifier_start(ch)
+    }
+
+    fn supports_string_literal_backslash_escape(&self) -> bool {
+        MySqlDialect {}.supports_string_literal_backslash_escape()
+    }
+
+    fn ignores_wildcard_escapes(&self) -> bool {
+        MySqlDialect {}.ignores_wildcard_escapes()
+    }
+
+    fn supports_numeric_prefix(&self) -> bool {
+        MySqlDialect {}.supports_numeric_prefix()
+    }
+
+    fn requires_single_line_comment_whitespace(&self) -> bool {
+        MySqlDialect {}.requires_single_line_comment_whitespace()
+    }
+
+    fn supports_multiline_comment_hints(&self) -> bool {
+        false
+    }
+}
+
+/// [`mask_refused`]'s fallback, for text that does not tokenize: every `'…'` and `"…"` run, and
+/// every word that starts with a digit, replaced by `?`.
+///
+/// Inside a run a backslash escapes the byte after it and a doubled quote stays in the run; a run
+/// with no closing quote runs to the end. A backtick name is copied through whole.
+fn mask_runs(sql: &str) -> String {
+    let b = sql.as_bytes();
+    // A byte that continues a name. Every byte of a multi-byte character is one, so a run of
+    // them never ends inside a character.
+    let name = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || !c.is_ascii();
+    let mut out = String::with_capacity(sql.len());
+    let (mut i, mut copied) = (0, 0);
+    while i < b.len() {
+        let start = i;
+        match b[i] {
+            q @ (b'\'' | b'"') => {
+                i += 1;
+                while i < b.len() {
+                    match b[i] {
+                        b'\\' => i += 2,
+                        c if c == q && b.get(i + 1) == Some(&q) => i += 2,
+                        c if c == q => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            b'`' => {
+                i += 1;
+                while i < b.len() && b[i] != b'`' {
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            c if c.is_ascii_digit() && (i == 0 || !name(b[i - 1])) => {
+                while i < b.len() && (name(b[i]) || b[i] == b'.') {
+                    i += 1;
+                }
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        }
+        let end = i.min(b.len());
+        out.push_str(&sql[copied..start]);
+        out.push('?');
+        copied = end;
+        i = end;
+    }
+    out.push_str(&sql[copied..]);
+    out
 }
 
 /// The kind and payload of a `Value` this crate records as a literal, or `None` for one it does
@@ -3392,6 +3604,147 @@ mod a_statement_ends_where_the_next_entry_begins {
         assert_eq!(
             statement_end(s.as_bytes(), true),
             Some("INSERT INTO notes VALUES ('SELECT 1;".len())
+        );
+    }
+}
+
+/// A STATEMENT THE GRAMMAR REFUSES IS MASKED TOO.
+///
+/// There is no tree, so the masking is token by token over the author's text, and every byte
+/// that is not a literal stays where the author put it.
+#[cfg(test)]
+mod a_refused_statement_is_masked_too {
+    use crate::parser::{MySqlLexer, mask_refused};
+    use crate::{EntryCodec, EntryCodecConfig, EntryMasking, EntryStatement};
+    use futures::StreamExt;
+    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::tokenizer::Tokenizer;
+    use std::io::Cursor;
+    use tokio_util::codec::FramedRead;
+
+    #[test]
+    fn every_literal_is_replaced_and_nothing_else_moves() {
+        for (sql, want) in [
+            (
+                "SELECT a FROM t WHERE email = 'alice@example.com' LOCK IN SHARE MODE;",
+                "SELECT a FROM t WHERE email = ? LOCK IN SHARE MODE;",
+            ),
+            (
+                "LOAD DATA INFILE '/tmp/secret.csv' INTO TABLE t;",
+                "LOAD DATA INFILE ? INTO TABLE t;",
+            ),
+            // Every kind, with case, layout and comments kept, and a digit inside a name left
+            // to the name.
+            (
+                "select  t1.c2\nFROM `t3` -- it's 42\nwhere n = \"x\" and h = 0x1F and b = b'01'\n  \
+                 and f = 0b11 and k = 1.5e3 and u = N'ü' lock in share mode;",
+                "select  t1.c2\nFROM `t3` -- it's 42\nwhere n = ? and h = ? and b = ?\n  \
+                 and f = ? and k = ? and u = ? lock in share mode;",
+            ),
+            // The server executes a version gate, so its body is masked. Its version is not a
+            // value.
+            (
+                "/*!40103 SET TIME_ZONE='+00:00' */;",
+                "/*!40103 SET TIME_ZONE=? */;",
+            ),
+            // It parses an optimizer hint, so a value in one goes too. A plain comment stays.
+            (
+                "SELECT /*+ SET_VAR(sort_buffer_size = 16777216) */ a /* 42 */ FROM t \
+                 LOCK IN SHARE MODE;",
+                "SELECT /*+ SET_VAR(sort_buffer_size = ?) */ a /* 42 */ FROM t \
+                 LOCK IN SHARE MODE;",
+            ),
+            // The tokenizer counts characters and the text is bytes, which part company at the
+            // first character wider than one byte: on the same line, after a line break, and
+            // inside a gate that spans one.
+            (
+                "SELECT café FROM t WHERE nom = 'Zoë' AND\n  ville = 'Köln' /*!50100\n AND n = \
+                 'ß' */ LOCK IN SHARE MODE;",
+                "SELECT café FROM t WHERE nom = ? AND\n  ville = ? /*!50100\n AND n = \
+                 ? */ LOCK IN SHARE MODE;",
+            ),
+            // No tree, so a number the grammar requires goes with the values, and a sign stays.
+            (
+                "ALTER TABLE t ADD c CHAR(60) DEFAULT -1, DISABLE KEYS;",
+                "ALTER TABLE t ADD c CHAR(?) DEFAULT -?, DISABLE KEYS;",
+            ),
+        ] {
+            assert_eq!(mask_refused(sql), want);
+        }
+    }
+
+    /// TEXT THAT DOES NOT TOKENIZE STILL CANNOT LEAK A STRING.
+    #[test]
+    fn text_that_does_not_tokenize_falls_back_to_masking_every_quoted_run() {
+        // An unterminated comment, then an unterminated string: the tokenizer refuses both.
+        assert_eq!(
+            mask_refused("SELECT 'a''b', \"c\\\"d\", 42, .5, t1 FROM `t 2` /* open;"),
+            "SELECT ?, ?, ?, .?, t1 FROM `t 2` /* open;"
+        );
+        assert_eq!(mask_refused("SELECT 'unterminated;"), "SELECT ?");
+    }
+
+    /// THE MASKING LEXER IS `MySqlDialect` EVERYWHERE BUT A VERSION GATE, which it keeps whole so
+    /// the body can be tokenized on its own and every position stays exact.
+    #[test]
+    fn the_masking_lexer_reads_text_as_mysql_dialect_does() {
+        for sql in [
+            "SELECT `a``b`, \"dq\", 'it''s', 'a\\'b', N'x', X'41', 0x1F, b'01', 0b11, \
+             1.5e3, .5 FROM t1",
+            "SELECT a # a comment with 'quotes'\nFROM t -- another\nWHERE c = 1 --1",
+            "SELECT @v, $d, café, 1abc FROM `db`.`t` /* plain 'x' */ /*+ BKA(t) */",
+        ] {
+            let ours = Tokenizer::new(&MySqlLexer, sql).tokenize_with_location();
+            let theirs = Tokenizer::new(&MySqlDialect {}, sql).tokenize_with_location();
+            assert_eq!(ours.unwrap(), theirs.unwrap(), "{sql}");
+        }
+        // And the one difference: a gate stays a comment.
+        let gate = Tokenizer::new(&MySqlLexer, "/*!40101 SET x = 1 */")
+            .tokenize()
+            .unwrap();
+        assert_eq!(gate.len(), 1, "{gate:?}");
+    }
+
+    /// AND THE CODEC MASKS WITH IT: `sql` is masked, and `sql_raw` stays the author's bytes.
+    #[tokio::test]
+    async fn the_codec_masks_the_rendering_of_a_refused_statement() {
+        let stmt = "SELECT a FROM t WHERE email = 'alice@example.com' LOCK IN SHARE MODE;";
+        let log = format!(
+            "# Time: 2018-02-05T02:46:47.273786Z
+# User@Host: msandbox[msandbox] @ localhost []  Id:    10
+# Query_time: 0.000352  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1517798807;
+{stmt}
+"
+        );
+        let read = |masking| {
+            let log = log.clone();
+            async move {
+                let config = EntryCodecConfig {
+                    masking,
+                    ..Default::default()
+                };
+                let mut f = FramedRead::new(Cursor::new(log.into_bytes()), EntryCodec::new(config));
+                f.next().await.unwrap().unwrap().sql_attributes
+            }
+        };
+
+        let masked = read(EntryMasking::PlaceHolder).await;
+        assert!(matches!(
+            masked.statement,
+            EntryStatement::InvalidStatement(_)
+        ));
+        assert_eq!(
+            masked.sql(),
+            "SELECT a FROM t WHERE email = ? LOCK IN SHARE MODE;"
+        );
+        assert_eq!(masked.sql_raw.as_deref(), Some(stmt.as_bytes()));
+
+        let plain = read(EntryMasking::None).await;
+        assert_eq!(
+            plain.sql(),
+            stmt,
+            "unmasked, the rendering is the author's bytes"
         );
     }
 }

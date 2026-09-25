@@ -584,7 +584,9 @@ impl EntrySession {
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntrySqlAttributes {
     /// The reader's rendering: for a parsed statement this is the AST rendered back to text,
-    /// for an admin command the command word, for an unparseable statement the log's bytes.
+    /// for an admin command the command word, for an unparseable statement the log's bytes --
+    /// with every literal replaced by `?` token by token under
+    /// [`crate::EntryMasking::PlaceHolder`].
     ///
     /// Three different things, and [`Self::statement`]'s arm is what says which.
     pub sql: Bytes,

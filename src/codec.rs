@@ -456,6 +456,12 @@ impl EntryCodec {
                         EntryStatement::InvalidStatement(text.into_owned())
                     };
 
+                    // A refused statement has no tree to mask, so masking reads its tokens.
+                    if let EntryStatement::InvalidStatement(text) = &s {
+                        sql_lines =
+                            crate::parser::refused_sql(sql_lines, text, &self.config.masking);
+                    }
+
                     self.context.attributes = Some(EntrySqlAttributes {
                         sql: sql_lines,
                         sql_raw: Some(sql_raw),
