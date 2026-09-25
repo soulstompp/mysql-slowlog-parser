@@ -23,8 +23,8 @@
 use crate::EntryMasking;
 use bytes::Bytes;
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, Expr, ObjectName, SetExpr, Statement, Value, ValueWithSpan,
-    VisitMut, VisitorMut,
+    AssignmentTarget, BinaryOperator, Expr, Ident, ObjectName, SetExpr, Statement, UnaryOperator,
+    Value, ValueWithSpan, VisitMut, VisitorMut,
 };
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::{Parser as SQLParser, ParserError};
@@ -900,10 +900,11 @@ pub struct EntryLiteral {
     /// across one.
     pub ordinal: u32,
     /// The literal rendered as SQL, quoting and all. The rendering is `sqlparser`'s, so escapes
-    /// are normalised and `0x41` reads `X'41'`; the author's exact bytes are in
-    /// [`crate::EntrySqlAttributes::sql_raw`].
+    /// are normalised, `0x41` reads `X'41'` and `b'1'` reads `B'1'`; the author's exact bytes
+    /// are in [`crate::EntrySqlAttributes::sql_raw`].
     pub rendered: Bytes,
-    /// The payload without its quoting -- what a reader groups by.
+    /// The payload without its quoting -- what a reader groups by. A negative number's payload
+    /// carries its sign, and a bit literal's is its digits.
     pub value: Bytes,
     /// Which kind of literal it is.
     pub kind: LiteralKind,
@@ -920,9 +921,9 @@ pub struct EntryLiteral {
     /// = 5` and `INSERT … (qty) VALUES (5)` name the column a value is *written* to, which is a
     /// key the statement creates or changes rather than one it looks up. [`Self::sought`] is what
     /// tells them apart, because a lock taken to find a row and a lock taken to write one are
-    /// different locks. The value must be the shape's direct operand: one under a unary minus,
-    /// in parentheses or behind a charset introducer is `None`, as is one written by
-    /// `INSERT … SET` or `ON DUPLICATE KEY UPDATE`.
+    /// different locks. The value must be the shape's direct operand, a negative number counting
+    /// as one: one in parentheses, under a unary plus or behind a charset introducer is `None`,
+    /// as is one written by `INSERT … SET` or `ON DUPLICATE KEY UPDATE`.
     pub column: Option<LiteralColumn>,
     /// Whether the author was **looking for** this value or **writing** it.
     ///
@@ -960,6 +961,8 @@ pub struct LiteralColumn {
 /// What kind of literal an [`EntryLiteral`] is.
 ///
 /// A boolean, a `NULL` and a placeholder are not the author's subject and are never recorded.
+/// A negative number is one [`Self::Number`], sign included: `balance = -500` and
+/// `balance = 500` name different rows.
 ///
 /// [`Self::DoubleQuotedString`] is the ambiguous one. MySQL reads `"…"` as a string literal under
 /// its default `sql_mode` and as an identifier under `ANSI_QUOTES`; `MySqlDialect` is fixed and
@@ -978,9 +981,16 @@ pub enum LiteralKind {
     NationalString,
     /// `X'...'`
     HexString,
+    /// `b'...'` or `0b...`, a bit-value literal
+    ///
+    /// `MySqlDialect` lexes `0b1010` as a word, so it reaches the tree as an identifier; it is
+    /// recorded and masked as the literal MySQL reads it as. `B"..."`, which `sqlparser` accepts
+    /// and MySQL has no syntax for, is neither recorded nor masked.
+    BitString,
 }
 
 vocabulary!(LiteralKind {
+    BitString => "bit",
     DoubleQuotedString => "double_quoted",
     HexString => "hex",
     NationalString => "national",
@@ -991,7 +1001,13 @@ vocabulary!(LiteralKind {
 /// Parses one or more SQL statements and returns them with every literal the author wrote.
 ///
 /// With `EntryMasking::PlaceHolder` the returned statements carry `?` in place of each literal;
-/// the literals come back either way, so **the author's subject survives masking**.
+/// the literals come back either way, so **the author's subject survives masking**. A negative
+/// number is one literal and one `?`, so `balance = -500` and `balance = 500` mask to the same
+/// text.
+///
+/// A value inside an optimizer hint, `/*+ SET_VAR(sort_buffer_size = 16777216) */`, is neither
+/// recorded nor masked: `sqlparser` hands a hint over as unparsed text, which the rendering
+/// repeats as written.
 pub fn parse_sql(
     sql: &str,
     mask: &EntryMasking,
@@ -1008,6 +1024,7 @@ pub fn parse_sql(
         binds: Vec::new(),
         targets: HashMap::new(),
         positional: HashMap::new(),
+        skip_value: false,
     };
     for s in statements.iter_mut() {
         let _ = s.visit(&mut pass);
@@ -1031,7 +1048,8 @@ pub fn parse_sql(
 /// string, with its quotes escaped. Swapping them changes the statement, because MySQL compares
 /// an integer column against a string by coercing it and takes a different path through the
 /// index. A number's or a hex literal's payload is written as given and not checked, so a caller
-/// substituting one must supply digits.
+/// substituting one must supply digits. A negative number is one literal, and its substitute
+/// replaces the sign along with the digits.
 ///
 /// Returns `None` where the text does not parse or is not exactly one statement. A caller with a
 /// substitute to apply and nothing to apply it to has to withhold, and the `None` is what says
@@ -1052,6 +1070,7 @@ pub fn rewrite_literals(sql: &str, replacements: &[Option<String>]) -> Option<St
     let mut pass = RewritePass {
         replacements,
         seen: 0,
+        skip_value: false,
     };
     let _ = statements[0].visit(&mut pass);
     Some(statements[0].to_string())
@@ -1109,32 +1128,108 @@ pub fn carries_a_value(sql: &str) -> Option<bool> {
     scan(sql, 0)
 }
 
+/// The kind and payload of a `Value` this crate records as a literal, or `None` for one it does
+/// not.
+///
+/// The one arm filter, shared by [`LiteralPass`] and [`RewritePass`]: a boolean, a NULL or a
+/// placeholder is recorded by neither, so neither advances its counter over one. An ordinal that
+/// meant a different literal in the two passes would substitute into the wrong slot.
+fn value_literal(v: &Value) -> Option<(LiteralKind, &str)> {
+    match v {
+        Value::Number(n, _) => Some((LiteralKind::Number, n)),
+        Value::SingleQuotedString(s) => Some((LiteralKind::SingleQuotedString, s)),
+        Value::DoubleQuotedString(s) => Some((LiteralKind::DoubleQuotedString, s)),
+        Value::NationalStringLiteral(s) => Some((LiteralKind::NationalString, s)),
+        Value::HexStringLiteral(s) => Some((LiteralKind::HexString, s)),
+        Value::SingleQuotedByteStringLiteral(s) => Some((LiteralKind::BitString, s)),
+        _ => None,
+    }
+}
+
+/// A literal the tree holds as an expression rather than as a `Value`, and so one that
+/// `pre_visit_value` never sees whole.
+enum ExprLiteral<'a> {
+    /// A number under a unary minus, which is how `sqlparser` builds `-5`. The digits, unsigned.
+    Negative(&'a str),
+    /// `0b…`, which `MySqlDialect` lexes as a word and the tree holds as an identifier. The
+    /// digits after the `0b`.
+    Bits(&'a str),
+}
+
+impl<'a> ExprLiteral<'a> {
+    fn of(e: &'a Expr) -> Option<Self> {
+        match e {
+            Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr,
+            } => match expr.as_ref() {
+                Expr::Value(ValueWithSpan {
+                    value: Value::Number(n, _),
+                    ..
+                }) => Some(Self::Negative(n)),
+                _ => None,
+            },
+            Expr::Identifier(i) if i.quote_style.is_none() => bit_digits(&i.value).map(Self::Bits),
+            _ => None,
+        }
+    }
+}
+
+/// The digits of `0b…`, where a bare word is one: MySQL reads `0b` followed by nothing but `0`
+/// and `1` as a bit literal and never as a name. `0B…` is a name.
+fn bit_digits(word: &str) -> Option<&str> {
+    let digits = word.strip_prefix("0b")?;
+    (!digits.is_empty() && digits.bytes().all(|b| b == b'0' || b == b'1')).then_some(digits)
+}
+
+/// The address a literal is filed under: the inner `Value` of an `Expr::Value`, which is what
+/// `pre_visit_value` sees, and the node itself for an [`ExprLiteral`], which is what
+/// `pre_visit_expr` sees.
+fn literal_addr(e: &Expr) -> Option<usize> {
+    match e {
+        Expr::Value(v) => Some(std::ptr::from_ref(&v.value).addr()),
+        _ => ExprLiteral::of(e).map(|_| std::ptr::from_ref(e).addr()),
+    }
+}
+
 /// The substitution half of [`LiteralPass`], sharing its arm filter and therefore its ordinals.
 struct RewritePass<'a> {
     replacements: &'a [Option<String>],
     seen: usize,
+    /// As [`LiteralPass::skip_value`], and for the same reason.
+    skip_value: bool,
 }
 
 impl VisitorMut for RewritePass<'_> {
     type Break = ();
+
+    /// An [`ExprLiteral`] is counted here, as in [`LiteralPass::pre_visit_expr`]. Its substitute
+    /// replaces the whole node, so a negative number's sign goes with its digits.
+    fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        let Some(lit) = ExprLiteral::of(expr) else {
+            return ControlFlow::Continue(());
+        };
+        let signed = matches!(lit, ExprLiteral::Negative(_));
+        self.skip_value = signed;
+        let i = self.seen;
+        self.seen += 1;
+        let Some(Some(new)) = self.replacements.get(i) else {
+            return ControlFlow::Continue(());
+        };
+        *expr = if signed {
+            Expr::Value(Value::Number(new.clone(), false).with_empty_span())
+        } else {
+            Expr::Identifier(Ident::new(format!("0b{new}")))
+        };
+        ControlFlow::Continue(())
+    }
 
     /// The hook takes a `ValueWithSpan`, which carries the source span; the body shadows it to
     /// the inner `Value`, because every arm below is about what the author wrote and assigning
     /// through the inner value leaves the span alone.
     fn pre_visit_value(&mut self, value: &mut ValueWithSpan) -> ControlFlow<Self::Break> {
         let value = &mut value.value;
-        // The same arms as `LiteralPass::pre_visit_value`, which is load-bearing: a boolean, a
-        // NULL or a placeholder is recorded by neither, so neither advances its counter over one.
-        // An ordinal that meant a different literal in the two passes would substitute into the
-        // wrong slot.
-        if !matches!(
-            value,
-            Value::Number(..)
-                | Value::SingleQuotedString(_)
-                | Value::DoubleQuotedString(_)
-                | Value::NationalStringLiteral(_)
-                | Value::HexStringLiteral(_)
-        ) {
+        if std::mem::take(&mut self.skip_value) || value_literal(value).is_none() {
             return ControlFlow::Continue(());
         }
         let i = self.seen;
@@ -1150,6 +1245,9 @@ impl VisitorMut for RewritePass<'_> {
             Value::DoubleQuotedString(_) => Value::DoubleQuotedString(new.clone()),
             Value::NationalStringLiteral(_) => Value::NationalStringLiteral(new.clone()),
             Value::HexStringLiteral(_) => Value::HexStringLiteral(new.clone()),
+            Value::SingleQuotedByteStringLiteral(_) => {
+                Value::SingleQuotedByteStringLiteral(new.clone())
+            }
             other => other.clone(),
         };
         ControlFlow::Continue(())
@@ -1165,7 +1263,8 @@ impl VisitorMut for RewritePass<'_> {
 ///
 /// `pre_visit_value` and not `Expr::Value`: `Expr::TypedString` (`DATE '2020-01-01'`) and
 /// `Expr::MatchAgainst` (MySQL's `AGAINST ('term')`) hold a `Value` without being one, so an
-/// `Expr`-shaped pass would neither mask nor record them.
+/// `Expr`-shaped pass would neither mask nor record them. `pre_visit_expr` as well, for the two
+/// literals the tree holds as expressions: a negative number and `0b…`. See [`ExprLiteral`].
 ///
 /// It reaches a few `Value`s that select no rows -- a `CEIL(x TO 2)` scale, a `TABLESAMPLE` seed.
 /// Those are grammar rather than subject, and masking one is wrong in the same way masking a type
@@ -1177,7 +1276,8 @@ struct LiteralPass {
     /// against.
     ///
     /// The parent and only the parent. `pre_visit_value` fires inside the `Expr::Value` node, so
-    /// the stack reads `[…, the comparison, Expr::Value]` and the binding is at `len - 2`.
+    /// the stack reads `[…, the comparison, Expr::Value]` and the binding is at `len - 2`; an
+    /// [`ExprLiteral`] is filed from its own node, which is on the stack in the same place.
     /// Searching further up would let `WHERE a = f(g(1))` bind `1` to `a`, which is a claim the
     /// author did not make: the value is an argument, not a key.
     binds: Vec<Option<LiteralColumn>>,
@@ -1189,10 +1289,10 @@ struct LiteralPass {
     ///
     /// Keyed on the value's address and never on its payload: `INSERT INTO t (a, b) VALUES (5,
     /// 5)` writes one payload into two columns, and a payload-matched queue would hand both to
-    /// whichever it met first. The address is taken in `pre_visit_statement`, which runs before
-    /// the statement's children and therefore before anything is masked; masking assigns through
-    /// `&mut Value` and moves no node, so the address still names the same slot when
-    /// `pre_visit_value` reaches it. Nothing is ever dereferenced.
+    /// whichever it met first. The address is the one [`literal_addr`] gives. It is taken in
+    /// `pre_visit_statement`, which runs before the statement's children and therefore before
+    /// anything is masked; masking assigns in place and moves no node, so the address still names
+    /// the same slot when the traversal reaches it. Nothing is ever dereferenced.
     targets: HashMap<usize, LiteralColumn>,
     /// Values written by an `INSERT` that named no columns, by address, with the position in the
     /// row they were written at.
@@ -1203,6 +1303,10 @@ struct LiteralPass {
     /// domain and a named one are not known to be the same domain; deciding that needs the
     /// catalogue.
     positional: HashMap<usize, u32>,
+    /// Set where a negative number was filed whole, so the digits beneath its minus sign are
+    /// not filed a second time. They are the next value the traversal reaches, and nothing can
+    /// come between: the minus has no other child.
+    skip_value: bool,
 }
 
 /// The column name an `ObjectName` spells, split into its qualifier and its last part.
@@ -1230,8 +1334,8 @@ fn statement_targets(
     positional: &mut HashMap<usize, u32>,
 ) {
     let mut put = |col: Option<LiteralColumn>, e: &Expr| {
-        if let (Some(c), Expr::Value(v)) = (col, e) {
-            out.insert(std::ptr::from_ref(&v.value).addr(), c);
+        if let (Some(c), Some(addr)) = (col, literal_addr(e)) {
+            out.insert(addr, c);
         }
     };
     match s {
@@ -1262,8 +1366,8 @@ fn statement_targets(
                     // VALUES (1, 2)` puts `1` in the table's first column, which the log does not
                     // say is `b`. Deciding they are one needs the catalogue.
                     for (n, e) in row.content.iter().enumerate() {
-                        if let Expr::Value(v) = e {
-                            positional.insert(std::ptr::from_ref(&v.value).addr(), n as u32);
+                        if let Some(addr) = literal_addr(e) {
+                            positional.insert(addr, n as u32);
                         }
                     }
                     continue;
@@ -1284,9 +1388,10 @@ fn statement_targets(
 ///
 /// Comparison operators only. `Expr::BinaryOp` covers `+` as well as `=`, so a rule that took any
 /// binary operator would bind the `1` in `qty + 1` to `qty` — filing arithmetic as a key lookup,
-/// in a field whose purpose is to say which rows a statement went for.
+/// in a field whose purpose is to say which rows a statement went for. An [`ExprLiteral`] is a
+/// value here like any other: `a = -5` is sought in `a`.
 fn binding_of(e: &Expr) -> Option<LiteralColumn> {
-    let is_value = |x: &Expr| matches!(x, Expr::Value(_));
+    let is_value = |x: &Expr| matches!(x, Expr::Value(_)) || ExprLiteral::of(x).is_some();
     match e {
         Expr::BinaryOp { left, op, right } if is_comparison(op) => {
             if is_value(right) {
@@ -1320,10 +1425,10 @@ fn is_comparison(op: &BinaryOperator) -> bool {
     )
 }
 
-/// The written column name, where this expression is one.
+/// The written column name, where this expression is one. `0b…` is a literal and not a name.
 fn column_of(e: &Expr) -> Option<LiteralColumn> {
     match e {
-        Expr::Identifier(i) => Some(LiteralColumn {
+        Expr::Identifier(i) if ExprLiteral::of(e).is_none() => Some(LiteralColumn {
             qualifier: None,
             name: Bytes::from(i.value.clone()),
         }),
@@ -1353,10 +1458,32 @@ impl VisitorMut for LiteralPass {
         ControlFlow::Continue(())
     }
 
+    /// Pushes this node's binding and, where the node is an [`ExprLiteral`], files it whole.
+    ///
+    /// Masked by replacing the node, so `-5` renders as `?` rather than `-?` and a masked `0b1`
+    /// is not an identifier. The replacement is a fresh `Expr::Value` with an empty span, as there
+    /// is no single value whose span could be kept.
     fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
         // Read before the value beneath is masked: `pre_visit_value` replaces the value with a
         // placeholder, and a binding computed afterwards would see `?` on both sides.
         self.binds.push(binding_of(expr));
+        let Some(lit) = ExprLiteral::of(expr) else {
+            return ControlFlow::Continue(());
+        };
+        let (kind, payload) = match lit {
+            ExprLiteral::Negative(n) => (LiteralKind::Number, format!("-{n}")),
+            ExprLiteral::Bits(d) => (LiteralKind::BitString, d.to_string()),
+        };
+        self.skip_value = kind == LiteralKind::Number;
+        self.record(
+            kind,
+            payload,
+            expr.to_string(),
+            std::ptr::from_ref(&*expr).addr(),
+        );
+        if self.mask {
+            *expr = Expr::Value(Value::Placeholder("?".to_string()).with_empty_span());
+        }
         ControlFlow::Continue(())
     }
 
@@ -1365,21 +1492,39 @@ impl VisitorMut for LiteralPass {
         ControlFlow::Continue(())
     }
 
-    /// Shadowed to the inner `Value`, as in [`RewritePass::pre_visit_value`], so `addr` below is
-    /// the inner `Value`'s — which is what `targets` and `positional` are keyed on.
+    /// Shadowed to the inner `Value`, as in [`RewritePass::pre_visit_value`], so the address
+    /// below is the inner `Value`'s — which is what `targets` and `positional` are keyed on.
     fn pre_visit_value(&mut self, value: &mut ValueWithSpan) -> ControlFlow<Self::Break> {
         let value = &mut value.value;
-        let (kind, payload) = match value {
-            Value::Number(n, _) => (LiteralKind::Number, n.clone()),
-            Value::SingleQuotedString(v) => (LiteralKind::SingleQuotedString, v.clone()),
-            Value::DoubleQuotedString(v) => (LiteralKind::DoubleQuotedString, v.clone()),
-            Value::NationalStringLiteral(v) => (LiteralKind::NationalString, v.clone()),
-            Value::HexStringLiteral(v) => (LiteralKind::HexString, v.clone()),
-            // A boolean, a NULL and a placeholder are not the author's subject: `TRUE` names no
-            // rows, and a `?` already in the text was never the author's value.
-            _ => return ControlFlow::Continue(()),
+        if std::mem::take(&mut self.skip_value) {
+            return ControlFlow::Continue(());
+        }
+        // A boolean, a NULL and a placeholder are not the author's subject: `TRUE` names no
+        // rows, and a `?` already in the text was never the author's value.
+        let Some((kind, payload)) = value_literal(value) else {
+            return ControlFlow::Continue(());
         };
+        let payload = payload.to_string();
+        self.record(
+            kind,
+            payload,
+            value.to_string(),
+            std::ptr::from_ref(&*value).addr(),
+        );
 
+        if self.mask {
+            // The inner value and not the wrapper: `Expr::value(..)` would build a fresh
+            // `ValueWithSpan` through `with_empty_span()` and discard the source span. Assigning
+            // through `&mut Value` leaves the wrapper alone.
+            *value = Value::Placeholder("?".to_string());
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+impl LiteralPass {
+    /// Files one literal, found at `addr` -- see [`literal_addr`].
+    fn record(&mut self, kind: LiteralKind, payload: String, rendered: String, addr: usize) {
         // `len - 2` and never a search: see `LiteralPass::binds`. A value with no enclosing
         // expression at all -- which the traversal does reach -- binds to nothing.
         let sought = self
@@ -1389,27 +1534,18 @@ impl VisitorMut for LiteralPass {
             .and_then(|i| self.binds[i].clone());
         // The predicate first: a value can only be in one of the two positions, and where it is
         // in neither both are `None`.
-        let addr = std::ptr::from_ref(&*value).addr();
         let written = self.targets.get(&addr).cloned();
         let column_position = self.positional.get(&addr).copied();
 
         self.literals.push(EntryLiteral {
             ordinal: self.literals.len() as u32,
-            rendered: Bytes::from(value.to_string()),
+            rendered: Bytes::from(rendered),
             value: Bytes::from(payload),
             kind,
             sought: sought.is_some(),
             column_position,
             column: sought.or(written),
         });
-
-        if self.mask {
-            // The inner value and not the wrapper: `Expr::value(..)` would build a fresh
-            // `ValueWithSpan` through `with_empty_span()` and discard the source span. Assigning
-            // through `&mut Value` leaves the wrapper alone.
-            *value = Value::Placeholder("?".to_string());
-        }
-        ControlFlow::Continue(())
     }
 }
 
@@ -1438,6 +1574,9 @@ mod every_literal_kind {
             ("SELECT 1 FROM t WHERE a = \"x\"", K::DoubleQuotedString),
             ("SELECT 1 FROM t WHERE a = N'x'", K::NationalString),
             ("SELECT 1 FROM t WHERE a = X'41'", K::HexString),
+            ("SELECT 1 FROM t WHERE a = b'1010'", K::BitString),
+            ("SELECT 1 FROM t WHERE a = 0b1010", K::BitString),
+            ("SELECT 1 FROM t WHERE a = -5", K::Number),
         ];
         let mut seen: std::collections::BTreeSet<String> = Default::default();
         for (sql, want) in cases {
@@ -1448,10 +1587,10 @@ mod every_literal_kind {
             );
             seen.insert(format!("{want:?}"));
         }
-        // THE GUARD. Five arms, written out because the enum cannot be iterated.
+        // THE GUARD. Six arms, written out because the enum cannot be iterated.
         assert_eq!(
             seen.len(),
-            5,
+            6,
             "every LiteralKind arm needs text that reaches it; reached {seen:?}"
         );
 
@@ -1489,6 +1628,52 @@ mod every_literal_kind {
             "the unambiguous spelling, for contrast"
         );
     }
+
+    /// A BIT LITERAL IS A VALUE, in both of MySQL's spellings, and masking reaches it.
+    ///
+    /// `b'1'` is a `Value`, and `0b1` is not a `Value` at all: `MySqlDialect` lexes it as a word
+    /// and the tree holds an identifier. Unrecorded, either one would render in the clear under
+    /// `PlaceHolder`.
+    #[test]
+    fn a_bit_literal_is_recorded_and_masked_in_either_spelling() {
+        for (sql, rendered, payload) in [
+            ("UPDATE t SET flags = b'1' WHERE id = 3", "B'1'", "1"),
+            ("UPDATE t SET flags = 0b1010 WHERE id = 3", "0b1010", "1010"),
+        ] {
+            let (plain, ls) = parse_sql(sql, &EntryMasking::None).unwrap();
+            assert_eq!(ls.len(), 2, "{sql}: {ls:?}");
+            assert_eq!(ls[0].kind, LiteralKind::BitString);
+            assert_eq!(String::from_utf8_lossy(&ls[0].rendered), rendered);
+            assert_eq!(String::from_utf8_lossy(&ls[0].value), payload);
+            assert_eq!(
+                ls[0].column.as_ref().map(|c| c.name.clone()),
+                Some(Bytes::from("flags")),
+                "written to the column the assignment names"
+            );
+            assert!(plain[0].to_string().contains(rendered));
+
+            let masked = parse_sql(sql, &EntryMasking::PlaceHolder).unwrap().0[0].to_string();
+            assert_eq!(masked, "UPDATE t SET flags = ? WHERE id = ?", "{sql}");
+        }
+
+        // A bit literal compared against a column is sought in it, from either side.
+        let ls = parse_sql("SELECT a FROM t WHERE 0b1 = flags", &EntryMasking::None)
+            .unwrap()
+            .1;
+        assert_eq!(ls.len(), 1);
+        assert!(ls[0].sought);
+        assert_eq!(ls[0].column.as_ref().unwrap().name, Bytes::from("flags"));
+
+        // And only `0b` followed by binary digits, unquoted, is one: the rest are names, to
+        // MySQL as much as to this parser.
+        for sql in [
+            "SELECT 0B1010 FROM t",
+            "SELECT 0b12 FROM t",
+            "SELECT `0b1` FROM t",
+        ] {
+            assert!(kinds(sql).is_empty(), "{sql}: {:?}", kinds(sql));
+        }
+    }
 }
 
 /// THE SUBSTITUTION, WHICH IS WHAT LETS A STATEMENT SHIP WITHOUT ITS SUBJECT.
@@ -1514,10 +1699,11 @@ mod a_literal_can_be_replaced_by_its_surrogate {
     #[test]
     fn rewriting_each_literal_to_itself_changes_nothing() {
         let sql = "SELECT a FROM t WHERE id = 42 AND ok = TRUE AND note IS NULL \
-                   AND name = 'kay' AND tag = X'41' AND n = N'x' LIMIT 10";
+                   AND name = 'kay' AND tag = X'41' AND n = N'x' AND d = -7 \
+                   AND f = b'1' AND g = 0b10 LIMIT 10";
         let rendered = parse_sql(sql, &EntryMasking::None).unwrap().0[0].to_string();
         let same: Vec<Option<String>> = lits(&rendered).into_iter().map(Some).collect();
-        assert_eq!(same.len(), 5, "TRUE and NULL are not the author's subject");
+        assert_eq!(same.len(), 8, "TRUE and NULL are not the author's subject");
         assert_eq!(
             rewrite_literals(&rendered, &same).as_deref(),
             Some(&*rendered)
@@ -1533,6 +1719,15 @@ mod a_literal_can_be_replaced_by_its_surrogate {
         let out = rewrite_literals(&rendered, &[Some("7".into()), None]).unwrap();
         assert!(out.contains("id = 7"), "{out}");
         assert!(out.contains("other = 99"), "{out}");
+
+        // A negative number is one ordinal, and its substitute takes the sign with it: the
+        // digits beneath the minus are not a second literal for the next substitute to land on.
+        let out = rewrite_literals(
+            "SELECT a FROM t WHERE d = -5 AND e = 6 AND f = 0b1",
+            &[Some("9".into()), Some("-8".into()), Some("10".into())],
+        )
+        .unwrap();
+        assert!(out.contains("d = 9 AND e = -8 AND f = 0b10"), "{out}");
     }
 
     /// THE KIND IS THE ORIGINAL'S AND THE CALLER CANNOT SAY OTHERWISE.
@@ -1843,6 +2038,69 @@ mod every_literal_binding {
             [
                 ("'sakila.actor'".into(), "db_tbl".into(), false),
                 ("188518946".into(), "checksum".into(), false)
+            ]
+        );
+    }
+
+    /// A NEGATIVE NUMBER IS ONE LITERAL, SIGN INCLUDED, AND KEEPS ITS COLUMN.
+    ///
+    /// `sqlparser` builds `-5` as a unary minus over `5`. Filed from the `5`, the sign would be
+    /// lost, the value's parent would be the minus rather than the comparison, and masking would
+    /// render `-?` -- keeping `balance = -500` and `balance = 500` two texts.
+    #[test]
+    fn a_negative_number_is_one_literal_with_its_sign_and_its_column() {
+        assert_eq!(
+            bound("SELECT id FROM t WHERE a = -5", &EntryMasking::None),
+            [("-5".into(), "a".into(), true)]
+        );
+        assert_eq!(
+            bound("INSERT INTO t (a) VALUES (-1)", &EntryMasking::None),
+            [("-1".into(), "a".into(), false)]
+        );
+        assert_eq!(
+            bound(
+                "SELECT id FROM t WHERE a IN (-1, 2) AND b BETWEEN -3.5 AND -1e2",
+                &EntryMasking::None
+            ),
+            [
+                ("-1".into(), "a".into(), true),
+                ("2".into(), "a".into(), true),
+                ("-3.5".into(), "b".into(), true),
+                ("-1e2".into(), "b".into(), true)
+            ]
+        );
+        let ls = parse_sql("SELECT id FROM t WHERE a = -5", &EntryMasking::None)
+            .unwrap()
+            .1;
+        assert_eq!(String::from_utf8_lossy(&ls[0].value), "-5");
+        assert_eq!(ls[0].kind, LiteralKind::Number);
+
+        // Positional too: an `INSERT` with no column list files it at its place in the row.
+        let rows = parse_sql("INSERT INTO t VALUES (-1, 2)", &EntryMasking::None)
+            .unwrap()
+            .1;
+        assert_eq!(
+            rows.iter().map(|l| l.column_position).collect::<Vec<_>>(),
+            vec![Some(0), Some(1)]
+        );
+
+        // Masked, the sign goes with the digits.
+        let mask = |sql| parse_sql(sql, &EntryMasking::PlaceHolder).unwrap().0[0].to_string();
+        assert_eq!(
+            mask("UPDATE t SET balance = -500 WHERE id = 1"),
+            mask("UPDATE t SET balance = 500 WHERE id = 1")
+        );
+        assert_eq!(
+            mask("UPDATE t SET balance = -500 WHERE id = 1"),
+            "UPDATE t SET balance = ? WHERE id = ?"
+        );
+
+        // A subtraction is not a sign: `qty - 1` still files an unbound `1`.
+        assert_eq!(
+            bound("SELECT id FROM t WHERE qty - 1 > 0", &EntryMasking::None),
+            [
+                ("1".into(), "-".into(), false),
+                ("0".into(), "-".into(), false)
             ]
         );
     }
@@ -2713,6 +2971,7 @@ mod the_author_keeps_their_literals {
             "SELECT SUBSTR(name, 1, 3) FROM t LIMIT 10 OFFSET 5",
             "SELECT * FROM t WHERE d > DATE '2020-01-01'",
             "UPDATE t SET amount = 1.5 WHERE id = 3",
+            "UPDATE t SET flags = b'1', n = -5 WHERE id = 0b11",
         ] {
             let (masked, _) = rendered(sql, &PlaceHolder);
             assert!(
@@ -2736,6 +2995,7 @@ mod the_author_keeps_their_literals {
             "INSERT INTO t VALUES (1, 'x', 2.5), (3, 'y', 4.5)",
             "SELECT CONCAT('a', (SELECT max(n) FROM u WHERE k = 7)) FROM t WHERE j = 'z'",
             "UPDATE t SET amount = 1.5, note = 'done' WHERE id = 3",
+            "UPDATE t SET flags = b'101', n = -3 WHERE id = 0b11 AND k IN (-1, 2)",
         ] {
             let (masked, ls) = rendered(sql, &PlaceHolder);
             let (plain, _) = rendered(sql, &NoMask);
