@@ -57,6 +57,12 @@ mod graph;
 mod parser;
 mod types;
 
+/// The SQL grammar whose AST [`EntrySqlStatement::statement`] holds, re-exported so a caller
+/// names the version this crate was built against.
+pub use sqlparser;
+/// The date and time types [`EntryCall`] exposes, re-exported for the same reason.
+pub use winnow_datetime;
+
 pub use graph::{
     Clause, Connective, ConstraintKind, Edge, GraphMeasures, IndexHint, IndexHintKind,
     IndexHintScope, JoinOp, LockStrength, LockWait, OptimizerHintText, Partition, PathStep,
