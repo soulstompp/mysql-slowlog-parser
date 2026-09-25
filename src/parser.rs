@@ -728,6 +728,14 @@ pub enum LiteralKind {
     HexString,
 }
 
+vocabulary!(LiteralKind {
+    DoubleQuotedString => "double_quoted",
+    HexString => "hex",
+    NationalString => "national",
+    Number => "number",
+    SingleQuotedString => "single_quoted",
+});
+
 /// Parses one or more SQL statements and returns them with every literal the author wrote.
 ///
 /// With `EntryMasking::PlaceHolder` the returned statements carry `?` in place of each literal;

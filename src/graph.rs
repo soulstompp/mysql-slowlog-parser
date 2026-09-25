@@ -122,6 +122,23 @@ pub enum RelationRole {
     FlushTarget,
 }
 
+vocabulary!(RelationRole {
+    AlterTarget => "alter_target",
+    AnalyzeTarget => "analyze_target",
+    CreateTarget => "create_target",
+    DeleteTarget => "delete_target",
+    DropTarget => "drop_target",
+    FlushTarget => "flush_target",
+    From => "from",
+    InsertTarget => "insert_target",
+    Join => "join",
+    LockExclusiveTarget => "lock_exclusive_target",
+    LockSharedTarget => "lock_shared_target",
+    MetadataTarget => "metadata_target",
+    TruncateTarget => "truncate_target",
+    UpdateTarget => "update_target",
+});
+
 /// The kind of naming scope a relation occurrence was found in.
 ///
 /// This is what separates a table scanned from a table named. A relation under a
@@ -144,6 +161,15 @@ pub enum ScopeKind {
     /// one side of a `UNION`, `EXCEPT` or `INTERSECT`
     SetOp,
 }
+
+vocabulary!(ScopeKind {
+    Cte => "cte",
+    Derived => "derived",
+    SetOp => "set_op",
+    Statement => "statement",
+    Subquery => "subquery",
+    ViewBody => "view_body",
+});
 
 /// How two relation occurrences were put together.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
@@ -184,6 +210,17 @@ pub enum JoinOp {
     NotMySql,
 }
 
+vocabulary!(JoinOp {
+    Comma => "comma",
+    Cross => "cross",
+    Inner => "inner",
+    Left => "left",
+    NotMySql => "not_mysql",
+    Predicate => "predicate",
+    Right => "right",
+    Straight => "straight",
+});
+
 /// What the join said about how to match rows.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
@@ -197,6 +234,13 @@ pub enum ConstraintKind {
     /// no constraint was written
     None,
 }
+
+vocabulary!(ConstraintKind {
+    Natural => "natural",
+    None => "none",
+    On => "on",
+    Using => "using",
+});
 
 /// Which clause a split was written in.
 ///
@@ -216,6 +260,14 @@ pub enum Clause {
     Projection,
 }
 
+vocabulary!(Clause {
+    Having => "having",
+    JoinUsing => "join_using",
+    On => "on",
+    Projection => "projection",
+    Where => "where",
+});
+
 /// A boolean connective, as a step on the path from a scope's root to one comparison.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
@@ -229,6 +281,13 @@ pub enum Connective {
     /// `NOT`, which negates the branch beneath it.
     Not,
 }
+
+vocabulary!(Connective {
+    And => "and",
+    Not => "not",
+    Or => "or",
+    Xor => "xor",
+});
 
 /// One step of a comparison's position in its scope's boolean tree.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
@@ -301,6 +360,35 @@ pub enum PredicateOp {
     NotMySql,
 }
 
+vocabulary!(PredicateOp {
+    All => "all",
+    Any => "any",
+    Between => "between",
+    Eq => "eq",
+    Exists => "exists",
+    Ge => "ge",
+    Gt => "gt",
+    InList => "in_list",
+    InSubquery => "in_subquery",
+    IsNotNull => "is_not_null",
+    IsNull => "is_null",
+    Le => "le",
+    Like => "like",
+    Lt => "lt",
+    MatchAgainst => "match_against",
+    Ne => "ne",
+    NotBetween => "not_between",
+    NotExists => "not_exists",
+    NotInList => "not_in_list",
+    NotInSubquery => "not_in_subquery",
+    NotLike => "not_like",
+    NotMySql => "not_mysql",
+    NotRegexp => "not_regexp",
+    NullSafeEq => "null_safe_eq",
+    Regexp => "regexp",
+    Scalar => "scalar",
+});
+
 /// What the right-hand side of a split is.
 ///
 /// `Subquery` is what makes the walk recursive: a subselect is an operand of a split rather than a
@@ -321,6 +409,15 @@ pub enum RhsKind {
     /// A unary split — `IS NULL`, `EXISTS` — which has no right-hand side.
     None,
 }
+
+vocabulary!(RhsKind {
+    Column => "column",
+    Expression => "expression",
+    Literal => "literal",
+    None => "none",
+    RowConstructor => "row_constructor",
+    Subquery => "subquery",
+});
 
 /// One side of a split, as the author spelled it.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -397,6 +494,17 @@ pub enum SetOperator {
     NotMySql,
 }
 
+vocabulary!(SetOperator {
+    Except => "except",
+    ExceptAll => "except_all",
+    Intersect => "intersect",
+    IntersectAll => "intersect_all",
+    NotApplicable => "not_applicable",
+    NotMySql => "not_mysql",
+    Union => "union",
+    UnionAll => "union_all",
+});
+
 /// The directions an `ORDER BY` wrote, which decide whether an index can be walked to satisfy it.
 #[derive(Copy, Clone, Debug, Default, Eq, Hash, PartialEq)]
 #[non_exhaustive]
@@ -411,6 +519,13 @@ pub enum SortDirections {
     #[default]
     NotApplicable,
 }
+
+vocabulary!(SortDirections {
+    Asc => "asc",
+    Desc => "desc",
+    Mixed => "mixed",
+    NotApplicable => "not_applicable",
+});
 
 /// The row lock a scope's `FOR UPDATE` / `FOR SHARE` clause asks for.
 ///
@@ -431,6 +546,13 @@ pub enum LockStrength {
     NotMySql,
 }
 
+vocabulary!(LockStrength {
+    Exclusive => "exclusive",
+    None => "none",
+    NotMySql => "not_mysql",
+    Shared => "shared",
+});
+
 /// What a locking scope does when the rows it wants are already locked.
 ///
 /// `Wait` is the default and is what `Lock_time` measures. Under the other two a statement
@@ -446,6 +568,12 @@ pub enum LockWait {
     /// `SKIP LOCKED`: omit the locked rows from the result instead of waiting
     SkipLocked,
 }
+
+vocabulary!(LockWait {
+    NoWait => "nowait",
+    SkipLocked => "skip_locked",
+    Wait => "wait",
+});
 
 /// What an index hint tells the optimiser to do with the indexes it names.
 ///
@@ -463,6 +591,12 @@ pub enum IndexHintKind {
     Ignore,
 }
 
+vocabulary!(IndexHintKind {
+    Force => "force",
+    Ignore => "ignore",
+    Use => "use",
+});
+
 /// Which part of the statement an index hint applies to.
 ///
 /// `Any` is a hint written without a `FOR` clause, which MySQL applies to every part. It is a
@@ -479,6 +613,13 @@ pub enum IndexHintScope {
     /// `FOR GROUP BY`
     GroupBy,
 }
+
+vocabulary!(IndexHintScope {
+    Any => "any",
+    GroupBy => "group_by",
+    Join => "join",
+    OrderBy => "order_by",
+});
 
 /// An index hint the author wrote against one relation occurrence.
 ///
@@ -3484,12 +3625,11 @@ mod tests {
             seen.insert(format!("{want:?}"));
         }
 
-        // THE GUARD. Eight arms — seven MySQL and the one landing place — written out rather
-        // than derived from the enum, because there is no way to iterate it, so adding a ninth
-        // without a witness has to fail here.
+        // THE GUARD, and it is derived: `all()` is the same arm list `name()` is built from, so an
+        // arm added above with no text that reaches it fails here with no number to edit.
         assert_eq!(
             seen.len(),
-            8,
+            JoinOp::all().count(),
             "every JoinOp arm needs text that reaches it; reached {seen:?}"
         );
         assert_eq!(mysql.len() + not_mysql.len(), 20, "cases, for the record");
@@ -3570,11 +3710,11 @@ mod tests {
         );
         seen.insert("NotApplicable".to_string());
 
-        // THE GUARD, as [`JoinOp`]'s: eight arms written out rather than derived, because the
-        // enum cannot be iterated, so a ninth without a witness fails here.
+        // THE GUARD, and it is derived: `all()` is the same arm list `name()` is built from, so an
+        // arm added above with no text that reaches it fails here with no number to edit.
         assert_eq!(
             seen.len(),
-            8,
+            SetOperator::all().count(),
             "every SetOperator arm needs text that reaches it; reached {seen:?}"
         );
     }
@@ -3620,11 +3760,11 @@ mod tests {
             seen.insert(format!("{want:?}"));
         }
 
-        // THE GUARD: fourteen arms written out rather than derived, because the enum cannot be
-        // iterated, so a fifteenth without text that reaches it fails here.
+        // THE GUARD, and it is derived: `all()` is the same arm list `name()` is built from, so an
+        // arm added above with no text that reaches it fails here with no number to edit.
         assert_eq!(
             seen.len(),
-            14,
+            RelationRole::all().count(),
             "every RelationRole arm needs text that reaches it; reached {seen:?}"
         );
 

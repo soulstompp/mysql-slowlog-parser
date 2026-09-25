@@ -306,6 +306,12 @@ pub enum EntryStatement {
     InvalidStatement(String),
 }
 
+vocabulary!(EntryStatement {
+    Self::SqlStatement(_) => "sql",
+    Self::AdminCommand(_) => "admin_command",
+    Self::InvalidStatement(_) => "invalid",
+});
+
 impl EntryStatement {
     /// returns the `EntrySqlStatement` objects associated with this statement, if known
     pub fn objects(&self) -> Option<Vec<EntrySqlStatementObject>> {

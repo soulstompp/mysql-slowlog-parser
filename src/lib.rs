@@ -52,6 +52,48 @@ use bytes::Bytes;
 
 pub use crate::codec::{CodecError, EntryCodec, EntryError, FileScope};
 
+/// Declares a public enum's published vocabulary: the string each arm reaches an artifact as.
+///
+/// The arms are written **once**, so `name()`, `NAMES` and `all()` cannot disagree about which arms
+/// exist or what they are called. A consumer that spelled the strings itself would be a second
+/// authority on what they mean, and nothing would make the two agree — which is why they are
+/// published from the crate that owns the arms.
+///
+/// The generated `name()` is an **exhaustive** match, deliberately. These enums are
+/// `#[non_exhaustive]`, which restricts a consumer and not this crate, so adding an arm breaks the
+/// build *here*, beside the arm, where the decision about what to call it belongs. A consumer never
+/// matches at all and so cannot acquire an answer nobody chose.
+macro_rules! vocabulary {
+    // Fieldless arms, so each one is a value: `all()` lets a consumer close a law over the whole
+    // vocabulary without transcribing it.
+    ($enum:ident { $($arm:ident => $name:literal,)+ }) => {
+        impl $enum {
+            /// The published string for this arm — the value that reaches an artifact column.
+            pub fn name(&self) -> &'static str {
+                match self { $(Self::$arm => $name,)+ }
+            }
+            /// Every published string, in declaration order.
+            pub const NAMES: &'static [&'static str] = &[$($name,)+];
+            /// Every arm. Derived from the same list as [`Self::name`].
+            pub fn all() -> impl Iterator<Item = Self> + Clone {
+                [$(Self::$arm,)+].into_iter()
+            }
+        }
+    };
+    // Arms carrying a payload. No `all()`: an arm is not a value on its own, so what a consumer can
+    // close a law over is `NAMES`, which is what the artifact carries anyway.
+    ($enum:ident { $($arm:pat => $name:literal,)+ }) => {
+        impl $enum {
+            /// The published string for this arm — the value that reaches an artifact column.
+            pub fn name(&self) -> &'static str {
+                match self { $($arm => $name,)+ }
+            }
+            /// Every published string, in declaration order.
+            pub const NAMES: &'static [&'static str] = &[$($name,)+];
+        }
+    };
+}
+
 mod codec;
 mod graph;
 mod parser;
@@ -93,6 +135,11 @@ pub enum EntryMasking {
     #[default]
     None,
 }
+
+vocabulary!(EntryMasking {
+    PlaceHolder => "placeholder",
+    None => "none",
+});
 
 /// Configuration for [`EntryCodec::new`].
 #[derive(Copy, Clone, Default)]
