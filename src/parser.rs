@@ -1042,19 +1042,31 @@ pub fn parse_sql(
 /// leaves the tail alone.
 ///
 /// The text must be the author's or an unmasked rendering of it. A masked rendering carries `?`
-/// where the literals were, a placeholder is not a literal, and nothing is substituted.
+/// where the literals were, and a placeholder is not a literal.
 ///
 /// The kind is taken from the original and never from the caller: a quoted string stays a quoted
-/// string, with its quotes escaped. Swapping them changes the statement, because MySQL compares
-/// an integer column against a string by coercing it and takes a different path through the
-/// index. A number's or a hex literal's payload is written as given and not checked, so a caller
-/// substituting one must supply digits. A negative number is one literal, and its substitute
-/// replaces the sign along with the digits.
+/// string. Swapping them changes the statement, because MySQL compares an integer column against
+/// a string by coercing it and takes a different path through the index. A negative number is
+/// one literal, and its substitute replaces the sign along with the digits.
 ///
-/// Returns `None` where the text does not parse or is not exactly one statement. A caller with a
-/// substitute to apply and nothing to apply it to has to withhold, and the `None` is what says
-/// so; returning the original would hand back the author's values from a function that promises
-/// it did not.
+/// Each substitute is checked against that kind before anything is written:
+///
+/// - a number must be a MySQL numeric literal: an optional sign, digits with an optional
+///   fraction, and an optional exponent, as in `-7`, `2.5` or `1e-3`;
+/// - a hex payload must be hex digits, and a bit payload `0`s and `1`s;
+/// - a string payload is escaped rather than checked, each quote and each backslash doubled,
+///   which is how MySQL reads a string under its default `sql_mode`. No payload can end the
+///   literal early. Where it holds a backslash the result differs from `sqlparser`'s own
+///   rendering, which doubles quotes and leaves backslashes alone.
+///
+/// Returns `None` where the text does not parse or is not exactly one statement, where any
+/// substitute does not fit its literal, and where any substitute has no literal to land on --
+/// which is what a masked rendering produces, holding no literals at all. None of these is
+/// partial: one bad substitute withholds the whole statement. A caller with a substitute to
+/// apply and nothing to apply it to has to withhold, and the `None` is what says so; returning
+/// the text would hand back either the author's values or a statement the caller did not ask
+/// for. A masked rendering with no substitutes comes back re-rendered, as there is nothing to
+/// withhold.
 ///
 /// It re-parses rather than taking a tree, because a caller usually knows its substitutes only
 /// once the whole log is read, and by then the trees are gone.
@@ -1072,8 +1084,44 @@ pub fn rewrite_literals(sql: &str, replacements: &[Option<String>]) -> Option<St
         seen: 0,
         skip_value: false,
     };
-    let _ = statements[0].visit(&mut pass);
+    if statements[0].visit(&mut pass).is_break()
+        || replacements.iter().skip(pass.seen).any(Option::is_some)
+    {
+        return None;
+    }
     Some(statements[0].to_string())
+}
+
+/// Whether `s` is a MySQL numeric literal: an optional sign, digits with an optional fraction --
+/// either side of the point may be empty, not both -- and an optional exponent.
+fn is_number(s: &str) -> bool {
+    let digits = |d: &str| d.bytes().all(|b| b.is_ascii_digit());
+    let s = s.strip_prefix(['+', '-']).unwrap_or(s);
+    let (mantissa, exponent) = match s.split_once(['e', 'E']) {
+        Some((m, e)) => (m, Some(e.strip_prefix(['+', '-']).unwrap_or(e))),
+        None => (s, None),
+    };
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    !(int.is_empty() && frac.is_empty())
+        && digits(int)
+        && digits(frac)
+        && exponent.is_none_or(|e| !e.is_empty() && digits(e))
+}
+
+/// A string payload as MySQL reads it between two `quote`s under its default `sql_mode`: each
+/// backslash and each quote doubled.
+///
+/// `sqlparser`'s rendering then leaves it as it is, since it doubles only a quote that is neither
+/// doubled already nor after a backslash.
+fn escape_payload(s: &str, quote: char) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        if c == '\\' || c == quote {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Whether `sql` carries a value the author supplied: `Some(true)` where its tokens include a
@@ -1193,6 +1241,9 @@ fn literal_addr(e: &Expr) -> Option<usize> {
 }
 
 /// The substitution half of [`LiteralPass`], sharing its arm filter and therefore its ordinals.
+///
+/// Breaks on the first substitute that does not fit its literal, which is how
+/// [`rewrite_literals`] learns to refuse.
 struct RewritePass<'a> {
     replacements: &'a [Option<String>],
     seen: usize,
@@ -1217,8 +1268,15 @@ impl VisitorMut for RewritePass<'_> {
             return ControlFlow::Continue(());
         };
         *expr = if signed {
+            if !is_number(new) {
+                return ControlFlow::Break(());
+            }
             Expr::Value(Value::Number(new.clone(), false).with_empty_span())
         } else {
+            // `0b` alone is a name, so the digits may not be empty here as they may in `b''`.
+            if bit_digits(&format!("0b{new}")).is_none() {
+                return ControlFlow::Break(());
+            }
             Expr::Identifier(Ident::new(format!("0b{new}")))
         };
         ControlFlow::Continue(())
@@ -1229,21 +1287,38 @@ impl VisitorMut for RewritePass<'_> {
     /// through the inner value leaves the span alone.
     fn pre_visit_value(&mut self, value: &mut ValueWithSpan) -> ControlFlow<Self::Break> {
         let value = &mut value.value;
-        if std::mem::take(&mut self.skip_value) || value_literal(value).is_none() {
+        if std::mem::take(&mut self.skip_value) {
             return ControlFlow::Continue(());
         }
+        let Some((kind, _)) = value_literal(value) else {
+            return ControlFlow::Continue(());
+        };
         let i = self.seen;
         self.seen += 1;
         let Some(Some(new)) = self.replacements.get(i) else {
             return ControlFlow::Continue(());
         };
+        let fits = match kind {
+            LiteralKind::Number => is_number(new),
+            LiteralKind::HexString => new.bytes().all(|b| b.is_ascii_hexdigit()),
+            LiteralKind::BitString => new.bytes().all(|b| b == b'0' || b == b'1'),
+            // Escaped below rather than checked.
+            LiteralKind::SingleQuotedString
+            | LiteralKind::DoubleQuotedString
+            | LiteralKind::NationalString => true,
+        };
+        if !fits {
+            return ControlFlow::Break(());
+        }
         // Assigning through `&mut Value` leaves the `ValueWithSpan` wrapper alone, for the same
         // reason masking does.
         *value = match &*value {
             Value::Number(_, long) => Value::Number(new.clone(), *long),
-            Value::SingleQuotedString(_) => Value::SingleQuotedString(new.clone()),
-            Value::DoubleQuotedString(_) => Value::DoubleQuotedString(new.clone()),
-            Value::NationalStringLiteral(_) => Value::NationalStringLiteral(new.clone()),
+            Value::SingleQuotedString(_) => Value::SingleQuotedString(escape_payload(new, '\'')),
+            Value::DoubleQuotedString(_) => Value::DoubleQuotedString(escape_payload(new, '"')),
+            Value::NationalStringLiteral(_) => {
+                Value::NationalStringLiteral(escape_payload(new, '\''))
+            }
             Value::HexStringLiteral(_) => Value::HexStringLiteral(new.clone()),
             Value::SingleQuotedByteStringLiteral(_) => {
                 Value::SingleQuotedByteStringLiteral(new.clone())
@@ -1768,6 +1843,98 @@ mod a_literal_can_be_replaced_by_its_surrogate {
         // asking for one statement's literal would reach another's.
         assert_eq!(
             rewrite_literals("SELECT 1; SELECT 2", &[Some("9".into())]),
+            None
+        );
+    }
+
+    /// A SUBSTITUTE THAT DOES NOT FIT ITS KIND REFUSES THE WHOLE CALL.
+    ///
+    /// A number, a hex payload and a bit payload are written into the rendering as they stand,
+    /// so one that is not digits is not a value but more statement: `id = 42` with `1 OR 1=1`
+    /// renders a predicate that holds for every row.
+    #[test]
+    fn a_substitute_that_does_not_fit_its_kind_is_refused() {
+        for (sql, bad) in [
+            ("SELECT a FROM t WHERE id = 42", "1 OR 1=1"),
+            ("SELECT a FROM t WHERE id = 42", ""),
+            ("SELECT a FROM t WHERE id = 42", "."),
+            ("SELECT a FROM t WHERE id = 42", "0x41"),
+            ("SELECT a FROM t WHERE id = 42", "1e"),
+            ("SELECT a FROM t WHERE id = -42", "7; DROP TABLE t"),
+            ("SELECT a FROM t WHERE tag = X'41'", "zz' OR '1"),
+            ("SELECT a FROM t WHERE f = b'1'", "2"),
+            ("SELECT a FROM t WHERE f = 0b1", ""),
+            ("SELECT a FROM t WHERE f = 0b1", "1 OR 1"),
+        ] {
+            assert_eq!(
+                rewrite_literals(sql, &[Some(bad.into())]),
+                None,
+                "{sql} <- {bad:?}"
+            );
+        }
+        // One bad substitute withholds the whole statement, the ones that fit included.
+        assert_eq!(
+            rewrite_literals(
+                "SELECT a FROM t WHERE k = 'x' AND id = 42",
+                &[Some("y".into()), Some("1 OR 1=1".into())]
+            ),
+            None
+        );
+
+        // Every MySQL spelling of a number fits.
+        for good in ["7", "-7", "+7", "2.5", ".5", "5.", "1e5", "-2.5E-3", "1e+2"] {
+            let out = rewrite_literals("SELECT a FROM t WHERE id = 42", &[Some(good.into())])
+                .unwrap_or_else(|| panic!("{good}"));
+            assert!(parse_sql(&out, &EntryMasking::None).is_ok(), "{out}");
+        }
+    }
+
+    /// A STRING PAYLOAD CANNOT END ITS LITERAL.
+    ///
+    /// MySQL reads a backslash inside a string as an escape, so a payload ending in `\` whose
+    /// quotes alone were doubled would swallow the closing quote, and the next substitute would
+    /// land outside any string. Re-parsing the output and finding exactly the substitutes, each
+    /// in its own slot, is what says nothing escaped.
+    #[test]
+    fn a_string_payload_cannot_end_its_literal() {
+        let subs = ["\\", " OR 1=1 -- ", "it's", "\\'", "say \"hi\""];
+        let out = rewrite_literals(
+            "SELECT a FROM t WHERE k = 'a' AND j = 'b' AND n = N'c' AND m = 'd' AND d = \"e\"",
+            &subs.iter().map(|s| Some(s.to_string())).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let (_, ls) = parse_sql(&out, &EntryMasking::None).unwrap();
+        assert_eq!(
+            ls.iter()
+                .map(|l| String::from_utf8_lossy(&l.value).into_owned())
+                .collect::<Vec<_>>(),
+            subs,
+            "{out}"
+        );
+        assert!(
+            ls.iter().all(|l| l.column.is_some()),
+            "every value still in its slot: {out}"
+        );
+    }
+
+    /// A MASKED RENDERING HOLDS NO LITERALS, so a substitute handed one has nowhere to land, and
+    /// the call refuses rather than returning the text with the substitute silently dropped.
+    #[test]
+    fn a_substitute_with_no_literal_to_land_on_is_refused() {
+        let masked = parse_sql("SELECT a FROM t WHERE id = 42", &EntryMasking::PlaceHolder)
+            .unwrap()
+            .0[0]
+            .to_string();
+        assert_eq!(rewrite_literals(&masked, &[Some("7".into())]), None);
+        // With nothing to substitute there is nothing to withhold.
+        assert_eq!(rewrite_literals(&masked, &[]).as_deref(), Some(&*masked));
+        assert_eq!(
+            rewrite_literals(&masked, &[None]).as_deref(),
+            Some(&*masked)
+        );
+        // And a slice longer than the statement's literals is the same mistake.
+        assert_eq!(
+            rewrite_literals("SELECT a FROM t WHERE id = 42", &[None, Some("7".into())]),
             None
         );
     }
